@@ -1,0 +1,543 @@
+import { Router, Request, Response } from 'express'
+import { prisma } from '../config'
+import { authenticate } from '../middleware/auth'
+
+const router = Router()
+
+router.use(authenticate)
+
+// GET /reports/dashboard
+router.get('/dashboard', async (req: Request, res: Response) => {
+  const { branchId } = req.query as { branchId?: string }
+  const orgId = req.user.organizationId
+
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const endOfToday = new Date(today)
+  endOfToday.setHours(23, 59, 59, 999)
+
+  const startOfWeek = new Date(today)
+  startOfWeek.setDate(today.getDate() - today.getDay())
+
+  const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1)
+
+  const branchFilter = branchId ? { branchId } : {}
+  const orgFilter = { organizationId: orgId }
+  const notVoid = { status: { not: 'void' } }
+
+  // Run all aggregations in parallel
+  const [
+    todaySales,
+    monthSales,
+    todayExpenses,
+    monthExpenses,
+    pendingApprovals,
+    overdueBills,
+    branches,
+    auditLogs,
+  ] = await Promise.all([
+    prisma.dailySale.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: today, lte: endOfToday } },
+      _sum: { netAmount: true },
+    }),
+    prisma.dailySale.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: startOfMonth } },
+      _sum: { netAmount: true },
+    }),
+    prisma.expense.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: today, lte: endOfToday } },
+      _sum: { totalAmount: true },
+    }),
+    prisma.expense.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: startOfMonth } },
+      _sum: { totalAmount: true },
+    }),
+    Promise.all([
+      prisma.dailySale.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
+      prisma.expense.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
+      prisma.cashClosing.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
+    ]),
+    prisma.bill.count({
+      where: {
+        ...orgFilter,
+        ...(branchId ? branchFilter : {}),
+        status: { notIn: ['paid', 'void'] },
+        dueDate: { lt: now },
+      },
+    }),
+    prisma.branch.findMany({
+      where: { organizationId: orgId, isActive: true, ...(branchId ? { id: branchId } : {}) },
+      select: { id: true, name: true },
+    }),
+    prisma.auditLog.findMany({
+      where: { organizationId: orgId, ...(branchId ? { branchId } : {}) },
+      orderBy: { createdAt: 'desc' },
+      take: 10,
+      select: {
+        id: true,
+        action: true,
+        module: true,
+        createdAt: true,
+        userEmail: true,
+        resourceType: true,
+        resourceRef: true,
+      },
+    }),
+  ])
+
+  // Low stock: compare quantityOnHand <= reorderPoint in application code
+  // (Prisma does not support field-to-field comparisons in filters)
+  const allStocks = await prisma.branchStock.findMany({
+    where: { organizationId: orgId, ...(branchId ? { branchId } : {}) },
+    select: { quantityOnHand: true, reorderPoint: true },
+  })
+  type StockRow = { quantityOnHand: number; reorderPoint: number }
+  const lowStockCount = (allStocks as StockRow[]).filter(
+    (s: StockRow) => s.quantityOnHand <= s.reorderPoint
+  ).length
+
+  // Cash position from most recent approved closings
+  const latestClosings = await prisma.cashClosing.findMany({
+    where: {
+      organizationId: orgId,
+      ...(branchId ? { branchId } : {}),
+      status: 'approved',
+    },
+    orderBy: { closingDate: 'desc' },
+    take: branchId ? 1 : 3,
+    select: { actualCashCounted: true, cashDeposited: true },
+  })
+
+  const cashPosition = latestClosings.reduce(
+    (sum: number, c: { actualCashCounted: number; cashDeposited: number }) =>
+      sum + (c.actualCashCounted - c.cashDeposited),
+    0
+  )
+
+  // Per-branch sales breakdown
+  const branchSales = await Promise.all(
+    branches.map(async (branch: { id: string; name: string }) => {
+      const [todayB, weekB, monthB] = await Promise.all([
+        prisma.dailySale.aggregate({
+          where: { organizationId: orgId, branchId: branch.id, ...notVoid, saleDate: { gte: today, lte: endOfToday } },
+          _sum: { netAmount: true },
+        }),
+        prisma.dailySale.aggregate({
+          where: { organizationId: orgId, branchId: branch.id, ...notVoid, saleDate: { gte: startOfWeek } },
+          _sum: { netAmount: true },
+        }),
+        prisma.dailySale.aggregate({
+          where: { organizationId: orgId, branchId: branch.id, ...notVoid, saleDate: { gte: startOfMonth } },
+          _sum: { netAmount: true },
+        }),
+      ])
+
+      return {
+        branchId: branch.id,
+        branchName: branch.name,
+        today: todayB._sum.netAmount ?? 0,
+        thisWeek: weekB._sum.netAmount ?? 0,
+        thisMonth: monthB._sum.netAmount ?? 0,
+      }
+    })
+  )
+
+  const totalPendingApprovals = pendingApprovals[0] + pendingApprovals[1] + pendingApprovals[2]
+
+  const recentActivity = auditLogs.map(
+    (log: {
+      id: string
+      action: string
+      module: string
+      createdAt: Date
+      userEmail: string
+      resourceType: string | null
+      resourceRef: string | null
+    }) => ({
+      id: log.id,
+      description: `${log.action} ${log.resourceType ?? ''} ${log.resourceRef ?? ''}`.trim(),
+      module: log.module,
+      createdAt: log.createdAt.toISOString(),
+      userEmail: log.userEmail,
+    })
+  )
+
+  res.json({
+    totalSalesToday: todaySales._sum.netAmount ?? 0,
+    totalSalesMonth: monthSales._sum.netAmount ?? 0,
+    totalExpensesToday: todayExpenses._sum.totalAmount ?? 0,
+    totalExpensesMonth: monthExpenses._sum.totalAmount ?? 0,
+    cashPosition,
+    pendingApprovals: totalPendingApprovals,
+    overdueSupplierBills: overdueBills,
+    lowStockItems: lowStockCount,
+    branchSales,
+    recentActivity,
+  })
+})
+
+// GET /reports/financial
+router.get('/financial', async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+
+  const dateFilter: Record<string, Date> = {}
+  if (fromDate) dateFilter.gte = new Date(fromDate)
+  if (toDate) dateFilter.lte = new Date(toDate)
+  const hasDateFilter = Object.keys(dateFilter).length > 0
+
+  const [totalSales, totalExpenses, totalBills] = await Promise.all([
+    prisma.dailySale.aggregate({
+      where: {
+        organizationId: orgId,
+        ...(branchId && { branchId }),
+        status: { not: 'void' },
+        ...(hasDateFilter && { saleDate: dateFilter }),
+      },
+      _sum: { netAmount: true, vatAmount: true, totalAmount: true },
+      _count: true,
+    }),
+    prisma.expense.aggregate({
+      where: {
+        organizationId: orgId,
+        ...(branchId && { branchId }),
+        status: { not: 'void' },
+        ...(hasDateFilter && { expenseDate: dateFilter }),
+      },
+      _sum: { totalAmount: true, vatAmount: true },
+      _count: true,
+    }),
+    prisma.bill.aggregate({
+      where: {
+        organizationId: orgId,
+        ...(branchId && { branchId }),
+        status: { not: 'void' },
+        ...(hasDateFilter && { billDate: dateFilter }),
+      },
+      _sum: { totalAmount: true, paidAmount: true, balanceDue: true },
+      _count: true,
+    }),
+  ])
+
+  const grossProfit = (totalSales._sum.netAmount ?? 0) - (totalExpenses._sum.totalAmount ?? 0)
+
+  res.json({
+    revenue: {
+      totalSales: totalSales._sum.netAmount ?? 0,
+      totalVatCollected: totalSales._sum.vatAmount ?? 0,
+      saleCount: totalSales._count,
+    },
+    expenses: {
+      totalExpenses: totalExpenses._sum.totalAmount ?? 0,
+      vatPaid: totalExpenses._sum.vatAmount ?? 0,
+      expenseCount: totalExpenses._count,
+    },
+    payables: {
+      totalBills: totalBills._sum.totalAmount ?? 0,
+      totalPaid: totalBills._sum.paidAmount ?? 0,
+      balanceDue: totalBills._sum.balanceDue ?? 0,
+      billCount: totalBills._count,
+    },
+    grossProfit,
+    netProfit: grossProfit - (totalBills._sum.totalAmount ?? 0),
+  })
+})
+
+// GET /reports/dashboard-v2 — comprehensive data for premium dashboard
+router.get('/dashboard-v2', async (req: Request, res: Response) => {
+  const { branchId, days = '30' } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+  const periodDays = Math.min(90, Math.max(7, parseInt(days)))
+
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const endOfToday = new Date(today)
+  endOfToday.setHours(23, 59, 59, 999)
+  const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1)
+  const periodStart = new Date(today)
+  periodStart.setDate(today.getDate() - periodDays + 1)
+
+  const notVoid = { status: { not: 'void' } }
+  const orgFilter = { organizationId: orgId }
+  const branchFilter = branchId ? { branchId } : {}
+
+  const branches = await prisma.branch.findMany({
+    where: { ...orgFilter, isActive: true, ...(branchId ? { id: branchId } : {}) },
+    select: { id: true, name: true, code: true },
+    orderBy: { name: 'asc' },
+  })
+
+  // ── Daily sales trend for last `periodDays` days per branch ──────────────
+  const trendSales = await prisma.dailySale.findMany({
+    where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: periodStart, lte: endOfToday } },
+    select: { saleDate: true, netAmount: true, branchId: true },
+    orderBy: { saleDate: 'asc' },
+  })
+
+  // Group by date string per branch
+  const trendMap: Record<string, Record<string, number>> = {}
+  for (const s of trendSales) {
+    const dateStr = s.saleDate.toISOString().slice(0, 10)
+    if (!trendMap[dateStr]) trendMap[dateStr] = {}
+    trendMap[dateStr][s.branchId] = (trendMap[dateStr][s.branchId] ?? 0) + s.netAmount
+  }
+  const salesTrend = Object.entries(trendMap)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, byBranch]) => ({ date, ...byBranch }))
+
+  // ── Per-branch aggregates for current month ───────────────────────────────
+  const branchStats = await Promise.all(
+    branches.map(async (branch) => {
+      const bf = { branchId: branch.id }
+
+      const [salesAgg, expAgg, prevSalesAgg] = await Promise.all([
+        prisma.dailySale.aggregate({
+          where: { ...orgFilter, ...bf, ...notVoid, saleDate: { gte: startOfMonth } },
+          _sum: {
+            netAmount: true, subtotal: true, vatAmount: true,
+            cashAmount: true, cardAmount: true, deliveryAmount: true,
+            discountAmount: true, refundAmount: true,
+          },
+          _count: true,
+        }),
+        prisma.expense.aggregate({
+          where: { ...orgFilter, ...bf, ...notVoid, expenseDate: { gte: startOfMonth } },
+          _sum: { totalAmount: true },
+          _count: true,
+        }),
+        // Previous month for comparison
+        prisma.dailySale.aggregate({
+          where: {
+            ...orgFilter, ...bf, ...notVoid,
+            saleDate: {
+              gte: new Date(today.getFullYear(), today.getMonth() - 1, 1),
+              lt: startOfMonth,
+            },
+          },
+          _sum: { netAmount: true },
+        }),
+      ])
+
+      const totalSales = salesAgg._sum.netAmount ?? 0
+      const totalExpenses = expAgg._sum.totalAmount ?? 0
+      const grossProfit = totalSales - totalExpenses
+      const prevSales = prevSalesAgg._sum.netAmount ?? 0
+      const salesGrowth = prevSales > 0 ? ((totalSales - prevSales) / prevSales) * 100 : 0
+      const foodCostPct = totalSales > 0 ? (totalExpenses / totalSales) * 100 : 0
+
+      return {
+        branchId: branch.id,
+        branchName: branch.name,
+        branchCode: branch.code,
+        totalSales,
+        totalExpenses,
+        grossProfit,
+        netProfit: grossProfit,
+        prevMonthSales: prevSales,
+        salesGrowth: Math.round(salesGrowth * 10) / 10,
+        foodCostPct: Math.round(foodCostPct * 10) / 10,
+        saleCount: salesAgg._count,
+        paymentBreakdown: {
+          cash: salesAgg._sum.cashAmount ?? 0,
+          card: salesAgg._sum.cardAmount ?? 0,
+          delivery: salesAgg._sum.deliveryAmount ?? 0,
+        },
+      }
+    })
+  )
+
+  // ── Expense breakdown by category (month, all/filtered branches) ──────────
+  const expByCategory = await prisma.expense.groupBy({
+    by: ['categoryId'],
+    where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: startOfMonth } },
+    _sum: { totalAmount: true },
+  })
+  const catIds = expByCategory.map((e) => e.categoryId)
+  const catDetails = await prisma.expenseCategory.findMany({
+    where: { id: { in: catIds } },
+    select: { id: true, name: true },
+  })
+  const catMap: Record<string, string> = {}
+  for (const c of catDetails) catMap[c.id] = c.name
+  const expenseBreakdown = expByCategory.map((e) => ({
+    categoryId: e.categoryId,
+    categoryName: catMap[e.categoryId] ?? e.categoryId,
+    total: e._sum.totalAmount ?? 0,
+  }))
+
+  // ── Payment method breakdown (month, all/filtered branches) ──────────────
+  const pmSales = await prisma.dailySale.aggregate({
+    where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: startOfMonth } },
+    _sum: {
+      cashAmount: true, cardAmount: true,
+      deliveryAmount: true, bankTransferAmount: true, otherAmount: true,
+    },
+  })
+  const paymentBreakdown = {
+    cash: pmSales._sum.cashAmount ?? 0,
+    card: pmSales._sum.cardAmount ?? 0,
+    delivery: pmSales._sum.deliveryAmount ?? 0,
+    bankTransfer: pmSales._sum.bankTransferAmount ?? 0,
+    other: pmSales._sum.otherAmount ?? 0,
+  }
+
+  // ── Pending approvals & overdue bills ─────────────────────────────────────
+  const [pendingSales, pendingExp, pendingCC, overdueBills, lowStockItems] = await Promise.all([
+    prisma.dailySale.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
+    prisma.expense.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
+    prisma.cashClosing.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
+    prisma.bill.count({
+      where: { ...orgFilter, ...(branchId ? branchFilter : {}), status: { notIn: ['paid', 'void'] }, dueDate: { lt: now } },
+    }),
+    prisma.branchStock.findMany({
+      where: { organizationId: orgId, ...(branchId ? { branchId } : {}) },
+      select: { quantityOnHand: true, reorderPoint: true, itemId: true, branchId: true },
+    }),
+  ])
+
+  const lowStockCount = lowStockItems.filter((s) => s.quantityOnHand <= s.reorderPoint).length
+
+  // ── Recent activity ───────────────────────────────────────────────────────
+  const auditLogs = await prisma.auditLog.findMany({
+    where: { ...orgFilter, ...(branchId ? { branchId } : {}) },
+    orderBy: { createdAt: 'desc' },
+    take: 15,
+    select: { id: true, action: true, module: true, createdAt: true, userEmail: true, userName: true, resourceType: true, resourceRef: true, branchId: true },
+  })
+
+  // ── Today's totals ────────────────────────────────────────────────────────
+  const [todaySales, todayExpenses, monthSales, monthExpenses] = await Promise.all([
+    prisma.dailySale.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: today, lte: endOfToday } },
+      _sum: { netAmount: true },
+    }),
+    prisma.expense.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: today, lte: endOfToday } },
+      _sum: { totalAmount: true },
+    }),
+    prisma.dailySale.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: startOfMonth } },
+      _sum: { netAmount: true },
+    }),
+    prisma.expense.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: startOfMonth } },
+      _sum: { totalAmount: true },
+    }),
+  ])
+
+  res.json({
+    period: { start: periodStart.toISOString(), end: endOfToday.toISOString(), days: periodDays },
+    kpis: {
+      todaySales: todaySales._sum.netAmount ?? 0,
+      todayExpenses: todayExpenses._sum.totalAmount ?? 0,
+      monthSales: monthSales._sum.netAmount ?? 0,
+      monthExpenses: monthExpenses._sum.totalAmount ?? 0,
+      monthProfit: (monthSales._sum.netAmount ?? 0) - (monthExpenses._sum.totalAmount ?? 0),
+      pendingApprovals: pendingSales + pendingExp + pendingCC,
+      overdueSupplierBills: overdueBills,
+      lowStockItems: lowStockCount,
+    },
+    branchStats,
+    salesTrend,
+    expenseBreakdown,
+    paymentBreakdown,
+    recentActivity: auditLogs.map((log) => ({
+      id: log.id,
+      description: `${log.action} ${log.resourceType ?? ''} ${log.resourceRef ?? ''}`.trim(),
+      module: log.module,
+      createdAt: log.createdAt.toISOString(),
+      userEmail: log.userEmail,
+      userName: log.userName,
+      branchId: log.branchId,
+    })),
+  })
+})
+
+// GET /reports/sales
+router.get('/sales', async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+
+  const where: Record<string, unknown> = {
+    organizationId: orgId,
+    status: { not: 'void' },
+  }
+  if (branchId) where.branchId = branchId
+  if (fromDate || toDate) {
+    where.saleDate = {
+      ...(fromDate && { gte: new Date(fromDate) }),
+      ...(toDate && { lte: new Date(toDate) }),
+    }
+  }
+
+  const [salesAgg, byBranch, dailyTrend] = await Promise.all([
+    prisma.dailySale.aggregate({
+      where,
+      _sum: {
+        cashAmount: true,
+        cardAmount: true,
+        deliveryAmount: true,
+        bankTransferAmount: true,
+        subtotal: true,
+        discountAmount: true,
+        vatAmount: true,
+        totalAmount: true,
+        refundAmount: true,
+        netAmount: true,
+      },
+      _count: true,
+    }),
+    prisma.dailySale.groupBy({
+      by: ['branchId'],
+      where,
+      _sum: { netAmount: true, totalAmount: true },
+      _count: true,
+    }),
+    prisma.dailySale.findMany({
+      where,
+      orderBy: { saleDate: 'asc' },
+      select: { saleDate: true, netAmount: true, branchId: true },
+    }),
+  ])
+
+  // Enrich branch groupBy with names
+  type GroupByBranch = (typeof byBranch)[number]
+  type BranchRow = { id: string; name: string }
+
+  const branchIds = byBranch.map((b: GroupByBranch) => b.branchId)
+  const branchDetails = await prisma.branch.findMany({
+    where: { id: { in: branchIds } },
+    select: { id: true, name: true },
+  })
+  const branchMap = Object.fromEntries(
+    branchDetails.map((b: BranchRow) => [b.id, b.name])
+  )
+
+  const byBranchEnriched = byBranch.map((b: GroupByBranch) => ({
+    branchId: b.branchId,
+    branchName: (branchMap[b.branchId] as string) || b.branchId,
+    netAmount: b._sum.netAmount ?? 0,
+    totalAmount: b._sum.totalAmount ?? 0,
+    count: b._count,
+  }))
+
+  res.json({
+    summary: {
+      totalSales: salesAgg._sum.netAmount ?? 0,
+      saleCount: salesAgg._count,
+      totalVat: salesAgg._sum.vatAmount ?? 0,
+      totalDiscount: salesAgg._sum.discountAmount ?? 0,
+      totalRefunds: salesAgg._sum.refundAmount ?? 0,
+    },
+    paymentBreakdown: {
+      cash: salesAgg._sum.cashAmount ?? 0,
+      card: salesAgg._sum.cardAmount ?? 0,
+      delivery: salesAgg._sum.deliveryAmount ?? 0,
+      bankTransfer: salesAgg._sum.bankTransferAmount ?? 0,
+    },
+    byBranch: byBranchEnriched,
+    dailyTrend,
+  })
+})
+
+export default router

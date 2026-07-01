@@ -1,0 +1,561 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id              String   @id @default(cuid())
+  name            String
+  tradeName       String?
+  registrationNo  String?
+  vatNumber       String?
+  email           String?
+  phone           String?
+  address         String?
+  city            String?
+  country         String   @default("SA")
+  currency        String   @default("SAR")
+  fiscalYearStart String   @default("01-01")
+  logoUrl         String?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  branches        Branch[]
+  users           User[]
+  accounts        Account[]
+  roles           Role[]
+  dailySales      DailySale[]
+  cashClosings    CashClosing[]
+  expenses        Expense[]
+  expenseCategories ExpenseCategory[]
+  suppliers       Supplier[]
+  bills           Bill[]
+  items           Item[]
+  journalEntries  JournalEntry[]
+  notifications   Notification[]
+  auditLogs       AuditLog[]
+  documents       Document[]
+}
+
+model Branch {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  code           String
+  city           String?
+  address        String?
+  phone          String?
+  email          String?
+  managerUserId  String?
+  vatEnabled     Boolean  @default(true)
+  vatRate        Float    @default(15)
+  invoicePrefix  String   @default("INV")
+  salePrefix     String   @default("SL")
+  expensePrefix  String   @default("EXP")
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  dailySales     DailySale[]
+  cashClosings   CashClosing[]
+  expenses       Expense[]
+  bills          Bill[]
+  branchStocks   BranchStock[]
+  stockMovements StockMovement[]
+  wastageReports WastageReport[]
+  journalEntries JournalEntry[]
+  userAccess     UserBranchAccess[]
+  @@unique([organizationId, code])
+}
+
+model User {
+  id             String   @id @default(cuid())
+  organizationId String
+  email          String
+  passwordHash   String
+  firstName      String
+  lastName       String
+  phone          String?
+  avatarUrl      String?
+  isActive       Boolean  @default(true)
+  lastLoginAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  roles          UserRole[]
+  branchAccess   UserBranchAccess[]
+  refreshTokens  RefreshToken[]
+  notifications  Notification[]
+  @@unique([organizationId, email])
+}
+
+model Role {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  displayName    String
+  description    String?
+  isSystemRole   Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  permissions    RolePermission[]
+  userRoles      UserRole[]
+  @@unique([organizationId, name])
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  module      String
+  description String?
+  roles       RolePermission[]
+}
+
+model RolePermission {
+  id           String @id @default(cuid())
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  @@unique([roleId, permissionId])
+}
+
+model UserRole {
+  id     String @id @default(cuid())
+  userId String
+  roleId String
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  @@unique([userId, roleId])
+}
+
+model UserBranchAccess {
+  id             String  @id @default(cuid())
+  userId         String
+  organizationId String
+  branchId       String
+  canView        Boolean @default(true)
+  canCreate      Boolean @default(true)
+  canApprove     Boolean @default(false)
+  user           User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch         Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  @@unique([userId, branchId])
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Chart of Accounts
+model Account {
+  id             String  @id @default(cuid())
+  organizationId String
+  branchId       String?
+  code           String
+  name           String
+  accountType    String
+  accountSubtype String?
+  parentId       String?
+  isHeader       Boolean @default(false)
+  isActive       Boolean @default(true)
+  normalBalance  String  @default("debit")
+  description    String?
+  createdAt      DateTime @default(now())
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  parent         Account?      @relation("AccountChildren", fields: [parentId], references: [id])
+  children       Account[]     @relation("AccountChildren")
+  journalLines   JournalLine[]
+  @@unique([organizationId, code])
+}
+
+// Journal Entries
+model JournalEntry {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String
+  entryNo        String
+  entryDate      DateTime
+  referenceType  String?
+  referenceId    String?
+  description    String
+  status         String   @default("draft")
+  totalDebit     Float    @default(0)
+  totalCredit    Float    @default(0)
+  isBalanced     Boolean  @default(false)
+  postedBy       String?
+  postedAt       DateTime?
+  voidReason     String?
+  createdBy      String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  branch         Branch        @relation(fields: [branchId], references: [id])
+  lines          JournalLine[]
+  @@unique([organizationId, entryNo])
+}
+
+model JournalLine {
+  id             String  @id @default(cuid())
+  journalEntryId String
+  accountId      String
+  description    String?
+  debitAmount    Float   @default(0)
+  creditAmount   Float   @default(0)
+  lineOrder      Int     @default(0)
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  account        Account      @relation(fields: [accountId], references: [id])
+}
+
+// Daily Sales
+model DailySale {
+  id                  String   @id @default(cuid())
+  organizationId      String
+  branchId            String
+  saleNo              String
+  saleDate            DateTime
+  cashAmount          Float    @default(0)
+  cardAmount          Float    @default(0)
+  deliveryAmount      Float    @default(0)
+  bankTransferAmount  Float    @default(0)
+  otherAmount         Float    @default(0)
+  subtotal            Float
+  discountAmount      Float    @default(0)
+  vatAmount           Float    @default(0)
+  totalAmount         Float
+  refundAmount        Float    @default(0)
+  netAmount           Float
+  vatRate             Float    @default(15)
+  status              String   @default("draft")
+  notes               String?
+  journalEntryId      String?
+  submittedBy         String?
+  submittedAt         DateTime?
+  approvedBy          String?
+  approvedAt          DateTime?
+  voidReason          String?
+  createdBy           String
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  organization        Organization       @relation(fields: [organizationId], references: [id])
+  branch              Branch             @relation(fields: [branchId], references: [id])
+  deliveryBreakdown   DeliveryBreakdown[]
+  @@unique([organizationId, saleNo])
+}
+
+model DeliveryBreakdown {
+  id          String @id @default(cuid())
+  dailySaleId String
+  platform    String
+  amount      Float
+  commission  Float  @default(0)
+  netAmount   Float
+  dailySale   DailySale @relation(fields: [dailySaleId], references: [id], onDelete: Cascade)
+}
+
+// Cash Closing
+model CashClosing {
+  id                 String   @id @default(cuid())
+  organizationId     String
+  branchId           String
+  closingNo          String
+  closingDate        DateTime
+  openingCash        Float    @default(0)
+  cashSales          Float    @default(0)
+  cashExpensesPaid   Float    @default(0)
+  cashDeposited      Float    @default(0)
+  otherCashIn        Float    @default(0)
+  otherCashOut       Float    @default(0)
+  expectedCash       Float    @default(0)
+  actualCashCounted  Float    @default(0)
+  difference         Float    @default(0)
+  differenceType     String   @default("balanced")
+  status             String   @default("draft")
+  notes              String?
+  journalEntryId     String?
+  approvedBy         String?
+  approvedAt         DateTime?
+  createdBy          String
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  organization       Organization @relation(fields: [organizationId], references: [id])
+  branch             Branch       @relation(fields: [branchId], references: [id])
+  @@unique([organizationId, closingNo])
+}
+
+// Expenses
+model ExpenseCategory {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  accountId      String?
+  description    String?
+  isActive       Boolean @default(true)
+  createdAt      DateTime @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  expenses       Expense[]
+  @@unique([organizationId, name])
+}
+
+model Expense {
+  id                String   @id @default(cuid())
+  organizationId    String
+  branchId          String
+  expenseNo         String
+  expenseDate       DateTime
+  categoryId        String
+  description       String
+  amount            Float
+  vatAmount         Float    @default(0)
+  vatRate           Float    @default(0)
+  totalAmount       Float
+  paymentMethod     String   @default("cash")
+  supplierId        String?
+  receiptDocumentId String?
+  status            String   @default("draft")
+  journalEntryId    String?
+  submittedBy       String?
+  submittedAt       DateTime?
+  approvedBy        String?
+  approvedAt        DateTime?
+  voidReason        String?
+  notes             String?
+  createdBy         String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  organization      Organization    @relation(fields: [organizationId], references: [id])
+  branch            Branch          @relation(fields: [branchId], references: [id])
+  category          ExpenseCategory @relation(fields: [categoryId], references: [id])
+  @@unique([organizationId, expenseNo])
+}
+
+// Suppliers & Bills
+model Supplier {
+  id               String  @id @default(cuid())
+  organizationId   String
+  name             String
+  tradeName        String?
+  vatNumber        String?
+  email            String?
+  phone            String?
+  address          String?
+  city             String?
+  accountId        String?
+  creditLimit      Float   @default(0)
+  paymentTermsDays Int     @default(30)
+  isActive         Boolean @default(true)
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  organization     Organization @relation(fields: [organizationId], references: [id])
+  bills            Bill[]
+}
+
+model Bill {
+  id              String   @id @default(cuid())
+  organizationId  String
+  branchId        String
+  supplierId      String
+  billNo          String
+  supplierBillNo  String?
+  billDate        DateTime
+  dueDate         DateTime
+  subtotal        Float
+  discountAmount  Float    @default(0)
+  vatAmount       Float    @default(0)
+  totalAmount     Float
+  paidAmount      Float    @default(0)
+  balanceDue      Float
+  status          String   @default("draft")
+  documentId      String?
+  journalEntryId  String?
+  approvedBy      String?
+  approvedAt      DateTime?
+  voidReason      String?
+  createdBy       String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  branch          Branch       @relation(fields: [branchId], references: [id])
+  supplier        Supplier     @relation(fields: [supplierId], references: [id])
+  items           BillItem[]
+  payments        Payment[]
+  @@unique([organizationId, billNo])
+}
+
+model BillItem {
+  id          String @id @default(cuid())
+  billId      String
+  description String
+  quantity    Float
+  unitPrice   Float
+  vatRate     Float  @default(0)
+  vatAmount   Float  @default(0)
+  totalAmount Float
+  itemId      String?
+  accountId   String?
+  bill        Bill @relation(fields: [billId], references: [id], onDelete: Cascade)
+}
+
+model Payment {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String
+  billId         String
+  paymentDate    DateTime
+  amount         Float
+  paymentMethod  String
+  referenceNo    String?
+  notes          String?
+  journalEntryId String?
+  createdBy      String
+  createdAt      DateTime @default(now())
+  bill           Bill @relation(fields: [billId], references: [id])
+}
+
+// Inventory
+model Item {
+  id             String  @id @default(cuid())
+  organizationId String
+  code           String
+  name           String
+  description    String?
+  category       String?
+  unit           String  @default("kg")
+  costPrice      Float   @default(0)
+  reorderPoint   Float   @default(0)
+  isActive       Boolean @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  branchStocks   BranchStock[]
+  movements      StockMovement[]
+  wastageItems   WastageItem[]
+  @@unique([organizationId, code])
+}
+
+model BranchStock {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String
+  itemId         String
+  quantityOnHand Float    @default(0)
+  averageCost    Float    @default(0)
+  totalValue     Float    @default(0)
+  reorderPoint   Float    @default(0)
+  lastUpdated    DateTime @default(now())
+  branch         Branch @relation(fields: [branchId], references: [id])
+  item           Item   @relation(fields: [itemId], references: [id])
+  @@unique([branchId, itemId])
+}
+
+model StockMovement {
+  id               String   @id @default(cuid())
+  organizationId   String
+  branchId         String
+  itemId           String
+  movementType     String
+  quantity         Float
+  unitCost         Float    @default(0)
+  totalValue       Float    @default(0)
+  referenceType    String?
+  referenceId      String?
+  transferBranchId String?
+  notes            String?
+  createdBy        String
+  createdAt        DateTime @default(now())
+  branch           Branch @relation(fields: [branchId], references: [id])
+  item             Item   @relation(fields: [itemId], references: [id])
+}
+
+model WastageReport {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String
+  reportDate     DateTime
+  totalValue     Float    @default(0)
+  status         String   @default("draft")
+  notes          String?
+  approvedBy     String?
+  approvedAt     DateTime?
+  createdBy      String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  branch         Branch        @relation(fields: [branchId], references: [id])
+  items          WastageItem[]
+}
+
+model WastageItem {
+  id              String  @id @default(cuid())
+  wastageReportId String
+  itemId          String
+  quantity        Float
+  unitCost        Float
+  totalValue      Float
+  reason          String?
+  wastageReport   WastageReport @relation(fields: [wastageReportId], references: [id], onDelete: Cascade)
+  item            Item          @relation(fields: [itemId], references: [id])
+}
+
+// Documents
+model Document {
+  id                String   @id @default(cuid())
+  organizationId    String
+  branchId          String
+  originalFilename  String
+  storedFilename    String
+  filePath          String
+  fileType          String
+  fileSize          Int
+  documentType      String   @default("other")
+  ocrStatus         String   @default("pending")
+  extractedData     Json?
+  linkedType        String?
+  linkedId          String?
+  uploadedBy        String
+  createdAt         DateTime @default(now())
+  organization      Organization @relation(fields: [organizationId], references: [id])
+}
+
+// Notifications
+model Notification {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  type           String   @default("info")
+  title          String
+  message        String
+  link           String?
+  isRead         Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Audit Logs
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String?
+  userId         String
+  userEmail      String
+  userName       String
+  action         String
+  module         String
+  resourceType   String?
+  resourceId     String?
+  resourceRef    String?
+  oldData        Json?
+  newData        Json?
+  ipAddress      String?
+  createdAt      DateTime @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+}
