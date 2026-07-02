@@ -12,6 +12,7 @@ import inventoryRouter from './inventory'
 import accountingRouter from './accounting'
 import reportsRouter from './reports'
 import notificationsRouter from './notifications'
+import syncRouter from './sync'
 
 const router = Router()
 
@@ -32,5 +33,6 @@ router.use('/inventory', inventoryRouter)
 router.use('/accounting', accountingRouter)
 router.use('/reports', reportsRouter)
 router.use('/notifications', notificationsRouter)
+router.use('/sync', syncRouter)
 
 export default router

@@ -10,4 +10,5 @@ export const config = {
   jwtRefreshExpiresIn: '7d',
   bcryptRounds: 10,
   apiPrefix: '/api/v1',
+  syncSecret: process.env.SYNC_SECRET || '',
 }

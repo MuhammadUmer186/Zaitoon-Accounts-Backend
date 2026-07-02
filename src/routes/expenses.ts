@@ -48,6 +48,17 @@ router.post('/categories', async (req: Request, res: Response) => {
   res.status(201).json(category)
 })
 
+// DELETE /expenses/categories/:id
+router.delete('/categories/:id', async (req: Request, res: Response) => {
+  const inUse = await prisma.expense.count({
+    where: { categoryId: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (inUse > 0) throw new AppError(`Cannot delete — ${inUse} expense(s) use this category`, 400, 'IN_USE')
+
+  await prisma.expenseCategory.delete({ where: { id: req.params.id } })
+  res.json({ message: 'Category deleted' })
+})
+
 // GET /expenses
 router.get('/', async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)

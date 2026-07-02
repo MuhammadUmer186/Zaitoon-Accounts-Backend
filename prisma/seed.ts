@@ -170,56 +170,42 @@ async function main() {
   console.log(`Created ${accountsData.length} accounts`)
 
   // ─── Permissions ──────────────────────────────────────────────────────────────
+  // Keys must match the PERMISSIONS constants in frontend/src/lib/constants.ts
   const permissionsData = [
-    // Dashboard
-    { key: 'dashboard.view', module: 'dashboard', description: 'View dashboard' },
     // Sales
-    { key: 'sales.view', module: 'sales', description: 'View daily sales' },
-    { key: 'sales.create', module: 'sales', description: 'Create daily sales' },
-    { key: 'sales.edit', module: 'sales', description: 'Edit daily sales' },
-    { key: 'sales.submit', module: 'sales', description: 'Submit sales for approval' },
-    { key: 'sales.approve', module: 'sales', description: 'Approve sales' },
-    { key: 'sales.void', module: 'sales', description: 'Void sales' },
+    { key: 'can_create_sales', module: 'sales', description: 'Create daily sales' },
+    { key: 'can_approve_sales', module: 'sales', description: 'Approve sales' },
+    { key: 'can_void_sales', module: 'sales', description: 'Void sales' },
     // Cash Closing
-    { key: 'cash_closing.view', module: 'cash_closing', description: 'View cash closings' },
-    { key: 'cash_closing.create', module: 'cash_closing', description: 'Create cash closings' },
-    { key: 'cash_closing.approve', module: 'cash_closing', description: 'Approve cash closings' },
+    { key: 'can_create_cash_closing', module: 'cash_closing', description: 'Create cash closings' },
+    { key: 'can_approve_cash_closing', module: 'cash_closing', description: 'Approve cash closings' },
     // Expenses
-    { key: 'expenses.view', module: 'expenses', description: 'View expenses' },
-    { key: 'expenses.create', module: 'expenses', description: 'Create expenses' },
-    { key: 'expenses.edit', module: 'expenses', description: 'Edit expenses' },
-    { key: 'expenses.approve', module: 'expenses', description: 'Approve expenses' },
-    { key: 'expenses.void', module: 'expenses', description: 'Void expenses' },
-    // Suppliers
-    { key: 'suppliers.view', module: 'suppliers', description: 'View suppliers' },
-    { key: 'suppliers.create', module: 'suppliers', description: 'Create suppliers' },
-    { key: 'suppliers.edit', module: 'suppliers', description: 'Edit suppliers' },
-    // Bills
-    { key: 'bills.view', module: 'bills', description: 'View bills' },
-    { key: 'bills.create', module: 'bills', description: 'Create bills' },
-    { key: 'bills.approve', module: 'bills', description: 'Approve bills' },
-    { key: 'bills.pay', module: 'bills', description: 'Record bill payments' },
+    { key: 'can_create_expense', module: 'expenses', description: 'Create expenses' },
+    { key: 'can_approve_expense', module: 'expenses', description: 'Approve expenses' },
+    { key: 'can_void_expense', module: 'expenses', description: 'Void expenses' },
+    // Suppliers & Bills
+    { key: 'can_manage_suppliers', module: 'suppliers', description: 'Manage suppliers and create bills' },
+    { key: 'can_create_bill', module: 'bills', description: 'Create bills' },
+    { key: 'can_approve_bill', module: 'bills', description: 'Approve bills' },
+    { key: 'can_make_payment', module: 'bills', description: 'Record bill payments' },
     // Inventory
-    { key: 'inventory.view', module: 'inventory', description: 'View inventory' },
-    { key: 'inventory.create', module: 'inventory', description: 'Add stock' },
-    { key: 'inventory.wastage', module: 'inventory', description: 'Record wastage' },
-    { key: 'inventory.approve_wastage', module: 'inventory', description: 'Approve wastage' },
+    { key: 'can_manage_inventory', module: 'inventory', description: 'Manage inventory items and stock' },
+    { key: 'can_transfer_stock', module: 'inventory', description: 'Transfer stock between branches' },
+    { key: 'can_approve_wastage', module: 'inventory', description: 'Approve wastage reports' },
     // Accounting
-    { key: 'accounting.view', module: 'accounting', description: 'View accounts and journals' },
-    { key: 'accounting.create', module: 'accounting', description: 'Create journal entries' },
-    { key: 'accounting.post', module: 'accounting', description: 'Post journal entries' },
-    { key: 'accounting.void', module: 'accounting', description: 'Void journal entries' },
+    { key: 'can_manage_accounting', module: 'accounting', description: 'Manage chart of accounts and journal entries' },
+    { key: 'can_post_journal', module: 'accounting', description: 'Post journal entries to ledger' },
+    { key: 'can_void_journal', module: 'accounting', description: 'Void journal entries' },
     // Reports
-    { key: 'reports.view', module: 'reports', description: 'View reports' },
-    { key: 'reports.financial', module: 'reports', description: 'View financial reports' },
-    // Users & ACL
-    { key: 'users.view', module: 'users', description: 'View users' },
-    { key: 'users.create', module: 'users', description: 'Create users' },
-    { key: 'users.edit', module: 'users', description: 'Edit users' },
-    { key: 'roles.manage', module: 'users', description: 'Manage roles and permissions' },
-    // Branches
-    { key: 'branches.view', module: 'branches', description: 'View branches' },
-    { key: 'branches.manage', module: 'branches', description: 'Manage branches' },
+    { key: 'can_view_reports', module: 'reports', description: 'View reports' },
+    { key: 'can_export_reports', module: 'reports', description: 'Export reports' },
+    { key: 'can_view_financial_reports', module: 'reports', description: 'View financial reports' },
+    // Admin
+    { key: 'can_manage_users', module: 'users', description: 'Manage users' },
+    { key: 'can_manage_roles', module: 'users', description: 'Manage roles and permissions' },
+    { key: 'can_create_branch', module: 'branches', description: 'Create and manage branches' },
+    { key: 'can_view_audit_logs', module: 'settings', description: 'View audit logs' },
+    { key: 'can_manage_settings', module: 'settings', description: 'Manage organization settings' },
   ]
 
   const permissions: Record<string, string> = {}
@@ -259,10 +245,11 @@ async function main() {
   })
 
   const accountantPerms = [
-    'dashboard.view', 'sales.view', 'cash_closing.view', 'cash_closing.approve',
-    'expenses.view', 'expenses.approve', 'suppliers.view', 'bills.view', 'bills.approve',
-    'bills.pay', 'accounting.view', 'accounting.create', 'accounting.post',
-    'reports.view', 'reports.financial', 'inventory.view',
+    'can_approve_cash_closing',
+    'can_approve_expense', 'can_void_expense',
+    'can_manage_suppliers', 'can_approve_bill', 'can_make_payment',
+    'can_manage_accounting', 'can_post_journal', 'can_void_journal',
+    'can_view_reports', 'can_view_financial_reports', 'can_export_reports',
   ]
 
   const accountantRole = await prisma.role.create({
@@ -279,11 +266,12 @@ async function main() {
   })
 
   const managerPerms = [
-    'dashboard.view', 'sales.view', 'sales.create', 'sales.edit', 'sales.submit',
-    'sales.approve', 'cash_closing.view', 'cash_closing.create', 'cash_closing.approve',
-    'expenses.view', 'expenses.create', 'expenses.edit', 'expenses.approve',
-    'suppliers.view', 'bills.view', 'inventory.view', 'inventory.create',
-    'inventory.wastage', 'inventory.approve_wastage', 'reports.view',
+    'can_create_sales', 'can_approve_sales', 'can_void_sales',
+    'can_create_cash_closing', 'can_approve_cash_closing',
+    'can_create_expense', 'can_approve_expense', 'can_void_expense',
+    'can_manage_suppliers', 'can_create_bill', 'can_approve_bill',
+    'can_manage_inventory', 'can_transfer_stock', 'can_approve_wastage',
+    'can_view_reports',
   ]
 
   const branchManagerRole = await prisma.role.create({
@@ -300,8 +288,9 @@ async function main() {
   })
 
   const cashierPerms = [
-    'dashboard.view', 'sales.view', 'sales.create', 'sales.submit',
-    'cash_closing.view', 'cash_closing.create', 'expenses.view', 'expenses.create',
+    'can_create_sales',
+    'can_create_cash_closing',
+    'can_create_expense',
   ]
 
   const cashierRole = await prisma.role.create({
