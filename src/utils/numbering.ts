@@ -15,7 +15,7 @@ export async function nextNumber(
   let count = 0
 
   try {
-    const modelDelegate = (prisma as Record<string, unknown>)[model] as {
+    const modelDelegate = (prisma as unknown as Record<string, unknown>)[model] as {
       count: (args: { where: Record<string, unknown> }) => Promise<number>
     }
     if (modelDelegate && typeof modelDelegate.count === 'function') {
