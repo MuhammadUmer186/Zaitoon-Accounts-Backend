@@ -69,7 +69,21 @@ model Branch {
   wastageReports WastageReport[]
   journalEntries JournalEntry[]
   userAccess     UserBranchAccess[]
+  targets        BranchTarget[]
   @@unique([organizationId, code])
+}
+
+model BranchTarget {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String
+  year           Int
+  month          Int
+  salesTarget    Float    @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  branch         Branch   @relation(fields: [branchId], references: [id])
+  @@unique([branchId, year, month])
 }
 
 model User {

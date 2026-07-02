@@ -267,6 +267,12 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     orderBy: { name: 'asc' },
   })
 
+  const branchTargets = await prisma.branchTarget.findMany({
+    where: { ...orgFilter, year: today.getFullYear(), month: today.getMonth() + 1, ...(branchId ? { branchId } : {}) },
+  })
+  const targetMap: Record<string, number> = {}
+  for (const t of branchTargets) targetMap[t.branchId] = t.salesTarget
+
   // ── Daily sales trend for last `periodDays` days per branch ──────────────
   const trendSales = await prisma.dailySale.findMany({
     where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: periodStart, lte: endOfToday } },
@@ -342,6 +348,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
           card: salesAgg._sum.cardAmount ?? 0,
           delivery: salesAgg._sum.deliveryAmount ?? 0,
         },
+        salesTarget: targetMap[branch.id] ?? 0,
       }
     })
   )
@@ -450,6 +457,83 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       userName: log.userName,
       branchId: log.branchId,
     })),
+  })
+})
+
+// GET /reports/inventory-health — real stock value, low/critical stock, movement velocity, wastage
+router.get('/inventory-health', async (req: Request, res: Response) => {
+  const { branchId } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+  const now = new Date()
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1)
+  const last30Days = new Date(now)
+  last30Days.setDate(now.getDate() - 30)
+
+  const branchFilter = branchId ? { branchId } : {}
+
+  const stocks = await prisma.branchStock.findMany({
+    where: { organizationId: orgId, ...branchFilter },
+    include: {
+      item: { select: { id: true, name: true, code: true, unit: true } },
+      branch: { select: { id: true, name: true } },
+    },
+  })
+
+  const totalStockValue = stocks.reduce((s, st) => s + st.totalValue, 0)
+
+  const lowStockStocks = stocks.filter((st) => st.quantityOnHand <= st.reorderPoint && st.quantityOnHand > st.reorderPoint * 0.5)
+  const criticalStockStocks = stocks.filter((st) => st.quantityOnHand <= st.reorderPoint * 0.5)
+  const purchaseRequired = lowStockStocks.length + criticalStockStocks.length
+
+  // Movement velocity: count stock_out movements per item in the last 30 days
+  const movements = await prisma.stockMovement.findMany({
+    where: {
+      organizationId: orgId, ...branchFilter,
+      movementType: 'stock_out',
+      createdAt: { gte: last30Days },
+    },
+    select: { itemId: true },
+  })
+  const movementCounts: Record<string, number> = {}
+  for (const m of movements) movementCounts[m.itemId] = (movementCounts[m.itemId] ?? 0) + 1
+
+  const distinctItemIds = new Set(stocks.map((st) => st.itemId))
+  let fastMovingItems = 0
+  let slowMovingItems = 0
+  for (const itemId of distinctItemIds) {
+    const count = movementCounts[itemId] ?? 0
+    if (count >= 4) fastMovingItems++
+    else if (count >= 1) slowMovingItems++
+  }
+
+  const wastageAgg = await prisma.wastageReport.aggregate({
+    where: { organizationId: orgId, ...branchFilter, reportDate: { gte: startOfMonth } },
+    _sum: { totalValue: true },
+  })
+
+  const lowStockList = [...criticalStockStocks, ...lowStockStocks]
+    .sort((a, b) => (a.quantityOnHand / (a.reorderPoint || 1)) - (b.quantityOnHand / (b.reorderPoint || 1)))
+    .slice(0, 10)
+    .map((st) => ({
+      item: st.item.name,
+      branch: st.branch.name,
+      current: st.quantityOnHand,
+      minimum: st.reorderPoint,
+      unit: st.item.unit,
+      status: st.quantityOnHand <= st.reorderPoint * 0.5 ? 'critical' : 'low',
+      recommended: Math.max(0, Math.round(st.reorderPoint * 2 - st.quantityOnHand)),
+    }))
+
+  res.json({
+    totalStockValue,
+    lowStockItems: lowStockStocks.length,
+    criticalStockItems: criticalStockStocks.length,
+    purchaseRequired,
+    fastMovingItems,
+    slowMovingItems,
+    itemsMonitored: distinctItemIds.size,
+    wastageValue: wastageAgg._sum.totalValue ?? 0,
+    lowStockList,
   })
 })
 

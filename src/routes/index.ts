@@ -13,6 +13,7 @@ import accountingRouter from './accounting'
 import reportsRouter from './reports'
 import notificationsRouter from './notifications'
 import syncRouter from './sync'
+import targetsRouter from './targets'
 
 const router = Router()
 
@@ -34,5 +35,6 @@ router.use('/accounting', accountingRouter)
 router.use('/reports', reportsRouter)
 router.use('/notifications', notificationsRouter)
 router.use('/sync', syncRouter)
+router.use('/targets', targetsRouter)
 
 export default router

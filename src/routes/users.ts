@@ -23,7 +23,9 @@ const createUserSchema = z.object({
 const updateUserSchema = z.object({
   firstName: z.string().min(1).optional(),
   lastName: z.string().min(1).optional(),
+  email: z.string().email().optional(),
   phone: z.string().optional(),
+  password: z.string().min(8).optional(),
   isActive: z.boolean().optional(),
   roleIds: z.array(z.string()).optional(),
   branchIds: z.array(z.string()).optional(),
@@ -141,9 +143,14 @@ router.put('/:id', async (req: Request, res: Response) => {
   })
   if (!user) throw new AppError('User not found', 404, 'NOT_FOUND')
 
-  const { roleIds, branchIds, ...rest } = body
+  const { roleIds, branchIds, password, ...rest } = body
 
-  await prisma.user.update({ where: { id }, data: rest })
+  const updateData: Record<string, unknown> = { ...rest }
+  if (password) {
+    updateData.passwordHash = await bcrypt.hash(password, config.bcryptRounds)
+  }
+
+  await prisma.user.update({ where: { id }, data: updateData })
 
   if (roleIds !== undefined) {
     await prisma.userRole.deleteMany({ where: { userId: id } })
