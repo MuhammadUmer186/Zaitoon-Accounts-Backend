@@ -59,6 +59,20 @@ router.delete('/categories/:id', async (req: Request, res: Response) => {
   res.json({ message: 'Category deleted' })
 })
 
+// GET /expenses/pending-approval
+router.get('/pending-approval', async (req: Request, res: Response) => {
+  const { branchId } = req.query as Record<string, string>
+  const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'submitted' }
+  if (branchId) where.branchId = branchId
+
+  const expenses = await prisma.expense.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    include: { branch: { select: { id: true, name: true } }, category: true },
+  })
+  res.json({ data: expenses })
+})
+
 // GET /expenses
 router.get('/', async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)

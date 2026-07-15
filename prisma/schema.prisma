@@ -8,41 +8,42 @@ datasource db {
 }
 
 model Organization {
-  id              String   @id @default(cuid())
-  name            String
-  tradeName       String?
-  registrationNo  String?
-  vatNumber       String?
-  email           String?
-  phone           String?
-  address         String?
-  city            String?
-  country         String   @default("SA")
-  currency        String   @default("SAR")
-  fiscalYearStart String   @default("01-01")
-  logoUrl         String?
-  isActive        Boolean  @default(true)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  branches        Branch[]
-  users           User[]
-  accounts        Account[]
-  roles           Role[]
-  dailySales      DailySale[]
-  cashClosings    CashClosing[]
-  expenses        Expense[]
+  id                String            @id @default(cuid())
+  name              String
+  tradeName         String?
+  registrationNo    String?
+  vatNumber         String?
+  email             String?
+  phone             String?
+  address           String?
+  city              String?
+  country           String            @default("SA")
+  currency          String            @default("SAR")
+  fiscalYearStart   String            @default("01-01")
+  logoUrl           String?
+  isActive          Boolean           @default(true)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  branches          Branch[]
+  users             User[]
+  accounts          Account[]
+  roles             Role[]
+  dailySales        DailySale[]
+  cashClosings      CashClosing[]
+  expenses          Expense[]
   expenseCategories ExpenseCategory[]
-  suppliers       Supplier[]
-  bills           Bill[]
-  items           Item[]
-  journalEntries  JournalEntry[]
-  notifications   Notification[]
-  auditLogs       AuditLog[]
-  documents       Document[]
+  suppliers         Supplier[]
+  bills             Bill[]
+  items             Item[]
+  journalEntries    JournalEntry[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  documents         Document[]
+  purchaseOrders    PurchaseOrder[]
 }
 
 model Branch {
-  id             String   @id @default(cuid())
+  id             String             @id @default(cuid())
   organizationId String
   name           String
   code           String
@@ -51,15 +52,15 @@ model Branch {
   phone          String?
   email          String?
   managerUserId  String?
-  vatEnabled     Boolean  @default(true)
-  vatRate        Float    @default(15)
-  invoicePrefix  String   @default("INV")
-  salePrefix     String   @default("SL")
-  expensePrefix  String   @default("EXP")
-  isActive       Boolean  @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  organization   Organization @relation(fields: [organizationId], references: [id])
+  vatEnabled     Boolean            @default(true)
+  vatRate        Float              @default(15)
+  invoicePrefix  String             @default("INV")
+  salePrefix     String             @default("SL")
+  expensePrefix  String             @default("EXP")
+  isActive       Boolean            @default(true)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  organization   Organization       @relation(fields: [organizationId], references: [id])
   dailySales     DailySale[]
   cashClosings   CashClosing[]
   expenses       Expense[]
@@ -70,6 +71,8 @@ model Branch {
   journalEntries JournalEntry[]
   userAccess     UserBranchAccess[]
   targets        BranchTarget[]
+  purchaseOrders PurchaseOrder[]
+
   @@unique([organizationId, code])
 }
 
@@ -83,11 +86,12 @@ model BranchTarget {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
   branch         Branch   @relation(fields: [branchId], references: [id])
+
   @@unique([branchId, year, month])
 }
 
 model User {
-  id             String   @id @default(cuid())
+  id             String             @id @default(cuid())
   organizationId String
   email          String
   passwordHash   String
@@ -95,46 +99,49 @@ model User {
   lastName       String
   phone          String?
   avatarUrl      String?
-  isActive       Boolean  @default(true)
+  isActive       Boolean            @default(true)
   lastLoginAt    DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  organization   Organization @relation(fields: [organizationId], references: [id])
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  organization   Organization       @relation(fields: [organizationId], references: [id])
   roles          UserRole[]
   branchAccess   UserBranchAccess[]
   refreshTokens  RefreshToken[]
   notifications  Notification[]
+
   @@unique([organizationId, email])
 }
 
 model Role {
-  id             String   @id @default(cuid())
+  id             String           @id @default(cuid())
   organizationId String
   name           String
   displayName    String
   description    String?
-  isSystemRole   Boolean  @default(false)
-  createdAt      DateTime @default(now())
-  organization   Organization @relation(fields: [organizationId], references: [id])
+  isSystemRole   Boolean          @default(false)
+  createdAt      DateTime         @default(now())
+  organization   Organization     @relation(fields: [organizationId], references: [id])
   permissions    RolePermission[]
   userRoles      UserRole[]
+
   @@unique([organizationId, name])
 }
 
 model Permission {
-  id          String   @id @default(cuid())
-  key         String   @unique
+  id          String           @id @default(cuid())
+  key         String           @unique
   module      String
   description String?
   roles       RolePermission[]
 }
 
 model RolePermission {
-  id           String @id @default(cuid())
+  id           String     @id @default(cuid())
   roleId       String
   permissionId String
   role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
   permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
   @@unique([roleId, permissionId])
 }
 
@@ -142,8 +149,9 @@ model UserRole {
   id     String @id @default(cuid())
   userId String
   roleId String
-  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
-  role   Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
   @@unique([userId, roleId])
 }
 
@@ -155,8 +163,9 @@ model UserBranchAccess {
   canView        Boolean @default(true)
   canCreate      Boolean @default(true)
   canApprove     Boolean @default(false)
-  user           User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  branch         Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  user           User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch         Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
   @@unique([userId, branchId])
 }
 
@@ -166,12 +175,12 @@ model RefreshToken {
   userId    String
   expiresAt DateTime
   createdAt DateTime @default(now())
-  user      User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 // Chart of Accounts
 model Account {
-  id             String  @id @default(cuid())
+  id             String        @id @default(cuid())
   organizationId String
   branchId       String?
   code           String
@@ -179,21 +188,22 @@ model Account {
   accountType    String
   accountSubtype String?
   parentId       String?
-  isHeader       Boolean @default(false)
-  isActive       Boolean @default(true)
-  normalBalance  String  @default("debit")
+  isHeader       Boolean       @default(false)
+  isActive       Boolean       @default(true)
+  normalBalance  String        @default("debit")
   description    String?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime      @default(now())
   organization   Organization  @relation(fields: [organizationId], references: [id])
   parent         Account?      @relation("AccountChildren", fields: [parentId], references: [id])
   children       Account[]     @relation("AccountChildren")
   journalLines   JournalLine[]
+
   @@unique([organizationId, code])
 }
 
 // Journal Entries
 model JournalEntry {
-  id             String   @id @default(cuid())
+  id             String        @id @default(cuid())
   organizationId String
   branchId       String
   entryNo        String
@@ -201,126 +211,130 @@ model JournalEntry {
   referenceType  String?
   referenceId    String?
   description    String
-  status         String   @default("draft")
-  totalDebit     Float    @default(0)
-  totalCredit    Float    @default(0)
-  isBalanced     Boolean  @default(false)
+  status         String        @default("draft")
+  totalDebit     Float         @default(0)
+  totalCredit    Float         @default(0)
+  isBalanced     Boolean       @default(false)
   postedBy       String?
   postedAt       DateTime?
   voidReason     String?
   createdBy      String
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
   organization   Organization  @relation(fields: [organizationId], references: [id])
   branch         Branch        @relation(fields: [branchId], references: [id])
   lines          JournalLine[]
+
   @@unique([organizationId, entryNo])
 }
 
 model JournalLine {
-  id             String  @id @default(cuid())
+  id             String       @id @default(cuid())
   journalEntryId String
   accountId      String
   description    String?
-  debitAmount    Float   @default(0)
-  creditAmount   Float   @default(0)
-  lineOrder      Int     @default(0)
+  debitAmount    Float        @default(0)
+  creditAmount   Float        @default(0)
+  lineOrder      Int          @default(0)
   journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
   account        Account      @relation(fields: [accountId], references: [id])
 }
 
 // Daily Sales
 model DailySale {
-  id                  String   @id @default(cuid())
-  organizationId      String
-  branchId            String
-  saleNo              String
-  saleDate            DateTime
-  cashAmount          Float    @default(0)
-  cardAmount          Float    @default(0)
-  deliveryAmount      Float    @default(0)
-  bankTransferAmount  Float    @default(0)
-  otherAmount         Float    @default(0)
-  subtotal            Float
-  discountAmount      Float    @default(0)
-  vatAmount           Float    @default(0)
-  totalAmount         Float
-  refundAmount        Float    @default(0)
-  netAmount           Float
-  vatRate             Float    @default(15)
-  status              String   @default("draft")
-  notes               String?
-  journalEntryId      String?
-  submittedBy         String?
-  submittedAt         DateTime?
-  approvedBy          String?
-  approvedAt          DateTime?
-  voidReason          String?
-  createdBy           String
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
-  organization        Organization       @relation(fields: [organizationId], references: [id])
-  branch              Branch             @relation(fields: [branchId], references: [id])
-  deliveryBreakdown   DeliveryBreakdown[]
+  id                 String              @id @default(cuid())
+  organizationId     String
+  branchId           String
+  saleNo             String
+  saleDate           DateTime
+  cashAmount         Float               @default(0)
+  cardAmount         Float               @default(0)
+  deliveryAmount     Float               @default(0)
+  bankTransferAmount Float               @default(0)
+  otherAmount        Float               @default(0)
+  subtotal           Float
+  discountAmount     Float               @default(0)
+  vatAmount          Float               @default(0)
+  totalAmount        Float
+  refundAmount       Float               @default(0)
+  netAmount          Float
+  vatRate            Float               @default(15)
+  status             String              @default("draft")
+  notes              String?
+  journalEntryId     String?
+  submittedBy        String?
+  submittedAt        DateTime?
+  approvedBy         String?
+  approvedAt         DateTime?
+  voidReason         String?
+  createdBy          String
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  organization       Organization        @relation(fields: [organizationId], references: [id])
+  branch             Branch              @relation(fields: [branchId], references: [id])
+  deliveryBreakdown  DeliveryBreakdown[]
+
   @@unique([organizationId, saleNo])
 }
 
 model DeliveryBreakdown {
-  id          String @id @default(cuid())
+  id          String    @id @default(cuid())
   dailySaleId String
   platform    String
   amount      Float
-  commission  Float  @default(0)
+  commission  Float     @default(0)
   netAmount   Float
   dailySale   DailySale @relation(fields: [dailySaleId], references: [id], onDelete: Cascade)
 }
 
 // Cash Closing
 model CashClosing {
-  id                 String   @id @default(cuid())
-  organizationId     String
-  branchId           String
-  closingNo          String
-  closingDate        DateTime
-  openingCash        Float    @default(0)
-  cashSales          Float    @default(0)
-  cashExpensesPaid   Float    @default(0)
-  cashDeposited      Float    @default(0)
-  otherCashIn        Float    @default(0)
-  otherCashOut       Float    @default(0)
-  expectedCash       Float    @default(0)
-  actualCashCounted  Float    @default(0)
-  difference         Float    @default(0)
-  differenceType     String   @default("balanced")
-  status             String   @default("draft")
-  notes              String?
-  journalEntryId     String?
-  approvedBy         String?
-  approvedAt         DateTime?
-  createdBy          String
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-  organization       Organization @relation(fields: [organizationId], references: [id])
-  branch             Branch       @relation(fields: [branchId], references: [id])
+  id                String       @id @default(cuid())
+  organizationId    String
+  branchId          String
+  closingNo         String
+  closingDate       DateTime
+  openingCash       Float        @default(0)
+  cashSales         Float        @default(0)
+  cashExpensesPaid  Float        @default(0)
+  cashDeposited     Float        @default(0)
+  otherCashIn       Float        @default(0)
+  otherCashOut      Float        @default(0)
+  expectedCash      Float        @default(0)
+  actualCashCounted Float        @default(0)
+  difference        Float        @default(0)
+  differenceType    String       @default("balanced")
+  status            String       @default("draft")
+  notes             String?
+  journalEntryId    String?
+  approvedBy        String?
+  approvedAt        DateTime?
+  createdBy         String
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  organization      Organization @relation(fields: [organizationId], references: [id])
+  branch            Branch       @relation(fields: [branchId], references: [id])
+
   @@unique([organizationId, closingNo])
 }
 
 // Expenses
 model ExpenseCategory {
-  id             String  @id @default(cuid())
+  id             String       @id @default(cuid())
   organizationId String
   name           String
   accountId      String?
   description    String?
-  isActive       Boolean @default(true)
-  createdAt      DateTime @default(now())
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
   organization   Organization @relation(fields: [organizationId], references: [id])
   expenses       Expense[]
+
   @@unique([organizationId, name])
 }
 
 model Expense {
-  id                String   @id @default(cuid())
+  id                String          @id @default(cuid())
   organizationId    String
   branchId          String
   expenseNo         String
@@ -328,13 +342,13 @@ model Expense {
   categoryId        String
   description       String
   amount            Float
-  vatAmount         Float    @default(0)
-  vatRate           Float    @default(0)
+  vatAmount         Float           @default(0)
+  vatRate           Float           @default(0)
   totalAmount       Float
-  paymentMethod     String   @default("cash")
+  paymentMethod     String          @default("cash")
   supplierId        String?
   receiptDocumentId String?
-  status            String   @default("draft")
+  status            String          @default("draft")
   journalEntryId    String?
   submittedBy       String?
   submittedAt       DateTime?
@@ -343,17 +357,18 @@ model Expense {
   voidReason        String?
   notes             String?
   createdBy         String
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
   organization      Organization    @relation(fields: [organizationId], references: [id])
   branch            Branch          @relation(fields: [branchId], references: [id])
   category          ExpenseCategory @relation(fields: [categoryId], references: [id])
+
   @@unique([organizationId, expenseNo])
 }
 
 // Suppliers & Bills
 model Supplier {
-  id               String  @id @default(cuid())
+  id               String          @id @default(cuid())
   organizationId   String
   name             String
   tradeName        String?
@@ -363,60 +378,62 @@ model Supplier {
   address          String?
   city             String?
   accountId        String?
-  creditLimit      Float   @default(0)
-  paymentTermsDays Int     @default(30)
-  isActive         Boolean @default(true)
+  creditLimit      Float           @default(0)
+  paymentTermsDays Int             @default(30)
+  isActive         Boolean         @default(true)
   notes            String?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
-  organization     Organization @relation(fields: [organizationId], references: [id])
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  organization     Organization    @relation(fields: [organizationId], references: [id])
   bills            Bill[]
+  purchaseOrders   PurchaseOrder[]
 }
 
 model Bill {
-  id              String   @id @default(cuid())
-  organizationId  String
-  branchId        String
-  supplierId      String
-  billNo          String
-  supplierBillNo  String?
-  billDate        DateTime
-  dueDate         DateTime
-  subtotal        Float
-  discountAmount  Float    @default(0)
-  vatAmount       Float    @default(0)
-  totalAmount     Float
-  paidAmount      Float    @default(0)
-  balanceDue      Float
-  status          String   @default("draft")
-  documentId      String?
-  journalEntryId  String?
-  approvedBy      String?
-  approvedAt      DateTime?
-  voidReason      String?
-  createdBy       String
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  organization    Organization @relation(fields: [organizationId], references: [id])
-  branch          Branch       @relation(fields: [branchId], references: [id])
-  supplier        Supplier     @relation(fields: [supplierId], references: [id])
-  items           BillItem[]
-  payments        Payment[]
+  id             String       @id @default(cuid())
+  organizationId String
+  branchId       String
+  supplierId     String
+  billNo         String
+  supplierBillNo String?
+  billDate       DateTime
+  dueDate        DateTime
+  subtotal       Float
+  discountAmount Float        @default(0)
+  vatAmount      Float        @default(0)
+  totalAmount    Float
+  paidAmount     Float        @default(0)
+  balanceDue     Float
+  status         String       @default("draft")
+  documentId     String?
+  journalEntryId String?
+  approvedBy     String?
+  approvedAt     DateTime?
+  voidReason     String?
+  createdBy      String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  branch         Branch       @relation(fields: [branchId], references: [id])
+  supplier       Supplier     @relation(fields: [supplierId], references: [id])
+  items          BillItem[]
+  payments       Payment[]
+
   @@unique([organizationId, billNo])
 }
 
 model BillItem {
-  id          String @id @default(cuid())
+  id          String  @id @default(cuid())
   billId      String
   description String
   quantity    Float
   unitPrice   Float
-  vatRate     Float  @default(0)
-  vatAmount   Float  @default(0)
+  vatRate     Float   @default(0)
+  vatAmount   Float   @default(0)
   totalAmount Float
   itemId      String?
   accountId   String?
-  bill        Bill @relation(fields: [billId], references: [id], onDelete: Cascade)
+  bill        Bill    @relation(fields: [billId], references: [id], onDelete: Cascade)
 }
 
 model Payment {
@@ -432,27 +449,29 @@ model Payment {
   journalEntryId String?
   createdBy      String
   createdAt      DateTime @default(now())
-  bill           Bill @relation(fields: [billId], references: [id])
+  bill           Bill     @relation(fields: [billId], references: [id])
 }
 
 // Inventory
 model Item {
-  id             String  @id @default(cuid())
-  organizationId String
-  code           String
-  name           String
-  description    String?
-  category       String?
-  unit           String  @default("kg")
-  costPrice      Float   @default(0)
-  reorderPoint   Float   @default(0)
-  isActive       Boolean @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  organization   Organization  @relation(fields: [organizationId], references: [id])
-  branchStocks   BranchStock[]
-  movements      StockMovement[]
-  wastageItems   WastageItem[]
+  id                 String              @id @default(cuid())
+  organizationId     String
+  code               String
+  name               String
+  description        String?
+  category           String?
+  unit               String              @default("kg")
+  costPrice          Float               @default(0)
+  reorderPoint       Float               @default(0)
+  isActive           Boolean             @default(true)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  organization       Organization        @relation(fields: [organizationId], references: [id])
+  branchStocks       BranchStock[]
+  movements          StockMovement[]
+  wastageItems       WastageItem[]
+  purchaseOrderItems PurchaseOrderItem[]
+
   @@unique([organizationId, code])
 }
 
@@ -466,8 +485,9 @@ model BranchStock {
   totalValue     Float    @default(0)
   reorderPoint   Float    @default(0)
   lastUpdated    DateTime @default(now())
-  branch         Branch @relation(fields: [branchId], references: [id])
-  item           Item   @relation(fields: [itemId], references: [id])
+  branch         Branch   @relation(fields: [branchId], references: [id])
+  item           Item     @relation(fields: [itemId], references: [id])
+
   @@unique([branchId, itemId])
 }
 
@@ -486,29 +506,29 @@ model StockMovement {
   notes            String?
   createdBy        String
   createdAt        DateTime @default(now())
-  branch           Branch @relation(fields: [branchId], references: [id])
-  item             Item   @relation(fields: [itemId], references: [id])
+  branch           Branch   @relation(fields: [branchId], references: [id])
+  item             Item     @relation(fields: [itemId], references: [id])
 }
 
 model WastageReport {
-  id             String   @id @default(cuid())
+  id             String        @id @default(cuid())
   organizationId String
   branchId       String
   reportDate     DateTime
-  totalValue     Float    @default(0)
-  status         String   @default("draft")
+  totalValue     Float         @default(0)
+  status         String        @default("draft")
   notes          String?
   approvedBy     String?
   approvedAt     DateTime?
   createdBy      String
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
   branch         Branch        @relation(fields: [branchId], references: [id])
   items          WastageItem[]
 }
 
 model WastageItem {
-  id              String  @id @default(cuid())
+  id              String        @id @default(cuid())
   wastageReportId String
   itemId          String
   quantity        Float
@@ -519,44 +539,92 @@ model WastageItem {
   item            Item          @relation(fields: [itemId], references: [id])
 }
 
+// Purchase Orders
+model PurchaseOrder {
+  id                   String              @id @default(cuid())
+  organizationId       String
+  branchId             String
+  supplierId           String
+  poNo                 String
+  orderDate            DateTime
+  expectedDeliveryDate DateTime?
+  subtotal             Float               @default(0)
+  vatAmount            Float               @default(0)
+  totalAmount          Float               @default(0)
+  status               String              @default("draft")
+  notes                String?
+  documentId           String?
+  rejectionReason      String?
+  voidReason           String?
+  submittedBy          String?
+  submittedAt          DateTime?
+  approvedBy           String?
+  approvedAt           DateTime?
+  receivedBy           String?
+  receivedAt           DateTime?
+  createdBy            String
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  organization         Organization        @relation(fields: [organizationId], references: [id])
+  branch               Branch              @relation(fields: [branchId], references: [id])
+  supplier             Supplier            @relation(fields: [supplierId], references: [id])
+  items                PurchaseOrderItem[]
+
+  @@unique([organizationId, poNo])
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  itemId          String?
+  description     String
+  quantity        Float
+  unitCost        Float
+  vatRate         Float         @default(0)
+  vatAmount       Float         @default(0)
+  totalCost       Float
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  item            Item?         @relation(fields: [itemId], references: [id])
+}
+
 // Documents
 model Document {
-  id                String   @id @default(cuid())
-  organizationId    String
-  branchId          String
-  originalFilename  String
-  storedFilename    String
-  filePath          String
-  fileType          String
-  fileSize          Int
-  documentType      String   @default("other")
-  ocrStatus         String   @default("pending")
-  extractedData     Json?
-  linkedType        String?
-  linkedId          String?
-  uploadedBy        String
-  createdAt         DateTime @default(now())
-  organization      Organization @relation(fields: [organizationId], references: [id])
+  id               String       @id @default(cuid())
+  organizationId   String
+  branchId         String
+  originalFilename String
+  storedFilename   String
+  filePath         String
+  fileType         String
+  fileSize         Int
+  documentType     String       @default("other")
+  ocrStatus        String       @default("pending")
+  extractedData    Json?
+  linkedType       String?
+  linkedId         String?
+  uploadedBy       String
+  createdAt        DateTime     @default(now())
+  organization     Organization @relation(fields: [organizationId], references: [id])
 }
 
 // Notifications
 model Notification {
-  id             String   @id @default(cuid())
+  id             String       @id @default(cuid())
   organizationId String
   userId         String
-  type           String   @default("info")
+  type           String       @default("info")
   title          String
   message        String
   link           String?
-  isRead         Boolean  @default(false)
-  createdAt      DateTime @default(now())
+  isRead         Boolean      @default(false)
+  createdAt      DateTime     @default(now())
   organization   Organization @relation(fields: [organizationId], references: [id])
   user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 // Audit Logs
 model AuditLog {
-  id             String   @id @default(cuid())
+  id             String       @id @default(cuid())
   organizationId String
   branchId       String?
   userId         String
@@ -570,6 +638,6 @@ model AuditLog {
   oldData        Json?
   newData        Json?
   ipAddress      String?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime     @default(now())
   organization   Organization @relation(fields: [organizationId], references: [id])
 }

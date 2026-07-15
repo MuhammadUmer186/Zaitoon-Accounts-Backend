@@ -128,6 +128,23 @@ router.delete('/:id', async (req: Request, res: Response) => {
   res.json({ message: 'Supplier deleted' })
 })
 
+// GET /bills/pending-approval
+router.get('/bills/pending-approval', async (req: Request, res: Response) => {
+  const { branchId } = req.query as Record<string, string>
+  const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'draft' }
+  if (branchId) where.branchId = branchId
+
+  const bills = await prisma.bill.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    include: {
+      supplier: { select: { id: true, name: true } },
+      branch: { select: { id: true, name: true } },
+    },
+  })
+  res.json({ data: bills })
+})
+
 // GET /bills
 router.get('/bills', async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)

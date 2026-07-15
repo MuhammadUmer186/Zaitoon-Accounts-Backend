@@ -4,17 +4,6 @@ import bcrypt from 'bcryptjs'
 
 const prisma = new PrismaClient()
 
-function daysAgo(n: number): Date {
-  const d = new Date()
-  d.setDate(d.getDate() - n)
-  d.setHours(0, 0, 0, 0)
-  return d
-}
-
-function rand(min: number, max: number): number {
-  return Math.round((Math.random() * (max - min) + min) * 100) / 100
-}
-
 async function main() {
   console.log('Seeding database...')
 
@@ -25,6 +14,8 @@ async function main() {
   await prisma.wastageReport.deleteMany()
   await prisma.stockMovement.deleteMany()
   await prisma.branchStock.deleteMany()
+  await prisma.purchaseOrderItem.deleteMany()
+  await prisma.purchaseOrder.deleteMany()
   await prisma.item.deleteMany()
   await prisma.payment.deleteMany()
   await prisma.billItem.deleteMany()
@@ -37,6 +28,7 @@ async function main() {
   await prisma.cashClosing.deleteMany()
   await prisma.journalLine.deleteMany()
   await prisma.journalEntry.deleteMany()
+  await prisma.document.deleteMany()
   await prisma.account.deleteMany()
   await prisma.rolePermission.deleteMany()
   await prisma.permission.deleteMany()
@@ -192,6 +184,12 @@ async function main() {
     { key: 'can_manage_inventory', module: 'inventory', description: 'Manage inventory items and stock' },
     { key: 'can_transfer_stock', module: 'inventory', description: 'Transfer stock between branches' },
     { key: 'can_approve_wastage', module: 'inventory', description: 'Approve wastage reports' },
+    // Purchase Orders
+    { key: 'can_create_purchase_order', module: 'purchase_orders', description: 'Create purchase orders' },
+    { key: 'can_approve_purchase_order', module: 'purchase_orders', description: 'Approve purchase orders and receive stock' },
+    // Approvals & Alerts
+    { key: 'can_view_approvals', module: 'approvals', description: 'View the unified approvals inbox' },
+    { key: 'can_view_alerts', module: 'alerts', description: 'View the alerts module' },
     // Accounting
     { key: 'can_manage_accounting', module: 'accounting', description: 'Manage chart of accounts and journal entries' },
     { key: 'can_post_journal', module: 'accounting', description: 'Post journal entries to ledger' },
@@ -250,6 +248,7 @@ async function main() {
     'can_manage_suppliers', 'can_approve_bill', 'can_make_payment',
     'can_manage_accounting', 'can_post_journal', 'can_void_journal',
     'can_view_reports', 'can_view_financial_reports', 'can_export_reports',
+    'can_view_approvals', 'can_view_alerts',
   ]
 
   const accountantRole = await prisma.role.create({
@@ -271,6 +270,8 @@ async function main() {
     'can_create_expense', 'can_approve_expense', 'can_void_expense',
     'can_manage_suppliers', 'can_create_bill', 'can_approve_bill',
     'can_manage_inventory', 'can_transfer_stock', 'can_approve_wastage',
+    'can_create_purchase_order', 'can_approve_purchase_order',
+    'can_view_approvals', 'can_view_alerts',
     'can_view_reports',
   ]
 
@@ -291,6 +292,7 @@ async function main() {
     'can_create_sales',
     'can_create_cash_closing',
     'can_create_expense',
+    'can_create_purchase_order',
   ]
 
   const cashierRole = await prisma.role.create({
@@ -409,16 +411,14 @@ async function main() {
     { name: 'Packaging', accountId: accounts['5300'] },
   ]
 
-  const categories: Record<string, string> = {}
   for (const cat of categoryNames) {
-    const created = await prisma.expenseCategory.create({
+    await prisma.expenseCategory.create({
       data: { ...cat, organizationId: org.id },
     })
-    categories[cat.name] = created.id
   }
   console.log('Expense categories created')
 
-  // ─── Inventory Items ──────────────────────────────────────────────────────────
+  // ─── Inventory Items (catalog only — zero stock until real purchases/counts) ──
   const itemsData = [
     { code: 'OIL-001', name: 'Olive Oil', category: 'Oils', unit: 'litre', costPrice: 45, reorderPoint: 20 },
     { code: 'CHK-001', name: 'Chicken Breast', category: 'Meat', unit: 'kg', costPrice: 28, reorderPoint: 50 },
@@ -441,256 +441,28 @@ async function main() {
   }
   console.log('Inventory items created')
 
-  // ─── Branch Stock ─────────────────────────────────────────────────────────────
-  const stockQtyMap: Record<string, number[]> = {
-    'OIL-001': [15, 25, 18],  // Makkah below reorder!
-    'CHK-001': [80, 60, 45],
-    'RIC-001': [150, 120, 95],
-    'TOM-001': [40, 35, 22],
-    'LAM-001': [25, 18, 12],  // Madina1 & 2 below reorder!
-    'FLR-001': [120, 100, 90],
-    'ONI-001': [60, 55, 40],
-    'GAR-001': [25, 20, 15],
-    'SPE-001': [8, 12, 7],    // Makkah & Madina2 below reorder!
-    'BOT-001': [45, 30, 20],
-  }
-
-  for (const [code, qtys] of Object.entries(stockQtyMap)) {
-    for (let i = 0; i < branches.length; i++) {
-      const item = itemsData.find(it => it.code === code)!
+  // ─── Branch Stock — start every branch at zero on-hand quantity ──────────────
+  // Real stock will only ever move because a Purchase Order was received or a
+  // stock-in/wastage entry was recorded — never fabricated.
+  for (const item of itemsData) {
+    for (const branch of branches) {
       await prisma.branchStock.create({
         data: {
           organizationId: org.id,
-          branchId: branches[i].id,
-          itemId: items[code],
-          quantityOnHand: qtys[i],
+          branchId: branch.id,
+          itemId: items[item.code],
+          quantityOnHand: 0,
           averageCost: item.costPrice,
-          totalValue: qtys[i] * item.costPrice,
+          totalValue: 0,
           reorderPoint: item.reorderPoint,
         },
       })
     }
   }
-  console.log('Branch stock created')
+  console.log('Branch stock initialized at zero (real reorder points, no fake quantities)')
 
-  // ─── Daily Sales (last 30 days) ───────────────────────────────────────────────
-  // Target monthly amounts: Makkah ~125k, Madina1 ~102k, Madina2 ~85.5k
-  const salesConfig = [
-    { branch: branchMakkah, dailyBase: 4167, variance: 0.3 },     // ~125k/month
-    { branch: branchMadina1, dailyBase: 3400, variance: 0.25 },   // ~102k/month
-    { branch: branchMadina2, dailyBase: 2850, variance: 0.2 },    // ~85.5k/month
-  ]
-
-  let saleCounters: Record<string, number> = {
-    [branchMakkah.id]: 0,
-    [branchMadina1.id]: 0,
-    [branchMadina2.id]: 0,
-  }
-
-  const saleStatuses = ['approved', 'approved', 'approved', 'approved', 'approved', 'submitted', 'draft', 'void']
-
-  for (let day = 30; day >= 0; day--) {
-    const saleDate = daysAgo(day)
-    const isToday = day === 0
-
-    for (const { branch, dailyBase, variance } of salesConfig) {
-      const status = isToday ? 'draft' : day <= 2 ? 'submitted' : saleStatuses[Math.floor(Math.random() * saleStatuses.length)]
-
-      saleCounters[branch.id]++
-      const year = saleDate.getFullYear()
-      const prefix = branch.salePrefix || 'SL'
-      const saleNo = `${prefix}-${year}-${saleCounters[branch.id].toString().padStart(4, '0')}`
-
-      const dailyTotal = rand(dailyBase * (1 - variance), dailyBase * (1 + variance))
-      const cashPct = rand(0.4, 0.6)
-      const cardPct = rand(0.15, 0.25)
-      const deliveryPct = 1 - cashPct - cardPct
-      const cashAmount = Math.round(dailyTotal * cashPct * 100) / 100
-      const cardAmount = Math.round(dailyTotal * cardPct * 100) / 100
-      const deliveryAmount = Math.round(dailyTotal * deliveryPct * 100) / 100
-
-      const subtotal = Math.round(dailyTotal / 1.15 * 100) / 100
-      const vatAmount = Math.round(subtotal * 0.15 * 100) / 100
-      const totalAmount = subtotal + vatAmount
-      const refundAmount = status !== 'void' ? rand(0, dailyTotal * 0.02) : 0
-      const netAmount = totalAmount - refundAmount
-      const discountAmount = rand(0, subtotal * 0.05)
-
-      await prisma.dailySale.create({
-        data: {
-          organizationId: org.id,
-          branchId: branch.id,
-          saleNo,
-          saleDate,
-          cashAmount,
-          cardAmount,
-          deliveryAmount,
-          bankTransferAmount: 0,
-          otherAmount: 0,
-          subtotal,
-          discountAmount,
-          vatAmount,
-          totalAmount,
-          refundAmount,
-          netAmount,
-          vatRate: 15,
-          status,
-          createdBy: adminUser.id,
-          ...(status === 'void' && { voidReason: 'Data entry error' }),
-          ...(status !== 'draft' && status !== 'void' && {
-            submittedBy: adminUser.id,
-            submittedAt: saleDate,
-          }),
-          ...(status === 'approved' && {
-            approvedBy: adminUser.id,
-            approvedAt: saleDate,
-          }),
-          deliveryBreakdown: deliveryAmount > 0 ? {
-            create: [
-              {
-                platform: 'HungerStation',
-                amount: Math.round(deliveryAmount * 0.5 * 100) / 100,
-                commission: Math.round(deliveryAmount * 0.5 * 0.15 * 100) / 100,
-                netAmount: Math.round(deliveryAmount * 0.5 * 0.85 * 100) / 100,
-              },
-              {
-                platform: 'Jahez',
-                amount: Math.round(deliveryAmount * 0.3 * 100) / 100,
-                commission: Math.round(deliveryAmount * 0.3 * 0.12 * 100) / 100,
-                netAmount: Math.round(deliveryAmount * 0.3 * 0.88 * 100) / 100,
-              },
-              {
-                platform: 'Noon Food',
-                amount: Math.round(deliveryAmount * 0.2 * 100) / 100,
-                commission: Math.round(deliveryAmount * 0.2 * 0.18 * 100) / 100,
-                netAmount: Math.round(deliveryAmount * 0.2 * 0.82 * 100) / 100,
-              },
-            ],
-          } : undefined,
-        },
-      })
-    }
-  }
-  console.log('Daily sales created (31 days x 3 branches)')
-
-  // ─── Cash Closings ────────────────────────────────────────────────────────────
-  let closingCounters: Record<string, number> = {
-    [branchMakkah.id]: 0,
-    [branchMadina1.id]: 0,
-    [branchMadina2.id]: 0,
-  }
-
-  for (let day = 30; day >= 3; day--) {
-    const closingDate = daysAgo(day)
-
-    for (const branch of branches) {
-      closingCounters[branch.id]++
-      const year = closingDate.getFullYear()
-      const closingNo = `CC-${branch.code}-${year}-${closingCounters[branch.id].toString().padStart(4, '0')}`
-      const openingCash = rand(500, 2000)
-      const cashSales = rand(1500, 4000)
-      const cashExpensesPaid = rand(200, 800)
-      const cashDeposited = rand(1000, 3000)
-      const otherCashIn = rand(0, 200)
-      const otherCashOut = rand(0, 100)
-      const expectedCash = openingCash + cashSales + otherCashIn - cashExpensesPaid - cashDeposited - otherCashOut
-      const deviation = rand(-50, 50)
-      const actualCashCounted = Math.round((expectedCash + deviation) * 100) / 100
-      const difference = actualCashCounted - expectedCash
-
-      const status = day > 5 ? 'approved' : day > 2 ? 'submitted' : 'draft'
-
-      await prisma.cashClosing.create({
-        data: {
-          organizationId: org.id,
-          branchId: branch.id,
-          closingNo,
-          closingDate,
-          openingCash,
-          cashSales,
-          cashExpensesPaid,
-          cashDeposited,
-          otherCashIn,
-          otherCashOut,
-          expectedCash,
-          actualCashCounted,
-          difference,
-          differenceType: Math.abs(difference) < 0.01 ? 'balanced' : difference < 0 ? 'short' : 'excess',
-          status,
-          createdBy: adminUser.id,
-          ...(status !== 'draft' && { approvedBy: adminUser.id, approvedAt: closingDate }),
-        },
-      })
-    }
-  }
-  console.log('Cash closings created')
-
-  // ─── Expenses ─────────────────────────────────────────────────────────────────
-  const expenseTemplates = [
-    { catName: 'Food Purchases', descr: 'Weekly food supply purchase', minAmt: 3000, maxAmt: 8000 },
-    { catName: 'Salaries', descr: 'Monthly staff salaries', minAmt: 15000, maxAmt: 25000 },
-    { catName: 'Rent', descr: 'Monthly rent payment', minAmt: 8000, maxAmt: 12000 },
-    { catName: 'Utilities', descr: 'Electricity and water bill', minAmt: 1500, maxAmt: 3500 },
-    { catName: 'Delivery Charges', descr: 'Delivery platform fees', minAmt: 500, maxAmt: 1500 },
-    { catName: 'Maintenance', descr: 'Equipment maintenance', minAmt: 500, maxAmt: 3000 },
-    { catName: 'Miscellaneous', descr: 'Miscellaneous operational expenses', minAmt: 200, maxAmt: 1000 },
-  ]
-
-  let expCounters: Record<string, number> = {
-    [branchMakkah.id]: 0,
-    [branchMadina1.id]: 0,
-    [branchMadina2.id]: 0,
-  }
-
-  for (let day = 29; day >= 0; day--) {
-    const expDate = daysAgo(day)
-    // About 2 expenses per branch per day
-    for (const branch of branches) {
-      const numExpenses = Math.floor(Math.random() * 2) + 1
-      for (let e = 0; e < numExpenses; e++) {
-        const template = expenseTemplates[Math.floor(Math.random() * expenseTemplates.length)]
-        expCounters[branch.id]++
-        const year = expDate.getFullYear()
-        const prefix = branch.expensePrefix || 'EXP'
-        const expenseNo = `${prefix}-${year}-${expCounters[branch.id].toString().padStart(4, '0')}`
-        const amount = rand(template.minAmt, template.maxAmt)
-        const vatRate = Math.random() > 0.5 ? 15 : 0
-        const vatAmount = Math.round(amount * vatRate / 100 * 100) / 100
-        const totalAmount = amount + vatAmount
-        const status = day > 5 ? 'approved' : day > 2 ? 'submitted' : 'draft'
-
-        await prisma.expense.create({
-          data: {
-            organizationId: org.id,
-            branchId: branch.id,
-            expenseNo,
-            expenseDate: expDate,
-            categoryId: categories[template.catName],
-            description: template.descr,
-            amount,
-            vatAmount,
-            vatRate,
-            totalAmount,
-            paymentMethod: Math.random() > 0.5 ? 'cash' : 'bank_transfer',
-            status,
-            createdBy: adminUser.id,
-            ...(status !== 'draft' && {
-              submittedBy: adminUser.id,
-              submittedAt: expDate,
-            }),
-            ...(status === 'approved' && {
-              approvedBy: adminUser.id,
-              approvedAt: expDate,
-            }),
-          },
-        })
-      }
-    }
-  }
-  console.log('Expenses created')
-
-  // ─── Supplier ─────────────────────────────────────────────────────────────────
-  const supplier = await prisma.supplier.create({
+  // ─── Suppliers (master data — no fabricated bills/purchase orders) ──────────
+  await prisma.supplier.create({
     data: {
       organizationId: org.id,
       name: 'Al-Noor Trading Company',
@@ -706,7 +478,7 @@ async function main() {
     },
   })
 
-  const supplier2 = await prisma.supplier.create({
+  await prisma.supplier.create({
     data: {
       organizationId: org.id,
       name: 'Arabian Spices Trading',
@@ -722,281 +494,7 @@ async function main() {
   })
   console.log('Suppliers created')
 
-  // ─── Bills ────────────────────────────────────────────────────────────────────
-  // Recent paid bill
-  const bill1 = await prisma.bill.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMakkah.id,
-      supplierId: supplier.id,
-      billNo: `BILL-${new Date().getFullYear()}-0001`,
-      supplierBillNo: 'SUP-2024-8821',
-      billDate: daysAgo(20),
-      dueDate: daysAgo(10), // Already past due
-      subtotal: 15000,
-      vatAmount: 2250,
-      totalAmount: 17250,
-      paidAmount: 17250,
-      balanceDue: 0,
-      status: 'paid',
-      createdBy: adminUser.id,
-      approvedBy: adminUser.id,
-      approvedAt: daysAgo(19),
-      items: {
-        create: [
-          { description: 'Olive Oil 100L', quantity: 100, unitPrice: 45, vatRate: 15, vatAmount: 675, totalAmount: 5175 },
-          { description: 'Chicken Breast 200kg', quantity: 200, unitPrice: 28, vatRate: 15, vatAmount: 840, totalAmount: 6440 },
-          { description: 'Basmati Rice 300kg', quantity: 300, unitPrice: 12, vatRate: 15, vatAmount: 540, totalAmount: 4140 },
-        ],
-      },
-    },
-  })
-
-  // Record the payment for bill1
-  await prisma.payment.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMakkah.id,
-      billId: bill1.id,
-      paymentDate: daysAgo(15),
-      amount: 17250,
-      paymentMethod: 'bank_transfer',
-      referenceNo: 'TXN-20240115-001',
-      createdBy: adminUser.id,
-    },
-  })
-
-  // Overdue bill (past due, unpaid)
-  await prisma.bill.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMadina1.id,
-      supplierId: supplier2.id,
-      billNo: `BILL-${new Date().getFullYear()}-0002`,
-      supplierBillNo: 'ARS-2024-0099',
-      billDate: daysAgo(45),
-      dueDate: daysAgo(15), // OVERDUE
-      subtotal: 8500,
-      vatAmount: 1275,
-      totalAmount: 9775,
-      paidAmount: 0,
-      balanceDue: 9775,
-      status: 'approved',
-      createdBy: adminUser.id,
-      approvedBy: adminUser.id,
-      approvedAt: daysAgo(44),
-      items: {
-        create: [
-          { description: 'Mixed Spices 100kg', quantity: 100, unitPrice: 85, vatRate: 15, vatAmount: 1275, totalAmount: 9775 },
-        ],
-      },
-    },
-  })
-
-  // Partially paid bill
-  const bill3 = await prisma.bill.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMakkah.id,
-      supplierId: supplier.id,
-      billNo: `BILL-${new Date().getFullYear()}-0003`,
-      billDate: daysAgo(10),
-      dueDate: daysAgo(-20), // Due in future
-      subtotal: 22000,
-      vatAmount: 3300,
-      totalAmount: 25300,
-      paidAmount: 10000,
-      balanceDue: 15300,
-      status: 'partial',
-      createdBy: adminUser.id,
-      approvedBy: adminUser.id,
-      approvedAt: daysAgo(9),
-      items: {
-        create: [
-          { description: 'Chicken Breast 500kg', quantity: 500, unitPrice: 28, vatRate: 15, vatAmount: 2100, totalAmount: 16100 },
-          { description: 'Lamb Meat 100kg', quantity: 100, unitPrice: 65, vatRate: 15, vatAmount: 975, totalAmount: 7475 },
-        ],
-      },
-    },
-  })
-
-  await prisma.payment.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMakkah.id,
-      billId: bill3.id,
-      paymentDate: daysAgo(5),
-      amount: 10000,
-      paymentMethod: 'bank_transfer',
-      referenceNo: 'TXN-PARTIAL-001',
-      createdBy: adminUser.id,
-    },
-  })
-
-  // Draft bill needing approval for Madina2
-  await prisma.bill.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMadina2.id,
-      supplierId: supplier.id,
-      billNo: `BILL-${new Date().getFullYear()}-0004`,
-      billDate: daysAgo(2),
-      dueDate: daysAgo(-28),
-      subtotal: 12000,
-      vatAmount: 1800,
-      totalAmount: 13800,
-      paidAmount: 0,
-      balanceDue: 13800,
-      status: 'draft',
-      createdBy: adminUser.id,
-    },
-  })
-
-  console.log('Bills created (1 paid, 1 overdue, 1 partial, 1 draft)')
-
-  // ─── Journal Entries ──────────────────────────────────────────────────────────
-  const year = new Date().getFullYear()
-
-  // Opening balances entry
-  await prisma.journalEntry.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMakkah.id,
-      entryNo: `JE-${year}-0001`,
-      entryDate: daysAgo(30),
-      description: 'Opening balances - Makkah Branch',
-      status: 'posted',
-      totalDebit: 500000,
-      totalCredit: 500000,
-      isBalanced: true,
-      postedBy: adminUser.id,
-      postedAt: daysAgo(30),
-      createdBy: adminUser.id,
-      lines: {
-        create: [
-          { accountId: accounts['1010'], description: 'Opening bank balance', debitAmount: 200000, creditAmount: 0, lineOrder: 1 },
-          { accountId: accounts['1000'], description: 'Opening cash balance', debitAmount: 50000, creditAmount: 0, lineOrder: 2 },
-          { accountId: accounts['1200'], description: 'Opening inventory value', debitAmount: 250000, creditAmount: 0, lineOrder: 3 },
-          { accountId: accounts['3000'], description: "Owner's equity", debitAmount: 0, creditAmount: 500000, lineOrder: 4 },
-        ],
-      },
-    },
-  })
-
-  // Revenue recognition entry
-  await prisma.journalEntry.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMakkah.id,
-      entryNo: `JE-${year}-0002`,
-      entryDate: daysAgo(7),
-      description: 'Weekly sales revenue recognition',
-      status: 'posted',
-      totalDebit: 28750,
-      totalCredit: 28750,
-      isBalanced: true,
-      postedBy: adminUser.id,
-      postedAt: daysAgo(7),
-      createdBy: adminUser.id,
-      lines: {
-        create: [
-          { accountId: accounts['1000'], description: 'Cash from sales', debitAmount: 25000, creditAmount: 0, lineOrder: 1 },
-          { accountId: accounts['2100'], description: 'VAT collected', debitAmount: 3750, creditAmount: 0, lineOrder: 2 },
-          { accountId: accounts['4000'], description: 'Sales revenue', debitAmount: 0, creditAmount: 25000, lineOrder: 3 },
-          { accountId: accounts['2100'], description: 'VAT payable', debitAmount: 0, creditAmount: 3750, lineOrder: 4 },
-        ],
-      },
-    },
-  })
-
-  // Draft entry
-  await prisma.journalEntry.create({
-    data: {
-      organizationId: org.id,
-      branchId: branchMadina1.id,
-      entryNo: `JE-${year}-0003`,
-      entryDate: daysAgo(1),
-      description: 'Supplier payment - Al-Noor Trading',
-      status: 'draft',
-      totalDebit: 17250,
-      totalCredit: 17250,
-      isBalanced: true,
-      createdBy: adminUser.id,
-      lines: {
-        create: [
-          { accountId: accounts['2000'], description: 'Accounts payable - Al-Noor', debitAmount: 17250, creditAmount: 0, lineOrder: 1 },
-          { accountId: accounts['1010'], description: 'Bank payment', debitAmount: 0, creditAmount: 17250, lineOrder: 2 },
-        ],
-      },
-    },
-  })
-
-  console.log('Journal entries created')
-
-  // ─── Notifications ────────────────────────────────────────────────────────────
-  const notifData = [
-    {
-      userId: adminUser.id,
-      type: 'warning',
-      title: 'Low Stock Alert',
-      message: 'Olive Oil stock at Makkah Branch is below reorder point (15 litres < 20 litres)',
-      link: '/inventory/stock',
-    },
-    {
-      userId: adminUser.id,
-      type: 'warning',
-      title: 'Overdue Bill',
-      message: 'Bill #BILL-2024-0002 from Arabian Spices Trading is overdue by 15 days. Amount: SAR 9,775',
-      link: '/suppliers/bills',
-    },
-    {
-      userId: adminUser.id,
-      type: 'info',
-      title: 'Sales Submitted',
-      message: '3 daily sales records are pending your approval',
-      link: '/sales?status=submitted',
-    },
-    {
-      userId: adminUser.id,
-      type: 'success',
-      title: 'Cash Closing Approved',
-      message: 'Cash closing CC-MKH-2024-0028 has been approved',
-      link: '/cash-closing',
-    },
-  ]
-
-  for (const notif of notifData) {
-    await prisma.notification.create({
-      data: { ...notif, organizationId: org.id },
-    })
-  }
-  console.log('Notifications created')
-
-  // ─── Audit Logs ───────────────────────────────────────────────────────────────
-  const auditData = [
-    { action: 'CREATE', module: 'sales', resourceType: 'DailySale', resourceRef: 'SL-MKH-2026-0031', branchId: branchMakkah.id },
-    { action: 'APPROVE', module: 'sales', resourceType: 'DailySale', resourceRef: 'SL-MD1-2026-0030', branchId: branchMadina1.id },
-    { action: 'CREATE', module: 'expenses', resourceType: 'Expense', resourceRef: 'EXP-MKH-2026-0060', branchId: branchMakkah.id },
-    { action: 'APPROVE', module: 'cash_closing', resourceType: 'CashClosing', resourceRef: 'CC-MKH-2024-0028', branchId: branchMakkah.id },
-    { action: 'CREATE', module: 'bills', resourceType: 'Bill', resourceRef: 'BILL-2026-0004', branchId: branchMadina2.id },
-    { action: 'LOGIN', module: 'auth', resourceType: 'User', resourceRef: 'admin@zaitoon.com' },
-  ]
-
-  for (const log of auditData) {
-    await prisma.auditLog.create({
-      data: {
-        organizationId: org.id,
-        userId: adminUser.id,
-        userEmail: adminUser.email,
-        userName: `${adminUser.firstName} ${adminUser.lastName}`,
-        ipAddress: '127.0.0.1',
-        ...log,
-      },
-    })
-  }
-  console.log('Audit logs created')
-
-  console.log('\n=== SEED COMPLETE ===')
+  console.log('\n=== SEED COMPLETE (structural/reference data only — no fabricated transactions) ===')
   console.log(`Organization: ${org.name} (${org.id})`)
   console.log(`Branches: ${branches.map((b) => `${b.name} (${b.id})`).join(', ')}`)
   console.log('\nLogin credentials:')

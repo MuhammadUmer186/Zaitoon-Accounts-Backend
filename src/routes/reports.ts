@@ -245,7 +245,7 @@ router.get('/financial', async (req: Request, res: Response) => {
 
 // GET /reports/dashboard-v2 — comprehensive data for premium dashboard
 router.get('/dashboard-v2', async (req: Request, res: Response) => {
-  const { branchId, days = '30' } = req.query as Record<string, string>
+  const { branchId, days = '30', compare = 'branch' } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const periodDays = Math.min(90, Math.max(7, parseInt(days)))
 
@@ -432,6 +432,84 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     }),
   ])
 
+  // ── Week/Month period-over-period comparison (only computed when requested) ─
+  let comparison: {
+    mode: 'week' | 'month'
+    currentLabel: string
+    previousLabel: string
+    byBranch: { branchId: string; branchName: string; current: number; previous: number; changePct: number }[]
+    trend: { dayOffset: number; current: number; previous: number }[]
+  } | null = null
+
+  if (compare === 'week' || compare === 'month') {
+    let currentStart: Date, currentEnd: Date, previousStart: Date, previousEnd: Date, currentLabel: string, previousLabel: string
+
+    if (compare === 'week') {
+      currentStart = new Date(today)
+      currentStart.setDate(today.getDate() - 6)
+      currentEnd = endOfToday
+      previousStart = new Date(today)
+      previousStart.setDate(today.getDate() - 13)
+      previousEnd = new Date(today)
+      previousEnd.setDate(today.getDate() - 7)
+      previousEnd.setHours(23, 59, 59, 999)
+      currentLabel = 'This Week'
+      previousLabel = 'Last Week'
+    } else {
+      currentStart = startOfMonth
+      currentEnd = endOfToday
+      const daysElapsed = today.getDate() // 1-based day of month, e.g. 15
+      previousStart = new Date(today.getFullYear(), today.getMonth() - 1, 1)
+      previousEnd = new Date(today.getFullYear(), today.getMonth() - 1, daysElapsed, 23, 59, 59, 999)
+      currentLabel = 'This Month (to date)'
+      previousLabel = 'Last Month (same days)'
+    }
+
+    const periodLen = compare === 'week'
+      ? 7
+      : Math.floor((currentEnd.getTime() - currentStart.getTime()) / (1000 * 60 * 60 * 24)) + 1
+
+    const sumSalesFor = (start: Date, end: Date, extraFilter: Record<string, unknown> = {}) =>
+      prisma.dailySale.aggregate({
+        where: { ...orgFilter, ...notVoid, ...extraFilter, saleDate: { gte: start, lte: end } },
+        _sum: { netAmount: true },
+      })
+
+    const byBranch = await Promise.all(
+      branches.map(async (branch) => {
+        const [curr, prev] = await Promise.all([
+          sumSalesFor(currentStart, currentEnd, { branchId: branch.id }),
+          sumSalesFor(previousStart, previousEnd, { branchId: branch.id }),
+        ])
+        const current = curr._sum.netAmount ?? 0
+        const previous = prev._sum.netAmount ?? 0
+        const changePct = previous > 0 ? Math.round(((current - previous) / previous) * 1000) / 10 : 0
+        return { branchId: branch.id, branchName: branch.name, current, previous, changePct }
+      })
+    )
+
+    const trend: { dayOffset: number; current: number; previous: number }[] = []
+    for (let i = 0; i < periodLen; i++) {
+      const cDay = new Date(currentStart)
+      cDay.setDate(currentStart.getDate() + i)
+      const cDayEnd = new Date(cDay)
+      cDayEnd.setHours(23, 59, 59, 999)
+
+      const pDay = new Date(previousStart)
+      pDay.setDate(previousStart.getDate() + i)
+      const pDayEnd = new Date(pDay)
+      pDayEnd.setHours(23, 59, 59, 999)
+
+      const [curr, prev] = await Promise.all([
+        sumSalesFor(cDay, cDayEnd, branchFilter),
+        sumSalesFor(pDay, pDayEnd, branchFilter),
+      ])
+      trend.push({ dayOffset: i + 1, current: curr._sum.netAmount ?? 0, previous: prev._sum.netAmount ?? 0 })
+    }
+
+    comparison = { mode: compare, currentLabel, previousLabel, byBranch, trend }
+  }
+
   res.json({
     period: { start: periodStart.toISOString(), end: endOfToday.toISOString(), days: periodDays },
     kpis: {
@@ -448,6 +526,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     salesTrend,
     expenseBreakdown,
     paymentBreakdown,
+    comparison,
     recentActivity: auditLogs.map((log) => ({
       id: log.id,
       description: `${log.action} ${log.resourceType ?? ''} ${log.resourceRef ?? ''}`.trim(),

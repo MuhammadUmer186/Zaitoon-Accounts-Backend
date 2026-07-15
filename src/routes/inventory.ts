@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
+import { applyStockIn } from '../utils/stock'
 import { AppError } from '../middleware/error'
 
 const router = Router()
@@ -166,58 +167,17 @@ router.post('/stock-in', async (req: Request, res: Response) => {
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
 
-  const totalValue = body.quantity * body.unitCost
-
-  // Create stock movement
-  const movement = await prisma.stockMovement.create({
-    data: {
-      organizationId: req.user.organizationId,
-      branchId: body.branchId,
-      itemId: body.itemId,
-      movementType: 'stock_in',
-      quantity: body.quantity,
-      unitCost: body.unitCost,
-      totalValue,
-      referenceType: body.referenceType,
-      referenceId: body.referenceId,
-      notes: body.notes,
-      createdBy: req.user.id,
-    },
+  const movement = await applyStockIn(prisma, {
+    organizationId: req.user.organizationId,
+    branchId: body.branchId,
+    itemId: body.itemId,
+    quantity: body.quantity,
+    unitCost: body.unitCost,
+    referenceType: body.referenceType,
+    referenceId: body.referenceId,
+    notes: body.notes,
+    createdBy: req.user.id,
   })
-
-  // Update or create branch stock (weighted average cost)
-  const existingStock = await prisma.branchStock.findUnique({
-    where: { branchId_itemId: { branchId: body.branchId, itemId: body.itemId } },
-  })
-
-  if (existingStock) {
-    const newQty = existingStock.quantityOnHand + body.quantity
-    const newTotalValue = existingStock.totalValue + totalValue
-    const newAvgCost = newQty > 0 ? newTotalValue / newQty : body.unitCost
-
-    await prisma.branchStock.update({
-      where: { branchId_itemId: { branchId: body.branchId, itemId: body.itemId } },
-      data: {
-        quantityOnHand: newQty,
-        averageCost: newAvgCost,
-        totalValue: newTotalValue,
-        lastUpdated: new Date(),
-      },
-    })
-  } else {
-    await prisma.branchStock.create({
-      data: {
-        organizationId: req.user.organizationId,
-        branchId: body.branchId,
-        itemId: body.itemId,
-        quantityOnHand: body.quantity,
-        averageCost: body.unitCost,
-        totalValue,
-        reorderPoint: item.reorderPoint,
-        lastUpdated: new Date(),
-      },
-    })
-  }
 
   res.status(201).json(movement)
 })
@@ -246,6 +206,20 @@ router.get('/movements', async (req: Request, res: Response) => {
   ])
 
   res.json(paginatedResponse(movements, total, page, limit))
+})
+
+// GET /inventory/wastage/pending-approval
+router.get('/wastage/pending-approval', async (req: Request, res: Response) => {
+  const { branchId } = req.query as Record<string, string>
+  const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'draft' }
+  if (branchId) where.branchId = branchId
+
+  const reports = await prisma.wastageReport.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    include: { branch: { select: { id: true, name: true } } },
+  })
+  res.json({ data: reports })
 })
 
 // GET /inventory/wastage

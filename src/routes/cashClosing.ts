@@ -46,6 +46,20 @@ function getDifferenceType(diff: number): string {
   return diff < 0 ? 'short' : 'excess'
 }
 
+// GET /cash-closing/pending-approval
+router.get('/pending-approval', async (req: Request, res: Response) => {
+  const { branchId } = req.query as Record<string, string>
+  const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'submitted' }
+  if (branchId) where.branchId = branchId
+
+  const closings = await prisma.cashClosing.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    include: { branch: { select: { id: true, name: true } } },
+  })
+  res.json({ data: closings })
+})
+
 // GET /cash-closing
 router.get('/', async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
