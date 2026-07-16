@@ -1,3 +1,4 @@
+import crypto from 'crypto'
 import jwt from 'jsonwebtoken'
 import { config } from '../config'
 
@@ -9,6 +10,7 @@ export interface AccessTokenPayload {
 
 export interface RefreshTokenPayload {
   userId: string
+  jti: string
 }
 
 export function signAccessToken(userId: string, organizationId: string, email: string): string {
@@ -21,7 +23,7 @@ export function signAccessToken(userId: string, organizationId: string, email: s
 
 export function signRefreshToken(userId: string): string {
   return jwt.sign(
-    { userId } as RefreshTokenPayload,
+    { userId, jti: crypto.randomUUID() } as RefreshTokenPayload,
     config.jwtRefreshSecret,
     { expiresIn: config.jwtRefreshExpiresIn } as jwt.SignOptions
   )

@@ -488,24 +488,25 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       })
     )
 
-    const trend: { dayOffset: number; current: number; previous: number }[] = []
-    for (let i = 0; i < periodLen; i++) {
-      const cDay = new Date(currentStart)
-      cDay.setDate(currentStart.getDate() + i)
-      const cDayEnd = new Date(cDay)
-      cDayEnd.setHours(23, 59, 59, 999)
+    const trend = await Promise.all(
+      Array.from({ length: periodLen }, (_, i) => i).map(async (i) => {
+        const cDay = new Date(currentStart)
+        cDay.setDate(currentStart.getDate() + i)
+        const cDayEnd = new Date(cDay)
+        cDayEnd.setHours(23, 59, 59, 999)
 
-      const pDay = new Date(previousStart)
-      pDay.setDate(previousStart.getDate() + i)
-      const pDayEnd = new Date(pDay)
-      pDayEnd.setHours(23, 59, 59, 999)
+        const pDay = new Date(previousStart)
+        pDay.setDate(previousStart.getDate() + i)
+        const pDayEnd = new Date(pDay)
+        pDayEnd.setHours(23, 59, 59, 999)
 
-      const [curr, prev] = await Promise.all([
-        sumSalesFor(cDay, cDayEnd, branchFilter),
-        sumSalesFor(pDay, pDayEnd, branchFilter),
-      ])
-      trend.push({ dayOffset: i + 1, current: curr._sum.netAmount ?? 0, previous: prev._sum.netAmount ?? 0 })
-    }
+        const [curr, prev] = await Promise.all([
+          sumSalesFor(cDay, cDayEnd, branchFilter),
+          sumSalesFor(pDay, pDayEnd, branchFilter),
+        ])
+        return { dayOffset: i + 1, current: curr._sum.netAmount ?? 0, previous: prev._sum.netAmount ?? 0 }
+      })
+    )
 
     comparison = { mode: compare, currentLabel, previousLabel, byBranch, trend }
   }

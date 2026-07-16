@@ -89,25 +89,23 @@ router.post('/login', async (req: Request, res: Response) => {
       throw new AppError('Invalid email or password', 401, 'INVALID_CREDENTIALS')
     }
 
-    // Update last login
-    await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } })
-
     const accessToken = signAccessToken(user.id, user.organizationId, user.email)
     const refreshToken = signRefreshToken(user.id)
 
-    // Store refresh token
     const expiresAt = new Date()
     expiresAt.setDate(expiresAt.getDate() + 7)
-    await prisma.refreshToken.create({
-      data: { token: refreshToken, userId: user.id, expiresAt },
-    })
 
-    const permissionMatrix = await buildPermissionMatrix(user.id, user.organizationId)
-
-    const branches = await prisma.branch.findMany({
-      where: { organizationId: user.organizationId, isActive: true },
-      orderBy: { name: 'asc' },
-    })
+    const [, permissionMatrix, branches] = await Promise.all([
+      prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } }),
+      buildPermissionMatrix(user.id, user.organizationId),
+      prisma.branch.findMany({
+        where: { organizationId: user.organizationId, isActive: true },
+        orderBy: { name: 'asc' },
+      }),
+      prisma.refreshToken.create({
+        data: { token: refreshToken, userId: user.id, expiresAt },
+      }),
+    ])
 
     const { passwordHash: _ph, ...userWithoutPassword } = user
 
