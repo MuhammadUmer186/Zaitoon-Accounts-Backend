@@ -1,6 +1,6 @@
-import 'dotenv/config'
-import { PrismaClient } from '@prisma/client'
-import bcrypt from 'bcryptjs'
+require('dotenv/config')
+const { PrismaClient } = require('@prisma/client')
+const bcrypt = require('bcryptjs')
 
 const prisma = new PrismaClient()
 
@@ -152,7 +152,7 @@ async function main() {
     { code: '6800', name: 'Bank Charges', accountType: 'expense', normalBalance: 'debit', isHeader: false },
   ]
 
-  const accounts: Record<string, string> = {}
+  const accounts = {}
   for (const acc of accountsData) {
     const created = await prisma.account.create({
       data: { ...acc, organizationId: org.id },
@@ -206,7 +206,7 @@ async function main() {
     { key: 'can_manage_settings', module: 'settings', description: 'Manage organization settings' },
   ]
 
-  const permissions: Record<string, string> = {}
+  const permissions = {}
   for (const perm of permissionsData) {
     const created = await prisma.permission.create({ data: perm })
     permissions[perm.key] = created.id
@@ -432,7 +432,7 @@ async function main() {
     { code: 'BOT-001', name: 'Water Bottles (Case)', category: 'Beverages', unit: 'case', costPrice: 25, reorderPoint: 30 },
   ]
 
-  const items: Record<string, string> = {}
+  const items = {}
   for (const item of itemsData) {
     const created = await prisma.item.create({
       data: { ...item, organizationId: org.id },

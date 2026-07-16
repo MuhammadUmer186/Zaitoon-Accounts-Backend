@@ -1,5 +1,5 @@
-import 'dotenv/config'
-import { PrismaClient } from '@prisma/client'
+require('dotenv/config')
+const { PrismaClient } = require('@prisma/client')
 
 const prisma = new PrismaClient()
 
@@ -81,7 +81,7 @@ const cashierPerms = [
 
 const allKeys = permissionsData.map((p) => p.key)
 
-const roleGrants: Record<string, string[]> = {
+const roleGrants = {
   super_admin: allKeys,
   admin: allKeys,
   accountant: accountantPerms,
@@ -92,7 +92,7 @@ const roleGrants: Record<string, string[]> = {
 async function main() {
   console.log('Syncing permissions...')
 
-  const permissionIds: Record<string, string> = {}
+  const permissionIds = {}
   let permsCreated = 0
   for (const perm of permissionsData) {
     const existing = await prisma.permission.findUnique({ where: { key: perm.key } })
@@ -111,7 +111,7 @@ async function main() {
 
   let grantsCreated = 0
   for (const role of roles) {
-    const keys = roleGrants[role.name] ?? []
+    const keys = roleGrants[role.name] || []
     for (const key of keys) {
       const permissionId = permissionIds[key]
       if (!permissionId) continue
