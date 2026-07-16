@@ -8,6 +8,7 @@
     "db:push": "prisma db push",
     "db:seed": "ts-node prisma/seed.ts",
     "db:clear-data": "ts-node prisma/clear-data.ts",
+    "db:sync-permissions": "ts-node prisma/sync-permissions.ts",
     "db:studio": "prisma studio"
   },
   "dependencies": {
