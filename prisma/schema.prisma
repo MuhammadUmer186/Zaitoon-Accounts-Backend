@@ -386,7 +386,6 @@ model Supplier {
   updatedAt        DateTime        @updatedAt
   organization     Organization    @relation(fields: [organizationId], references: [id])
   bills            Bill[]
-  purchaseOrders   PurchaseOrder[]
 }
 
 model Bill {
@@ -405,6 +404,7 @@ model Bill {
   paidAmount     Float        @default(0)
   balanceDue     Float
   status         String       @default("draft")
+  notes          String?
   documentId     String?
   journalEntryId String?
   approvedBy     String?
@@ -544,7 +544,6 @@ model PurchaseOrder {
   id                   String              @id @default(cuid())
   organizationId       String
   branchId             String
-  supplierId           String
   poNo                 String
   orderDate            DateTime
   expectedDeliveryDate DateTime?
@@ -553,7 +552,6 @@ model PurchaseOrder {
   totalAmount          Float               @default(0)
   status               String              @default("draft")
   notes                String?
-  documentId           String?
   rejectionReason      String?
   voidReason           String?
   submittedBy          String?
@@ -567,7 +565,6 @@ model PurchaseOrder {
   updatedAt            DateTime            @updatedAt
   organization         Organization        @relation(fields: [organizationId], references: [id])
   branch               Branch              @relation(fields: [branchId], references: [id])
-  supplier             Supplier            @relation(fields: [supplierId], references: [id])
   items                PurchaseOrderItem[]
 
   @@unique([organizationId, poNo])
@@ -579,10 +576,10 @@ model PurchaseOrderItem {
   itemId          String?
   description     String
   quantity        Float
-  unitCost        Float
+  unitCost        Float         @default(0)
   vatRate         Float         @default(0)
   vatAmount       Float         @default(0)
-  totalCost       Float
+  totalCost       Float         @default(0)
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   item            Item?         @relation(fields: [itemId], references: [id])
 }

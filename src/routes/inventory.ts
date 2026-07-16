@@ -1,34 +1,17 @@
+import fs from 'fs'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { upload } from '../middleware/upload'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { applyStockIn } from '../utils/stock'
+import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
 
 const router = Router()
 
 router.use(authenticate)
-
-const itemSchema = z.object({
-  code: z.string().min(1),
-  name: z.string().min(1),
-  description: z.string().optional(),
-  category: z.string().optional(),
-  unit: z.string().default('kg'),
-  costPrice: z.number().default(0),
-  reorderPoint: z.number().default(0),
-})
-
-const stockInSchema = z.object({
-  branchId: z.string(),
-  itemId: z.string(),
-  quantity: z.number().positive(),
-  unitCost: z.number().default(0),
-  notes: z.string().optional(),
-  referenceType: z.string().optional(),
-  referenceId: z.string().optional(),
-})
 
 const wastageSchema = z.object({
   branchId: z.string(),
@@ -105,107 +88,168 @@ router.get('/items', async (req: Request, res: Response) => {
   res.json(paginatedResponse(items, total, page, limit))
 })
 
-// POST /inventory/items
-router.post('/items', async (req: Request, res: Response) => {
-  const body = itemSchema.parse(req.body)
-  const item = await prisma.item.create({
-    data: { ...body, organizationId: req.user.organizationId },
-  })
-  res.status(201).json(item)
+const addPurchaseItemSchema = z.object({
+  purchaseOrderItemId: z.string(),
+  unitCost: z.coerce.number().min(0),
 })
 
-// GET /inventory/items/:id
-router.get('/items/:id', async (req: Request, res: Response) => {
-  const item = await prisma.item.findFirst({
-    where: { id: req.params.id, organizationId: req.user.organizationId },
-    include: { branchStocks: { include: { branch: true } } },
-  })
-  if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
-  res.json(item)
+const addPurchaseSchema = z.object({
+  purchaseOrderId: z.string(),
+  supplierId: z.string(),
+  purchaseDate: z.string(),
+  paymentDate: z.string(),
+  totalAmount: z.coerce.number().min(0),
+  paidAmount: z.coerce.number().min(0).default(0),
+  note: z.string().optional(),
+  items: z.string(), // JSON-stringified addPurchaseItemSchema[]
 })
 
-// PUT /items/:id
-router.put('/items/:id', async (req: Request, res: Response) => {
-  const item = await prisma.item.findFirst({
-    where: { id: req.params.id, organizationId: req.user.organizationId },
-  })
-  if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
-
-  const body = itemSchema.partial().parse(req.body)
-  const updated = await prisma.item.update({ where: { id: req.params.id }, data: body })
-  res.json(updated)
-})
-
-// DELETE /inventory/items/:id
-router.delete('/items/:id', async (req: Request, res: Response) => {
-  const item = await prisma.item.findFirst({
-    where: { id: req.params.id, organizationId: req.user.organizationId },
-  })
-  if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
-
-  const hasMovements = await prisma.stockMovement.count({ where: { itemId: req.params.id } })
-  if (hasMovements > 0) {
-    await prisma.item.update({ where: { id: req.params.id }, data: { isActive: false } })
-    return res.json({ message: 'Item deactivated (has stock movements)' })
+// POST /inventory/purchases — receive an approved PO into branch stock, with
+// real costing/supplier/payment/invoice captured at the moment of receiving,
+// auto-creating the matching Supplier Bill (and Payment, if partly/fully paid).
+router.post('/purchases', upload.single('file'), async (req: Request, res: Response) => {
+  const body = addPurchaseSchema.parse(req.body)
+  let itemInputs: { purchaseOrderItemId: string; unitCost: number }[]
+  try {
+    itemInputs = z.array(addPurchaseItemSchema).parse(JSON.parse(body.items))
+  } catch {
+    throw new AppError('Invalid items payload', 400, 'VALIDATION_ERROR')
   }
+  if (itemInputs.length === 0) throw new AppError('At least one item is required', 400, 'VALIDATION_ERROR')
 
-  await prisma.item.delete({ where: { id: req.params.id } })
-  res.json({ message: 'Item deleted' })
-})
+  try {
+    const bill = await prisma.$transaction(async (tx) => {
+      const order = await tx.purchaseOrder.findFirst({
+        where: { id: body.purchaseOrderId, organizationId: req.user.organizationId },
+        include: { items: true },
+      })
+      if (!order) throw new AppError('Purchase order not found', 404, 'NOT_FOUND')
+      if (order.status !== 'approved') throw new AppError('Only approved purchase orders can be received', 400, 'INVALID_STATUS')
 
-// POST /inventory/stock-in
-router.post('/stock-in', async (req: Request, res: Response) => {
-  const body = stockInSchema.parse(req.body)
+      const supplier = await tx.supplier.findFirst({
+        where: { id: body.supplierId, organizationId: req.user.organizationId },
+      })
+      if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
 
-  const item = await prisma.item.findFirst({
-    where: { id: body.itemId, organizationId: req.user.organizationId },
-  })
-  if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
+      const poItemsById = new Map(order.items.map((i) => [i.id, i]))
+      const resolvedLines = itemInputs.map((input) => {
+        const poItem = poItemsById.get(input.purchaseOrderItemId)
+        if (!poItem) throw new AppError('Purchase order item not found on this order', 400, 'VALIDATION_ERROR')
+        return { poItem, unitCost: input.unitCost, totalCost: poItem.quantity * input.unitCost }
+      })
 
-  const branch = await prisma.branch.findFirst({
-    where: { id: body.branchId, organizationId: req.user.organizationId },
-  })
-  if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+      for (const line of resolvedLines) {
+        await tx.purchaseOrderItem.update({
+          where: { id: line.poItem.id },
+          data: { unitCost: line.unitCost, totalCost: line.totalCost },
+        })
+      }
 
-  const movement = await applyStockIn(prisma, {
-    organizationId: req.user.organizationId,
-    branchId: body.branchId,
-    itemId: body.itemId,
-    quantity: body.quantity,
-    unitCost: body.unitCost,
-    referenceType: body.referenceType,
-    referenceId: body.referenceId,
-    notes: body.notes,
-    createdBy: req.user.id,
-  })
+      const subtotal = resolvedLines.reduce((sum, l) => sum + l.totalCost, 0)
+      await tx.purchaseOrder.update({
+        where: { id: order.id },
+        data: {
+          subtotal,
+          totalAmount: subtotal,
+          status: 'received',
+          receivedBy: req.user.id,
+          receivedAt: new Date(),
+        },
+      })
 
-  res.status(201).json(movement)
-})
+      const billNo = await nextNumber(tx as unknown as typeof prisma, 'bill', 'billNo', 'BILL', req.user.organizationId)
+      const paidAmount = body.paidAmount
+      const balanceDue = body.totalAmount - paidAmount
+      const status = balanceDue <= 0.01 ? 'paid' : paidAmount > 0 ? 'partial' : 'approved'
 
-// GET /inventory/movements
-router.get('/movements', async (req: Request, res: Response) => {
-  const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
-  const { branchId, itemId, movementType } = req.query as Record<string, string>
+      const createdBill = await tx.bill.create({
+        data: {
+          organizationId: req.user.organizationId,
+          branchId: order.branchId,
+          supplierId: body.supplierId,
+          billNo,
+          billDate: new Date(body.purchaseDate),
+          dueDate: new Date(body.paymentDate),
+          subtotal,
+          totalAmount: body.totalAmount,
+          paidAmount,
+          balanceDue,
+          status,
+          notes: body.note,
+          createdBy: req.user.id,
+          items: {
+            create: resolvedLines.map((line) => ({
+              description: line.poItem.description,
+              quantity: line.poItem.quantity,
+              unitPrice: line.unitCost,
+              totalAmount: line.totalCost,
+              itemId: line.poItem.itemId,
+            })),
+          },
+        },
+      })
 
-  const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.branchId = branchId
-  if (itemId) where.itemId = itemId
-  if (movementType) where.movementType = movementType
+      if (paidAmount > 0) {
+        await tx.payment.create({
+          data: {
+            organizationId: req.user.organizationId,
+            branchId: order.branchId,
+            billId: createdBill.id,
+            paymentDate: new Date(body.paymentDate),
+            amount: paidAmount,
+            paymentMethod: 'cash',
+            createdBy: req.user.id,
+          },
+        })
+      }
 
-  const [movements, total] = await Promise.all([
-    prisma.stockMovement.findMany({
-      where,
-      ...paginate(page, limit),
-      orderBy: { createdAt: 'desc' },
-      include: {
-        item: { select: { id: true, name: true, code: true, unit: true } },
-        branch: { select: { id: true, name: true } },
-      },
-    }),
-    prisma.stockMovement.count({ where }),
-  ])
+      if (req.file) {
+        const document = await tx.document.create({
+          data: {
+            organizationId: req.user.organizationId,
+            branchId: order.branchId,
+            originalFilename: req.file.originalname,
+            storedFilename: req.file.filename,
+            filePath: req.file.path,
+            fileType: req.file.mimetype,
+            fileSize: req.file.size,
+            documentType: 'bill',
+            linkedType: 'bill',
+            linkedId: createdBill.id,
+            uploadedBy: req.user.id,
+          },
+        })
+        await tx.bill.update({ where: { id: createdBill.id }, data: { documentId: document.id } })
+      }
 
-  res.json(paginatedResponse(movements, total, page, limit))
+      for (const line of resolvedLines) {
+        if (!line.poItem.itemId) continue // free-text lines aren't linked to a stock item
+        await applyStockIn(tx as unknown as typeof prisma, {
+          organizationId: req.user.organizationId,
+          branchId: order.branchId,
+          itemId: line.poItem.itemId,
+          quantity: line.poItem.quantity,
+          unitCost: line.unitCost,
+          referenceType: 'purchase',
+          referenceId: createdBill.id,
+          notes: `Purchased via PO ${order.poNo}`,
+          createdBy: req.user.id,
+        })
+      }
+
+      return tx.bill.findUniqueOrThrow({
+        where: { id: createdBill.id },
+        include: { items: true, supplier: true, branch: true },
+      })
+    })
+
+    res.status(201).json(bill)
+  } catch (err) {
+    if (req.file) {
+      try { fs.unlinkSync(req.file.path) } catch { /* best-effort cleanup */ }
+    }
+    throw err
+  }
 })
 
 // GET /inventory/wastage/pending-approval

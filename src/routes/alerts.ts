@@ -105,7 +105,7 @@ router.get('/', async (req: Request, res: Response) => {
   // ── Purchase orders pending approval ──────────────────────────────────────
   const pendingPOs = await prisma.purchaseOrder.findMany({
     where: { organizationId: orgId, ...branchFilter, status: 'submitted' },
-    include: { branch: { select: { id: true, name: true } }, supplier: { select: { name: true } } },
+    include: { branch: { select: { id: true, name: true } }, items: { select: { id: true } } },
     orderBy: { submittedAt: 'asc' },
     take: 20,
   })
@@ -117,7 +117,7 @@ router.get('/', async (req: Request, res: Response) => {
       module: 'purchase_orders',
       branchId: po.branch.id,
       branchName: po.branch.name,
-      message: `Purchase order ${po.poNo} to ${po.supplier.name} awaiting approval${ageDays > 0 ? ` (${ageDays}d)` : ''} — SAR ${po.totalAmount.toFixed(2)}`,
+      message: `Purchase order ${po.poNo} (${po.items.length} item${po.items.length === 1 ? '' : 's'}) at ${po.branch.name} awaiting approval${ageDays > 0 ? ` (${ageDays}d)` : ''}`,
       createdAt: (po.submittedAt ?? po.createdAt).toISOString(),
       link: '/purchase-orders',
     })
