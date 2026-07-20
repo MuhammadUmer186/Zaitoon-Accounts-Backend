@@ -30,7 +30,7 @@ const wastageSchema = z.object({
 router.get('/stock', async (req: Request, res: Response) => {
   const { branchId, search, lowStock } = req.query as Record<string, string>
 
-  const where: Record<string, unknown> = { organizationId: req.user.organizationId }
+  const where: Record<string, unknown> = { organizationId: req.user.organizationId, quantityOnHand: { gt: 0 } }
   if (branchId) where.branchId = branchId
 
   const stocks = await prisma.branchStock.findMany({
@@ -39,7 +39,7 @@ router.get('/stock', async (req: Request, res: Response) => {
       item: true,
       branch: { select: { id: true, name: true } },
     },
-    orderBy: { item: { name: 'asc' } },
+    orderBy: [{ branch: { name: 'asc' } }, { item: { name: 'asc' } }],
   })
 
   let filtered = stocks
@@ -57,7 +57,24 @@ router.get('/stock', async (req: Request, res: Response) => {
     filtered = filtered.filter((st) => st.quantityOnHand <= st.reorderPoint)
   }
 
-  res.json({ data: filtered, total: filtered.length })
+  const data = filtered.map((st) => ({
+    id: st.id,
+    organizationId: st.organizationId,
+    branchId: st.branchId,
+    branchName: st.branch.name,
+    itemId: st.itemId,
+    itemName: st.item.name,
+    itemCode: st.item.code,
+    unit: st.item.unit,
+    quantityOnHand: st.quantityOnHand,
+    averageCost: st.averageCost,
+    totalValue: st.totalValue,
+    reorderPoint: st.reorderPoint,
+    isLowStock: st.quantityOnHand <= st.reorderPoint,
+    lastUpdated: st.lastUpdated,
+  }))
+
+  res.json({ data, total: data.length })
 })
 
 // GET /inventory/items
