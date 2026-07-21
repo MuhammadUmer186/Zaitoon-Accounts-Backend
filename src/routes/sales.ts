@@ -205,43 +205,26 @@ router.put('/:id', async (req: Request, res: Response) => {
   res.json(withBranchName(updated))
 })
 
-// POST /sales/:id/submit
-router.post('/:id/submit', async (req: Request, res: Response) => {
-  const sale = await prisma.dailySale.findFirst({
-    where: { id: req.params.id, organizationId: req.user.organizationId },
-  })
-  if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
-  if (sale.status !== 'draft') throw new AppError('Only draft sales can be submitted', 400, 'INVALID_STATUS')
-
-  const updated = await prisma.dailySale.update({
-    where: { id: req.params.id },
-    data: { status: 'submitted', submittedBy: req.user.id, submittedAt: new Date() },
-  })
-  res.json(updated)
-})
-
-// POST /sales/:id/approve
-router.post('/:id/approve', async (req: Request, res: Response) => {
-  const sale = await prisma.dailySale.findFirst({
-    where: { id: req.params.id, organizationId: req.user.organizationId },
-    include: { branch: true },
-  })
-  if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
-  if (sale.status !== 'submitted') throw new AppError('Only submitted sales can be approved', 400, 'INVALID_STATUS')
-
-  // Standardized double-entry posting: every payment method is debited to
-  // where that money actually sits; revenue is recognized as the plug so
-  // the entry always balances regardless of discount/refund composition.
+// Standardized double-entry posting: every payment method is debited to
+// where that money actually sits; revenue is recognized as the plug so
+// the entry always balances regardless of discount/refund composition.
+// Shared by /submit (the normal path — daily sales need no approval) and
+// /approve (kept only to resolve any pre-existing 'submitted' records).
+async function postSaleJournalEntry(sale: {
+  id: string; saleNo: string; branchId: string; saleDate: Date
+  cashAmount: number; cardAmount: number; deliveryAmount: number; bankTransferAmount: number; otherAmount: number
+  vatAmount: number
+}, organizationId: string, userId: string) {
   const totalReceived = sale.cashAmount + sale.cardAmount + sale.deliveryAmount + sale.bankTransferAmount + sale.otherAmount
 
-  const je = await postJournalEntry(prisma, {
-    organizationId: req.user.organizationId,
+  return postJournalEntry(prisma, {
+    organizationId,
     branchId: sale.branchId,
     entryDate: sale.saleDate,
     referenceType: 'daily_sale',
     referenceId: sale.id,
     description: `Daily Sales - ${sale.saleNo}`,
-    createdBy: req.user.id,
+    createdBy: userId,
     lines: [
       { accountCode: GL.CASH, description: 'Cash received', debitAmount: sale.cashAmount },
       { accountCode: GL.CARD_CLEARING, description: 'Card receipts', debitAmount: sale.cardAmount },
@@ -252,8 +235,46 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
       { accountCode: GL.SALES_REVENUE, description: 'Sales revenue', creditAmount: totalReceived - sale.vatAmount },
     ],
   })
+}
 
-  const journalEntryId = je?.id
+// POST /sales/:id/submit — daily sales need no separate approval step
+// (unlike purchases): submitting a draft finalizes it immediately, posting
+// the journal entry straight away.
+router.post('/:id/submit', async (req: Request, res: Response) => {
+  const sale = await prisma.dailySale.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
+  if (sale.status !== 'draft') throw new AppError('Only draft sales can be submitted', 400, 'INVALID_STATUS')
+
+  const je = await postSaleJournalEntry(sale, req.user.organizationId, req.user.id)
+  const now = new Date()
+
+  const updated = await prisma.dailySale.update({
+    where: { id: req.params.id },
+    data: {
+      status: 'approved',
+      submittedBy: req.user.id,
+      submittedAt: now,
+      approvedBy: req.user.id,
+      approvedAt: now,
+      journalEntryId: je?.id,
+    },
+  })
+  res.json(updated)
+})
+
+// POST /sales/:id/approve — kept only to resolve any sale that was already
+// sitting in 'submitted' status before daily sales stopped requiring
+// approval; new sales never reach this via /submit anymore.
+router.post('/:id/approve', async (req: Request, res: Response) => {
+  const sale = await prisma.dailySale.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
+  if (sale.status !== 'submitted') throw new AppError('Only submitted sales can be approved', 400, 'INVALID_STATUS')
+
+  const je = await postSaleJournalEntry(sale, req.user.organizationId, req.user.id)
 
   const updated = await prisma.dailySale.update({
     where: { id: req.params.id },
@@ -261,7 +282,7 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
       status: 'approved',
       approvedBy: req.user.id,
       approvedAt: new Date(),
-      journalEntryId,
+      journalEntryId: je?.id,
     },
   })
 
