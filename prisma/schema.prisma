@@ -41,6 +41,7 @@ model Organization {
   auditLogs         AuditLog[]
   documents         Document[]
   purchaseOrders    PurchaseOrder[]
+  itemCategories    ItemCategory[]
 }
 
 model Branch {
@@ -454,6 +455,23 @@ model Payment {
 }
 
 // Inventory
+// Item catalog — a category groups items and carries the default unit of
+// measurement (kg, litre, gallon, ...) new items in it should use.
+model ItemCategory {
+  id             String       @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  unit           String
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  items          Item[]
+
+  @@unique([organizationId, name])
+}
+
 model Item {
   id                 String              @id @default(cuid())
   organizationId     String
@@ -461,6 +479,7 @@ model Item {
   name               String
   description        String?
   category           String?
+  categoryId         String?
   unit               String              @default("kg")
   costPrice          Float               @default(0)
   reorderPoint       Float               @default(0)
@@ -468,6 +487,7 @@ model Item {
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
   organization       Organization        @relation(fields: [organizationId], references: [id])
+  itemCategory       ItemCategory?       @relation(fields: [categoryId], references: [id])
   branchStocks       BranchStock[]
   movements          StockMovement[]
   wastageItems       WastageItem[]

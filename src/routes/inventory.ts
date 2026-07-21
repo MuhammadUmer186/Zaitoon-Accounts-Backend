@@ -14,6 +14,22 @@ const router = Router()
 
 router.use(authenticate)
 
+const categorySchema = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  unit: z.string().min(1),
+})
+
+const itemSchema = z.object({
+  code: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string().optional(),
+  categoryId: z.string().optional(),
+  unit: z.string().min(1).optional(),
+  costPrice: z.number().min(0).default(0),
+  reorderPoint: z.number().min(0).default(0),
+})
+
 const stockOutSchema = z.object({
   branchId: z.string(),
   stockOutDate: z.string().or(z.date()).optional(),
@@ -36,6 +52,55 @@ const wastageSchema = z.object({
     totalValue: z.number(),
     reason: z.string().optional(),
   })),
+})
+
+// GET /inventory/categories — the item catalog's categories, each carrying
+// a default unit of measurement (kg, litre, gallon, ...) for items in it
+router.get('/categories', async (req: Request, res: Response) => {
+  const categories = await prisma.itemCategory.findMany({
+    where: { organizationId: req.user.organizationId, isActive: true },
+    orderBy: { name: 'asc' },
+    include: { _count: { select: { items: true } } },
+  })
+  res.json({ data: categories })
+})
+
+// POST /inventory/categories
+router.post('/categories', async (req: Request, res: Response) => {
+  const body = categorySchema.parse(req.body)
+  const category = await prisma.itemCategory.create({
+    data: { ...body, organizationId: req.user.organizationId },
+  })
+  res.status(201).json(category)
+})
+
+// PUT /inventory/categories/:id
+router.put('/categories/:id', async (req: Request, res: Response) => {
+  const category = await prisma.itemCategory.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!category) throw new AppError('Category not found', 404, 'NOT_FOUND')
+
+  const body = categorySchema.partial().parse(req.body)
+  const updated = await prisma.itemCategory.update({ where: { id: req.params.id }, data: body })
+  res.json(updated)
+})
+
+// DELETE /inventory/categories/:id
+router.delete('/categories/:id', async (req: Request, res: Response) => {
+  const category = await prisma.itemCategory.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!category) throw new AppError('Category not found', 404, 'NOT_FOUND')
+
+  const inUse = await prisma.item.count({ where: { categoryId: req.params.id } })
+  if (inUse > 0) {
+    await prisma.itemCategory.update({ where: { id: req.params.id }, data: { isActive: false } })
+    return res.json({ message: 'Category deactivated (has existing items)' })
+  }
+
+  await prisma.itemCategory.delete({ where: { id: req.params.id } })
+  res.json({ message: 'Category deleted' })
 })
 
 // GET /inventory/stock
@@ -97,11 +162,12 @@ router.get('/stock', async (req: Request, res: Response) => {
 // GET /inventory/items
 router.get('/items', async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
-  const search = req.query.search as string | undefined
+  const { search, categoryId } = req.query as Record<string, string>
 
   const where = {
     organizationId: req.user.organizationId,
     isActive: true,
+    ...(categoryId && { categoryId }),
     ...(search && {
       OR: [
         { name: { contains: search, mode: 'insensitive' as const } },
@@ -115,11 +181,69 @@ router.get('/items', async (req: Request, res: Response) => {
       where,
       ...paginate(page, limit),
       orderBy: { name: 'asc' },
+      include: { itemCategory: { select: { id: true, name: true, unit: true } } },
     }),
     prisma.item.count({ where }),
   ])
 
-  res.json(paginatedResponse(items, total, page, limit))
+  const data = items.map((i) => ({ ...i, categoryName: i.itemCategory?.name ?? i.category ?? null }))
+  res.json(paginatedResponse(data, total, page, limit))
+})
+
+// POST /inventory/items — add a new product to the catalog
+router.post('/items', async (req: Request, res: Response) => {
+  const body = itemSchema.parse(req.body)
+
+  let unit = body.unit
+  if (body.categoryId) {
+    const category = await prisma.itemCategory.findFirst({
+      where: { id: body.categoryId, organizationId: req.user.organizationId },
+    })
+    if (!category) throw new AppError('Category not found', 404, 'NOT_FOUND')
+    unit = unit ?? category.unit
+  }
+
+  const item = await prisma.item.create({
+    data: { ...body, unit: unit ?? 'kg', organizationId: req.user.organizationId },
+    include: { itemCategory: { select: { id: true, name: true, unit: true } } },
+  })
+  res.status(201).json(item)
+})
+
+// PUT /inventory/items/:id
+router.put('/items/:id', async (req: Request, res: Response) => {
+  const item = await prisma.item.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
+
+  const body = itemSchema.partial().parse(req.body)
+  if (body.categoryId) {
+    const category = await prisma.itemCategory.findFirst({
+      where: { id: body.categoryId, organizationId: req.user.organizationId },
+    })
+    if (!category) throw new AppError('Category not found', 404, 'NOT_FOUND')
+  }
+
+  const updated = await prisma.item.update({
+    where: { id: req.params.id },
+    data: body,
+    include: { itemCategory: { select: { id: true, name: true, unit: true } } },
+  })
+  res.json(updated)
+})
+
+// DELETE /inventory/items/:id — items always have a BranchStock row per
+// branch (created up front) and often purchase/movement history, so this
+// always deactivates rather than hard-deleting.
+router.delete('/items/:id', async (req: Request, res: Response) => {
+  const item = await prisma.item.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
+
+  await prisma.item.update({ where: { id: req.params.id }, data: { isActive: false } })
+  res.json({ message: 'Item deactivated' })
 })
 
 // POST /inventory/stock-out — manual stock removal for any branch, applied

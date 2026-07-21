@@ -17,6 +17,7 @@ async function main() {
   await prisma.purchaseOrderItem.deleteMany()
   await prisma.purchaseOrder.deleteMany()
   await prisma.item.deleteMany()
+  await prisma.itemCategory.deleteMany()
   await prisma.payment.deleteMany()
   await prisma.billItem.deleteMany()
   await prisma.bill.deleteMany()
@@ -418,6 +419,26 @@ async function main() {
   }
   console.log('Expense categories created')
 
+  // ─── Item Categories (catalog groupings with a default unit of measure) ──────
+  const categoriesData = [
+    { name: 'Oils', description: 'Cooking and finishing oils', unit: 'litre' },
+    { name: 'Meat', description: 'Fresh and frozen meats', unit: 'kg' },
+    { name: 'Grains', description: 'Rice, flour, and other staples', unit: 'kg' },
+    { name: 'Condiments', description: 'Sauces, pastes, and seasonings', unit: 'kg' },
+    { name: 'Vegetables', description: 'Fresh produce', unit: 'kg' },
+    { name: 'Spices', description: 'Dried spices and spice blends', unit: 'kg' },
+    { name: 'Beverages', description: 'Bottled and packaged drinks', unit: 'case' },
+  ]
+
+  const categories = {}
+  for (const cat of categoriesData) {
+    const created = await prisma.itemCategory.create({
+      data: { ...cat, organizationId: org.id },
+    })
+    categories[cat.name] = created.id
+  }
+  console.log(`Created ${categoriesData.length} item categories`)
+
   // ─── Inventory Items (catalog only — zero stock until real purchases/counts) ──
   const itemsData = [
     { code: 'OIL-001', name: 'Olive Oil', category: 'Oils', unit: 'litre', costPrice: 45, reorderPoint: 20 },
@@ -435,7 +456,7 @@ async function main() {
   const items = {}
   for (const item of itemsData) {
     const created = await prisma.item.create({
-      data: { ...item, organizationId: org.id },
+      data: { ...item, categoryId: categories[item.category], organizationId: org.id },
     })
     items[item.code] = created.id
   }
