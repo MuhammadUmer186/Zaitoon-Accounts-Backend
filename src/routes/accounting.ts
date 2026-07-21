@@ -256,8 +256,10 @@ router.post('/journals/:id/post', async (req: Request, res: Response) => {
 })
 
 // GET /accounting/trial-balance — General Ledger summary grouped by
-// Assets / Liabilities / Equity / Revenue / Expenses, built from posted
-// journal lines only (draft/void entries never affect the ledger).
+// Assets / Liabilities / Revenue / Expenses, built from posted journal
+// lines only (draft/void entries never affect the ledger). Equity is
+// excluded from GL reporting entirely — legacy equity accounts (if any)
+// still exist in the chart of accounts, they just aren't reported here.
 router.get('/trial-balance', async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
   const orgId = req.user.organizationId
@@ -272,7 +274,7 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
   }
 
   const accounts = await prisma.account.findMany({
-    where: { organizationId: orgId, isActive: true },
+    where: { organizationId: orgId, isActive: true, accountType: { not: 'equity' } },
     orderBy: [{ accountType: 'asc' }, { code: 'asc' }],
   })
 
@@ -303,7 +305,7 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
     }
   }).filter((r) => r.totalDebit > 0 || r.totalCredit > 0)
 
-  const types = ['asset', 'liability', 'equity', 'revenue', 'expense'] as const
+  const types = ['asset', 'liability', 'revenue', 'expense'] as const
   const byType = Object.fromEntries(
     types.map((t) => {
       const rows = accountRows.filter((r) => r.accountType === t)
@@ -313,7 +315,6 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
 
   const totalAssets = byType.asset.total
   const totalLiabilities = byType.liability.total
-  const totalEquity = byType.equity.total
   const totalRevenue = byType.revenue.total
   const totalExpenses = byType.expense.total
 
@@ -322,7 +323,6 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
     summary: {
       totalAssets,
       totalLiabilities,
-      totalEquity,
       totalRevenue,
       totalExpenses,
       netIncome: totalRevenue - totalExpenses,

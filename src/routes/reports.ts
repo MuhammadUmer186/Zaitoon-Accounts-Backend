@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { sendGeneralLedgerCsv, sendGeneralLedgerExcel, sendGeneralLedgerPdf, GLReportData, GLReportAccount, GLReportLine } from '../utils/glReport'
 
 const router = Router()
 
@@ -810,6 +811,99 @@ router.get('/sales', async (req: Request, res: Response) => {
     byBranch: byBranchEnriched,
     dailyTrend,
   })
+})
+
+// GET /reports/general-ledger — the full posted ledger (Assets, Liabilities,
+// Revenue, Expenses — Equity is excluded from GL reporting), viewable on
+// screen (format omitted/json) or exported as csv / excel / pdf for
+// printing and record-keeping.
+router.get('/general-ledger', async (req: Request, res: Response) => {
+  const { branchId, accountId, fromDate, toDate, format } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+
+  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
+  if (branchId) entryWhere.branchId = branchId
+  if (fromDate || toDate) {
+    entryWhere.entryDate = {
+      ...(fromDate && { gte: new Date(fromDate) }),
+      ...(toDate && { lte: new Date(toDate) }),
+    }
+  }
+
+  const [accounts, branch] = await Promise.all([
+    prisma.account.findMany({
+      where: {
+        organizationId: orgId,
+        isActive: true,
+        accountType: { not: 'equity' },
+        ...(accountId ? { id: accountId } : {}),
+      },
+      orderBy: [{ accountType: 'asc' }, { code: 'asc' }],
+    }),
+    branchId ? prisma.branch.findUnique({ where: { id: branchId }, select: { name: true } }) : Promise.resolve(null),
+  ])
+
+  const lines = await prisma.journalLine.findMany({
+    where: { accountId: { in: accounts.map((a) => a.id) }, journalEntry: entryWhere },
+    include: {
+      journalEntry: {
+        select: { entryNo: true, entryDate: true, description: true, branch: { select: { name: true } } },
+      },
+    },
+    orderBy: [{ journalEntry: { entryDate: 'asc' } }, { journalEntry: { createdAt: 'asc' } }],
+  })
+
+  const byAccount = new Map<string, typeof lines>()
+  for (const l of lines) {
+    if (!byAccount.has(l.accountId)) byAccount.set(l.accountId, [])
+    byAccount.get(l.accountId)!.push(l)
+  }
+
+  let grandDebit = 0
+  let grandCredit = 0
+
+  const accountSections: GLReportAccount[] = accounts
+    .map((acc) => {
+      const accLines = byAccount.get(acc.id) ?? []
+      let running = 0
+      const rows: GLReportLine[] = accLines.map((l) => {
+        running += acc.normalBalance === 'debit' ? l.debitAmount - l.creditAmount : l.creditAmount - l.debitAmount
+        grandDebit += l.debitAmount
+        grandCredit += l.creditAmount
+        return {
+          date: l.journalEntry.entryDate,
+          entryNo: l.journalEntry.entryNo,
+          description: l.description || l.journalEntry.description,
+          branch: l.journalEntry.branch?.name ?? null,
+          debit: l.debitAmount,
+          credit: l.creditAmount,
+          balance: running,
+        }
+      })
+      return {
+        accountId: acc.id,
+        code: acc.code,
+        name: acc.name,
+        accountType: acc.accountType,
+        lines: rows,
+        closingBalance: running,
+      }
+    })
+    .filter((s) => !!accountId || s.lines.length > 0)
+
+  const report: GLReportData = {
+    generatedAt: new Date().toISOString(),
+    branchName: branch?.name ?? null,
+    fromDate: fromDate || null,
+    toDate: toDate || null,
+    accounts: accountSections,
+    totals: { debit: grandDebit, credit: grandCredit },
+  }
+
+  if (format === 'csv') { sendGeneralLedgerCsv(res, report); return }
+  if (format === 'excel') { await sendGeneralLedgerExcel(res, report); return }
+  if (format === 'pdf') { sendGeneralLedgerPdf(res, report); return }
+  res.json(report)
 })
 
 export default router
