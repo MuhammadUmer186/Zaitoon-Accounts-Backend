@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { getEverStockedKeys, isNeverStocked } from '../utils/stock'
 
 const router = Router()
 
@@ -61,11 +62,18 @@ router.get('/', async (req: Request, res: Response) => {
   }
 
   // ── Low / critical stock ──────────────────────────────────────────────────
-  const stocks = await prisma.branchStock.findMany({
-    where: { organizationId: orgId, ...branchFilter },
-    include: { item: { select: { name: true, unit: true } }, branch: { select: { id: true, name: true } } },
-  })
+  const [stocks, everStocked] = await Promise.all([
+    prisma.branchStock.findMany({
+      where: { organizationId: orgId, ...branchFilter },
+      include: { item: { select: { name: true, unit: true } }, branch: { select: { id: true, name: true } } },
+    }),
+    getEverStockedKeys(prisma, orgId),
+  ])
   for (const st of stocks) {
+    // A catalog item that has sat at zero since creation was never actually
+    // received via a purchase — that's not a "critically low" situation,
+    // it just hasn't been stocked yet, so it shouldn't alert.
+    if (isNeverStocked(everStocked, st.branchId, st.itemId, st.quantityOnHand)) continue
     // When an org-wide threshold is set, it applies uniformly to every
     // product (overrides each item's individual reorder point). Otherwise
     // fall back to the item/branch-specific reorder point.

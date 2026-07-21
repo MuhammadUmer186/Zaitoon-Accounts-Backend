@@ -130,3 +130,22 @@ export async function applyStockOut(prisma: PrismaClient, input: StockOutInput) 
 
   return { movement, unitCost, totalValue }
 }
+
+// Every catalog item gets a zero-quantity BranchStock row per branch up
+// front (so purchasing/receiving has somewhere to post to) — but a row
+// that's still at zero because it has never actually been received via a
+// purchase is not "critically low," it's just never been stocked. Returns
+// the set of "branchId|itemId" pairs that have at least one real stock
+// movement, so low-stock checks can tell the two cases apart.
+export async function getEverStockedKeys(prisma: PrismaClient, organizationId: string): Promise<Set<string>> {
+  const moved = await prisma.stockMovement.findMany({
+    where: { organizationId },
+    select: { branchId: true, itemId: true },
+    distinct: ['branchId', 'itemId'],
+  })
+  return new Set(moved.map((m) => `${m.branchId}|${m.itemId}`))
+}
+
+export function isNeverStocked(everStocked: Set<string>, branchId: string, itemId: string, quantityOnHand: number): boolean {
+  return quantityOnHand === 0 && !everStocked.has(`${branchId}|${itemId}`)
+}

@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { sendGeneralLedgerCsv, sendGeneralLedgerExcel, sendGeneralLedgerPdf, GLReportData, GLReportAccount, GLReportLine } from '../utils/glReport'
+import { getEverStockedKeys, isNeverStocked } from '../utils/stock'
 
 const router = Router()
 
@@ -89,17 +90,21 @@ router.get('/dashboard', async (req: Request, res: Response) => {
   // Low stock: compare quantityOnHand against the org-wide threshold when
   // set (overrides every item's individual reorder point), else per-item
   // reorder point. (Prisma does not support field-to-field comparisons.)
-  const [allStocks, orgForThreshold] = await Promise.all([
+  // Catalog items that have sat at zero since creation (never actually
+  // received via a purchase) are excluded — that's "not stocked yet," not
+  // "critically low."
+  const [allStocks, orgForThreshold, everStocked] = await Promise.all([
     prisma.branchStock.findMany({
       where: { organizationId: orgId, ...(branchId ? { branchId } : {}) },
-      select: { quantityOnHand: true, reorderPoint: true },
+      select: { quantityOnHand: true, reorderPoint: true, branchId: true, itemId: true },
     }),
     prisma.organization.findUnique({ where: { id: orgId }, select: { lowStockThreshold: true } }),
+    getEverStockedKeys(prisma, orgId),
   ])
   const globalThreshold = orgForThreshold?.lowStockThreshold ?? null
-  type StockRow = { quantityOnHand: number; reorderPoint: number }
+  type StockRow = { quantityOnHand: number; reorderPoint: number; branchId: string; itemId: string }
   const lowStockCount = (allStocks as StockRow[]).filter(
-    (s: StockRow) => s.quantityOnHand < (globalThreshold ?? s.reorderPoint)
+    (s: StockRow) => !isNeverStocked(everStocked, s.branchId, s.itemId, s.quantityOnHand) && s.quantityOnHand < (globalThreshold ?? s.reorderPoint)
   ).length
 
   // Cash position from most recent approved closings
@@ -487,7 +492,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   }
 
   // ── Pending approvals & overdue bills ─────────────────────────────────────
-  const [pendingSales, pendingExp, pendingCC, overdueBills, lowStockItems, orgForThreshold] = await Promise.all([
+  const [pendingSales, pendingExp, pendingCC, overdueBills, lowStockItems, orgForThreshold, everStockedV2] = await Promise.all([
     prisma.dailySale.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
     prisma.expense.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
     prisma.cashClosing.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
@@ -499,10 +504,13 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       select: { quantityOnHand: true, reorderPoint: true, itemId: true, branchId: true },
     }),
     prisma.organization.findUnique({ where: { id: orgId }, select: { lowStockThreshold: true } }),
+    getEverStockedKeys(prisma, orgId),
   ])
 
   const globalThreshold = orgForThreshold?.lowStockThreshold ?? null
-  const lowStockCount = lowStockItems.filter((s) => s.quantityOnHand < (globalThreshold ?? s.reorderPoint)).length
+  const lowStockCount = lowStockItems.filter((s) =>
+    !isNeverStocked(everStockedV2, s.branchId, s.itemId, s.quantityOnHand) && s.quantityOnHand < (globalThreshold ?? s.reorderPoint)
+  ).length
 
   // ── Recent activity ───────────────────────────────────────────────────────
   const auditLogs = await prisma.auditLog.findMany({
@@ -655,7 +663,7 @@ router.get('/inventory-health', async (req: Request, res: Response) => {
 
   const branchFilter = branchId ? { branchId } : {}
 
-  const [stocks, orgForThreshold] = await Promise.all([
+  const [stocks, orgForThreshold, everStockedHealth] = await Promise.all([
     prisma.branchStock.findMany({
       where: { organizationId: orgId, ...branchFilter },
       include: {
@@ -664,14 +672,20 @@ router.get('/inventory-health', async (req: Request, res: Response) => {
       },
     }),
     prisma.organization.findUnique({ where: { id: orgId }, select: { lowStockThreshold: true } }),
+    getEverStockedKeys(prisma, orgId),
   ])
   const globalThreshold = orgForThreshold?.lowStockThreshold ?? null
   const thresholdFor = (st: { reorderPoint: number }) => globalThreshold ?? st.reorderPoint
+  // Catalog items still at zero since creation (never actually received via
+  // a purchase) are excluded from low/critical counts — never stocked isn't
+  // the same as critically low.
+  const everStocked = (st: { branchId: string; itemId: string; quantityOnHand: number }) =>
+    !isNeverStocked(everStockedHealth, st.branchId, st.itemId, st.quantityOnHand)
 
   const totalStockValue = stocks.reduce((s, st) => s + st.totalValue, 0)
 
-  const lowStockStocks = stocks.filter((st) => st.quantityOnHand < thresholdFor(st) && st.quantityOnHand > thresholdFor(st) * 0.5)
-  const criticalStockStocks = stocks.filter((st) => st.quantityOnHand <= thresholdFor(st) * 0.5)
+  const lowStockStocks = stocks.filter((st) => everStocked(st) && st.quantityOnHand < thresholdFor(st) && st.quantityOnHand > thresholdFor(st) * 0.5)
+  const criticalStockStocks = stocks.filter((st) => everStocked(st) && st.quantityOnHand <= thresholdFor(st) * 0.5)
   const purchaseRequired = lowStockStocks.length + criticalStockStocks.length
 
   // Movement velocity: count stock_out movements per item in the last 30 days
