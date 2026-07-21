@@ -11,6 +11,12 @@ const router = Router()
 
 router.use(authenticate)
 
+// The frontend reads a flat `branchName` field; Prisma's `include` only gives
+// a nested `branch` object, so every sale response is flattened through this.
+function withBranchName<T extends { branch?: { name: string } | null }>(sale: T): T & { branchName?: string } {
+  return { ...sale, branchName: sale.branch?.name }
+}
+
 const deliveryBreakdownSchema = z.object({
   platform: z.string(),
   amount: z.number(),
@@ -65,7 +71,7 @@ router.get('/', async (req: Request, res: Response) => {
     prisma.dailySale.count({ where }),
   ])
 
-  res.json(paginatedResponse(sales, total, page, limit))
+  res.json(paginatedResponse(sales.map(withBranchName), total, page, limit))
 })
 
 // GET /sales/pending-approval
@@ -75,7 +81,7 @@ router.get('/pending-approval', async (req: Request, res: Response) => {
     orderBy: { createdAt: 'desc' },
     include: { branch: { select: { id: true, name: true } } },
   })
-  res.json({ data: sales })
+  res.json({ data: sales.map(withBranchName) })
 })
 
 // GET /sales/summary
@@ -151,7 +157,7 @@ router.post('/', async (req: Request, res: Response) => {
     include: { deliveryBreakdown: true, branch: true },
   })
 
-  res.status(201).json(sale)
+  res.status(201).json(withBranchName(sale))
 })
 
 // GET /sales/:id
@@ -164,7 +170,7 @@ router.get('/:id', async (req: Request, res: Response) => {
     },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
-  res.json(sale)
+  res.json(withBranchName(sale))
 })
 
 // PUT /sales/:id
@@ -196,7 +202,7 @@ router.put('/:id', async (req: Request, res: Response) => {
     include: { deliveryBreakdown: true, branch: true },
   })
 
-  res.json(updated)
+  res.json(withBranchName(updated))
 })
 
 // POST /sales/:id/submit
