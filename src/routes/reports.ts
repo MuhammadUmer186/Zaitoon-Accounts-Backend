@@ -248,19 +248,98 @@ router.get('/financial', async (req: Request, res: Response) => {
   })
 })
 
+type DashboardRange = 'today' | 'yesterday' | 'this_week' | 'this_month' | 'this_year' | 'overall'
+
+// Resolves the selected filter-bar range to concrete date bounds. `start`
+// is null for 'overall', meaning no lower bound (all-time up to `end`).
+function getRangeBounds(range: DashboardRange, today: Date, endOfToday: Date): { start: Date | null; end: Date; label: string } {
+  switch (range) {
+    case 'today':
+      return { start: today, end: endOfToday, label: 'Today' }
+    case 'yesterday': {
+      const start = new Date(today)
+      start.setDate(today.getDate() - 1)
+      const end = new Date(start)
+      end.setHours(23, 59, 59, 999)
+      return { start, end, label: 'Yesterday' }
+    }
+    case 'this_week': {
+      const start = new Date(today)
+      start.setDate(today.getDate() - today.getDay())
+      return { start, end: endOfToday, label: 'This Week' }
+    }
+    case 'this_year': {
+      const start = new Date(today.getFullYear(), 0, 1)
+      return { start, end: endOfToday, label: 'This Year' }
+    }
+    case 'overall':
+      return { start: null, end: endOfToday, label: 'Overall' }
+    case 'this_month':
+    default: {
+      const start = new Date(today.getFullYear(), today.getMonth(), 1)
+      return { start, end: endOfToday, label: 'This Month' }
+    }
+  }
+}
+
+// The equivalent immediately-prior period, for the "vs previous period"
+// growth comparisons. Null for 'overall' (nothing to compare against).
+function getPreviousRangeBounds(range: DashboardRange, today: Date): { start: Date; end: Date } | null {
+  switch (range) {
+    case 'today': {
+      const start = new Date(today)
+      start.setDate(today.getDate() - 1)
+      const end = new Date(start)
+      end.setHours(23, 59, 59, 999)
+      return { start, end }
+    }
+    case 'yesterday': {
+      const start = new Date(today)
+      start.setDate(today.getDate() - 2)
+      const end = new Date(start)
+      end.setHours(23, 59, 59, 999)
+      return { start, end }
+    }
+    case 'this_week': {
+      const currentStart = new Date(today)
+      currentStart.setDate(today.getDate() - today.getDay())
+      const start = new Date(currentStart)
+      start.setDate(currentStart.getDate() - 7)
+      const end = new Date(currentStart)
+      end.setDate(currentStart.getDate() - 1)
+      end.setHours(23, 59, 59, 999)
+      return { start, end }
+    }
+    case 'this_year': {
+      const start = new Date(today.getFullYear() - 1, 0, 1)
+      const end = new Date(today.getFullYear() - 1, 11, 31, 23, 59, 59, 999)
+      return { start, end }
+    }
+    case 'overall':
+      return null
+    case 'this_month':
+    default: {
+      const start = new Date(today.getFullYear(), today.getMonth() - 1, 1)
+      const end = new Date(today.getFullYear(), today.getMonth(), 0, 23, 59, 59, 999)
+      return { start, end }
+    }
+  }
+}
+
 // GET /reports/dashboard-v2 — comprehensive data for premium dashboard
 router.get('/dashboard-v2', async (req: Request, res: Response) => {
-  const { branchId, days = '30', compare = 'branch' } = req.query as Record<string, string>
+  const { branchId, range = 'this_month', compare = 'branch' } = req.query as Record<string, string>
   const orgId = req.user.organizationId
-  const periodDays = Math.min(90, Math.max(7, parseInt(days)))
+  const selectedRange = range as DashboardRange
 
   const now = new Date()
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
   const endOfToday = new Date(today)
   endOfToday.setHours(23, 59, 59, 999)
-  const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1)
-  const periodStart = new Date(today)
-  periodStart.setDate(today.getDate() - periodDays + 1)
+
+  const { start: rangeStart, end: rangeEnd, label: rangeLabel } = getRangeBounds(selectedRange, today, endOfToday)
+  const dateFilter = { ...(rangeStart && { gte: rangeStart }), lte: rangeEnd }
+  const previousRange = getPreviousRangeBounds(selectedRange, today)
 
   const notVoid = { status: { not: 'void' } }
   const orgFilter = { organizationId: orgId }
@@ -278,9 +357,26 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   const targetMap: Record<string, number> = {}
   for (const t of branchTargets) targetMap[t.branchId] = t.salesTarget
 
-  // ── Daily sales trend for last `periodDays` days per branch ──────────────
+  // ── Daily sales trend within the selected range (capped for readability) ──
+  const MAX_TREND_DAYS = 180
+  let trendStart: Date
+  if (rangeStart) {
+    const spanDays = Math.floor((rangeEnd.getTime() - rangeStart.getTime()) / 86400000) + 1
+    if (spanDays > MAX_TREND_DAYS) {
+      trendStart = new Date(rangeEnd)
+      trendStart.setDate(rangeEnd.getDate() - MAX_TREND_DAYS + 1)
+    } else {
+      trendStart = rangeStart
+    }
+  } else {
+    // 'overall' has no lower bound for totals, but the trend chart shows a
+    // recent trailing window rather than querying literally all-time rows.
+    trendStart = new Date(rangeEnd)
+    trendStart.setDate(rangeEnd.getDate() - MAX_TREND_DAYS + 1)
+  }
+
   const trendSales = await prisma.dailySale.findMany({
-    where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: periodStart, lte: endOfToday } },
+    where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: trendStart, lte: rangeEnd } },
     select: { saleDate: true, netAmount: true, branchId: true },
     orderBy: { saleDate: 'asc' },
   })
@@ -296,14 +392,14 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([date, byBranch]) => ({ date, ...byBranch }))
 
-  // ── Per-branch aggregates for current month ───────────────────────────────
+  // ── Per-branch aggregates for the selected range ──────────────────────────
   const branchStats = await Promise.all(
     branches.map(async (branch) => {
       const bf = { branchId: branch.id }
 
       const [salesAgg, expAgg, prevSalesAgg] = await Promise.all([
         prisma.dailySale.aggregate({
-          where: { ...orgFilter, ...bf, ...notVoid, saleDate: { gte: startOfMonth } },
+          where: { ...orgFilter, ...bf, ...notVoid, saleDate: dateFilter },
           _sum: {
             netAmount: true, subtotal: true, vatAmount: true,
             cashAmount: true, cardAmount: true, deliveryAmount: true,
@@ -312,21 +408,17 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
           _count: true,
         }),
         prisma.expense.aggregate({
-          where: { ...orgFilter, ...bf, ...notVoid, expenseDate: { gte: startOfMonth } },
+          where: { ...orgFilter, ...bf, ...notVoid, expenseDate: dateFilter },
           _sum: { totalAmount: true },
           _count: true,
         }),
-        // Previous month for comparison
-        prisma.dailySale.aggregate({
-          where: {
-            ...orgFilter, ...bf, ...notVoid,
-            saleDate: {
-              gte: new Date(today.getFullYear(), today.getMonth() - 1, 1),
-              lt: startOfMonth,
-            },
-          },
-          _sum: { netAmount: true },
-        }),
+        // Previous equivalent period, for the growth comparison
+        previousRange
+          ? prisma.dailySale.aggregate({
+              where: { ...orgFilter, ...bf, ...notVoid, saleDate: { gte: previousRange.start, lte: previousRange.end } },
+              _sum: { netAmount: true },
+            })
+          : Promise.resolve({ _sum: { netAmount: 0 } }),
       ])
 
       const totalSales = salesAgg._sum.netAmount ?? 0
@@ -344,7 +436,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
         totalExpenses,
         grossProfit,
         netProfit: grossProfit,
-        prevMonthSales: prevSales,
+        prevPeriodSales: prevSales,
         salesGrowth: Math.round(salesGrowth * 10) / 10,
         foodCostPct: Math.round(foodCostPct * 10) / 10,
         saleCount: salesAgg._count,
@@ -358,10 +450,10 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     })
   )
 
-  // ── Expense breakdown by category (month, all/filtered branches) ──────────
+  // ── Expense breakdown by category (selected range, all/filtered branches) ─
   const expByCategory = await prisma.expense.groupBy({
     by: ['categoryId'],
-    where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: startOfMonth } },
+    where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: dateFilter },
     _sum: { totalAmount: true },
   })
   const catIds = expByCategory.map((e) => e.categoryId)
@@ -377,9 +469,9 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     total: e._sum.totalAmount ?? 0,
   }))
 
-  // ── Payment method breakdown (month, all/filtered branches) ──────────────
+  // ── Payment method breakdown (selected range, all/filtered branches) ─────
   const pmSales = await prisma.dailySale.aggregate({
-    where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: startOfMonth } },
+    where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: dateFilter },
     _sum: {
       cashAmount: true, cardAmount: true,
       deliveryAmount: true, bankTransferAmount: true, otherAmount: true,
@@ -419,24 +511,22 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     select: { id: true, action: true, module: true, createdAt: true, userEmail: true, userName: true, resourceType: true, resourceRef: true, branchId: true },
   })
 
-  // ── Today's totals ────────────────────────────────────────────────────────
-  const [todaySales, todayExpenses, monthSales, monthExpenses] = await Promise.all([
+  // ── Totals for the selected range ─────────────────────────────────────────
+  const [periodSalesAgg, periodExpensesAgg, previousPeriodSalesAgg] = await Promise.all([
     prisma.dailySale.aggregate({
-      where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: today, lte: endOfToday } },
+      where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: dateFilter },
       _sum: { netAmount: true },
     }),
     prisma.expense.aggregate({
-      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: today, lte: endOfToday } },
+      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: dateFilter },
       _sum: { totalAmount: true },
     }),
-    prisma.dailySale.aggregate({
-      where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: startOfMonth } },
-      _sum: { netAmount: true },
-    }),
-    prisma.expense.aggregate({
-      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: startOfMonth } },
-      _sum: { totalAmount: true },
-    }),
+    previousRange
+      ? prisma.dailySale.aggregate({
+          where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: { gte: previousRange.start, lte: previousRange.end } },
+          _sum: { netAmount: true },
+        })
+      : Promise.resolve({ _sum: { netAmount: 0 } }),
   ])
 
   // ── Week/Month period-over-period comparison (only computed when requested) ─
@@ -463,7 +553,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       currentLabel = 'This Week'
       previousLabel = 'Last Week'
     } else {
-      currentStart = startOfMonth
+      currentStart = new Date(today.getFullYear(), today.getMonth(), 1)
       currentEnd = endOfToday
       const daysElapsed = today.getDate() // 1-based day of month, e.g. 15
       previousStart = new Date(today.getFullYear(), today.getMonth() - 1, 1)
@@ -518,14 +608,20 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     comparison = { mode: compare, currentLabel, previousLabel, byBranch, trend }
   }
 
+  const periodSales = periodSalesAgg._sum.netAmount ?? 0
+  const periodExpenses = periodExpensesAgg._sum.totalAmount ?? 0
+  const previousPeriodSales = previousPeriodSalesAgg._sum.netAmount ?? 0
+  const periodSalesChangePct = previousPeriodSales > 0
+    ? Math.round(((periodSales - previousPeriodSales) / previousPeriodSales) * 1000) / 10
+    : 0
+
   res.json({
-    period: { start: periodStart.toISOString(), end: endOfToday.toISOString(), days: periodDays },
+    period: { start: rangeStart ? rangeStart.toISOString() : null, end: rangeEnd.toISOString(), range: selectedRange, label: rangeLabel },
     kpis: {
-      todaySales: todaySales._sum.netAmount ?? 0,
-      todayExpenses: todayExpenses._sum.totalAmount ?? 0,
-      monthSales: monthSales._sum.netAmount ?? 0,
-      monthExpenses: monthExpenses._sum.totalAmount ?? 0,
-      monthProfit: (monthSales._sum.netAmount ?? 0) - (monthExpenses._sum.totalAmount ?? 0),
+      periodSales,
+      periodExpenses,
+      periodProfit: periodSales - periodExpenses,
+      periodSalesChangePct,
       pendingApprovals: pendingSales + pendingExp + pendingCC,
       overdueSupplierBills: overdueBills,
       lowStockItems: lowStockCount,
