@@ -8,6 +8,7 @@
     "db:push": "prisma db push",
     "db:seed": "node prisma/seed.js",
     "db:clear-data": "node prisma/clear-data.js",
+    "db:clear-inventory": "node prisma/clear-inventory.js",
     "db:sync-permissions": "node prisma/sync-permissions.js",
     "db:studio": "prisma studio"
   },
