@@ -28,6 +28,12 @@ router.get('/', async (req: Request, res: Response) => {
 
   const alerts: Alert[] = []
 
+  const org = await prisma.organization.findUnique({
+    where: { id: orgId },
+    select: { lowStockThreshold: true },
+  })
+  const globalThreshold = org?.lowStockThreshold ?? null
+
   // ── Overdue supplier bills ────────────────────────────────────────────────
   const overdueBills = await prisma.bill.findMany({
     where: {
@@ -60,15 +66,19 @@ router.get('/', async (req: Request, res: Response) => {
     include: { item: { select: { name: true, unit: true } }, branch: { select: { id: true, name: true } } },
   })
   for (const st of stocks) {
-    if (st.quantityOnHand > st.reorderPoint) continue
-    const critical = st.quantityOnHand <= st.reorderPoint * 0.5
+    // When an org-wide threshold is set, it applies uniformly to every
+    // product (overrides each item's individual reorder point). Otherwise
+    // fall back to the item/branch-specific reorder point.
+    const threshold = globalThreshold ?? st.reorderPoint
+    if (st.quantityOnHand >= threshold) continue
+    const critical = st.quantityOnHand <= threshold * 0.5
     alerts.push({
       id: `stock-${st.id}`,
       level: critical ? 'critical' : 'warning',
       module: 'inventory',
       branchId: st.branch.id,
       branchName: st.branch.name,
-      message: `${st.item.name} at ${st.branch.name} is ${critical ? 'critically low' : 'below reorder point'} — ${st.quantityOnHand} ${st.item.unit} remaining (reorder at ${st.reorderPoint})`,
+      message: `${st.item.name} at ${st.branch.name} is ${critical ? 'critically low' : 'below threshold'} — ${st.quantityOnHand} ${st.item.unit} remaining (alert threshold ${threshold})`,
       createdAt: st.lastUpdated.toISOString(),
       link: '/inventory',
     })

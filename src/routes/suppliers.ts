@@ -5,6 +5,7 @@ import { authenticate } from '../middleware/auth'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { postJournalEntry, accountCodeForPaymentMethod, GL } from '../utils/ledger'
 
 const router = Router()
 
@@ -90,43 +91,9 @@ router.post('/', async (req: Request, res: Response) => {
   res.status(201).json(supplier)
 })
 
-// GET /suppliers/:id
-router.get('/:id', async (req: Request, res: Response) => {
-  const supplier = await prisma.supplier.findFirst({
-    where: { id: req.params.id, organizationId: req.user.organizationId },
-  })
-  if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
-  res.json(supplier)
-})
-
-// PUT /suppliers/:id
-router.put('/:id', async (req: Request, res: Response) => {
-  const supplier = await prisma.supplier.findFirst({
-    where: { id: req.params.id, organizationId: req.user.organizationId },
-  })
-  if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
-
-  const body = supplierSchema.partial().parse(req.body)
-  const updated = await prisma.supplier.update({ where: { id: req.params.id }, data: body })
-  res.json(updated)
-})
-
-// DELETE /suppliers/:id
-router.delete('/:id', async (req: Request, res: Response) => {
-  const supplier = await prisma.supplier.findFirst({
-    where: { id: req.params.id, organizationId: req.user.organizationId },
-  })
-  if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
-
-  const hasBills = await prisma.bill.count({ where: { supplierId: req.params.id } })
-  if (hasBills > 0) {
-    await prisma.supplier.update({ where: { id: req.params.id }, data: { isActive: false } })
-    return res.json({ message: 'Supplier deactivated (has existing bills)' })
-  }
-
-  await prisma.supplier.delete({ where: { id: req.params.id } })
-  res.json({ message: 'Supplier deleted' })
-})
+// NOTE: all literal /bills* routes must be registered before the generic
+// GET/PUT/DELETE /:id routes below — otherwise Express matches them against
+// `:id` first (e.g. "/bills" would look up a supplier with id "bills").
 
 // GET /bills/pending-approval
 router.get('/bills/pending-approval', async (req: Request, res: Response) => {
@@ -206,7 +173,28 @@ router.post('/bills', async (req: Request, res: Response) => {
     include: { items: true, supplier: true, branch: true },
   })
 
-  res.status(201).json(bill)
+  // Standardized posting: debit the line-items' accounts when they all agree
+  // on one, otherwise default to Inventory; credit Accounts Payable.
+  const uniformAccountId = items && items.length > 0 && items.every((i) => i.accountId && i.accountId === items[0].accountId)
+    ? items[0].accountId
+    : undefined
+
+  const je = await postJournalEntry(prisma, {
+    organizationId: req.user.organizationId,
+    branchId: bill.branchId,
+    entryDate: bill.billDate,
+    referenceType: 'bill',
+    referenceId: bill.id,
+    description: `Supplier Bill ${billNo}`,
+    createdBy: req.user.id,
+    lines: [
+      { accountId: uniformAccountId, accountCode: uniformAccountId ? undefined : GL.INVENTORY, description: 'Bill items', debitAmount: bill.totalAmount },
+      { accountCode: GL.AP, description: 'Payable to supplier', creditAmount: bill.totalAmount },
+    ],
+  })
+  await prisma.bill.update({ where: { id: bill.id }, data: { journalEntryId: je?.id } })
+
+  res.status(201).json({ ...bill, journalEntryId: je?.id })
 })
 
 // GET /bills/:id
@@ -309,6 +297,21 @@ router.post('/bills/:id/payments', async (req: Request, res: Response) => {
     },
   })
 
+  const je = await postJournalEntry(prisma, {
+    organizationId: req.user.organizationId,
+    branchId: bill.branchId,
+    entryDate: payment.paymentDate,
+    referenceType: 'payment',
+    referenceId: payment.id,
+    description: `Payment for Bill ${bill.billNo}`,
+    createdBy: req.user.id,
+    lines: [
+      { accountCode: GL.AP, description: 'Payable settled', debitAmount: payment.amount },
+      { accountCode: accountCodeForPaymentMethod(payment.paymentMethod), description: 'Payment made', creditAmount: payment.amount },
+    ],
+  })
+  await prisma.payment.update({ where: { id: payment.id }, data: { journalEntryId: je?.id } })
+
   const newPaidAmount = bill.paidAmount + body.amount
   const newBalanceDue = bill.totalAmount - newPaidAmount
   const newStatus = newBalanceDue <= 0.01 ? 'paid' : bill.paidAmount === 0 ? 'partial' : 'partial'
@@ -318,7 +321,72 @@ router.post('/bills/:id/payments', async (req: Request, res: Response) => {
     data: { paidAmount: newPaidAmount, balanceDue: newBalanceDue, status: newStatus },
   })
 
-  res.status(201).json(payment)
+  res.status(201).json({ ...payment, journalEntryId: je?.id })
+})
+
+// GET /suppliers/:id
+router.get('/:id', async (req: Request, res: Response) => {
+  const supplier = await prisma.supplier.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
+
+  const bills = await prisma.bill.findMany({
+    where: { supplierId: supplier.id, organizationId: req.user.organizationId, status: { not: 'void' } },
+    select: { totalAmount: true, paidAmount: true, balanceDue: true, billDate: true },
+  })
+
+  const lastPayment = await prisma.payment.findFirst({
+    where: { organizationId: req.user.organizationId, bill: { supplierId: supplier.id } },
+    orderBy: { paymentDate: 'desc' },
+    select: { paymentDate: true },
+  })
+
+  const totalPurchases = bills.reduce((s, b) => s + b.totalAmount, 0)
+  const totalPaid = bills.reduce((s, b) => s + b.paidAmount, 0)
+  const totalPayable = bills.reduce((s, b) => s + b.balanceDue, 0)
+  const lastPurchaseDate = bills.length > 0
+    ? bills.reduce((latest, b) => (b.billDate > latest ? b.billDate : latest), bills[0].billDate)
+    : null
+
+  res.json({
+    ...supplier,
+    totalPurchases,
+    totalPaid,
+    totalPayable,
+    outstandingBalance: totalPayable,
+    lastPurchaseDate,
+    lastPaymentDate: lastPayment?.paymentDate ?? null,
+  })
+})
+
+// PUT /suppliers/:id
+router.put('/:id', async (req: Request, res: Response) => {
+  const supplier = await prisma.supplier.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
+
+  const body = supplierSchema.partial().parse(req.body)
+  const updated = await prisma.supplier.update({ where: { id: req.params.id }, data: body })
+  res.json(updated)
+})
+
+// DELETE /suppliers/:id
+router.delete('/:id', async (req: Request, res: Response) => {
+  const supplier = await prisma.supplier.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+  })
+  if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
+
+  const hasBills = await prisma.bill.count({ where: { supplierId: req.params.id } })
+  if (hasBills > 0) {
+    await prisma.supplier.update({ where: { id: req.params.id }, data: { isActive: false } })
+    return res.json({ message: 'Supplier deactivated (has existing bills)' })
+  }
+
+  await prisma.supplier.delete({ where: { id: req.params.id } })
+  res.json({ message: 'Supplier deleted' })
 })
 
 export default router

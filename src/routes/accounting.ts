@@ -255,6 +255,129 @@ router.post('/journals/:id/post', async (req: Request, res: Response) => {
   res.json(updated)
 })
 
+// GET /accounting/trial-balance — General Ledger summary grouped by
+// Assets / Liabilities / Equity / Revenue / Expenses, built from posted
+// journal lines only (draft/void entries never affect the ledger).
+router.get('/trial-balance', async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+
+  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
+  if (branchId) entryWhere.branchId = branchId
+  if (fromDate || toDate) {
+    entryWhere.entryDate = {
+      ...(fromDate && { gte: new Date(fromDate) }),
+      ...(toDate && { lte: new Date(toDate) }),
+    }
+  }
+
+  const accounts = await prisma.account.findMany({
+    where: { organizationId: orgId, isActive: true },
+    orderBy: [{ accountType: 'asc' }, { code: 'asc' }],
+  })
+
+  const lines = await prisma.journalLine.findMany({
+    where: { journalEntry: entryWhere },
+    select: { accountId: true, debitAmount: true, creditAmount: true },
+  })
+
+  const sums: Record<string, { debit: number; credit: number }> = {}
+  for (const l of lines) {
+    if (!sums[l.accountId]) sums[l.accountId] = { debit: 0, credit: 0 }
+    sums[l.accountId].debit += l.debitAmount
+    sums[l.accountId].credit += l.creditAmount
+  }
+
+  const accountRows = accounts.map((a) => {
+    const s = sums[a.id] ?? { debit: 0, credit: 0 }
+    const balance = a.normalBalance === 'debit' ? s.debit - s.credit : s.credit - s.debit
+    return {
+      accountId: a.id,
+      code: a.code,
+      name: a.name,
+      accountType: a.accountType,
+      normalBalance: a.normalBalance,
+      totalDebit: s.debit,
+      totalCredit: s.credit,
+      balance,
+    }
+  }).filter((r) => r.totalDebit > 0 || r.totalCredit > 0)
+
+  const types = ['asset', 'liability', 'equity', 'revenue', 'expense'] as const
+  const byType = Object.fromEntries(
+    types.map((t) => {
+      const rows = accountRows.filter((r) => r.accountType === t)
+      return [t, { accounts: rows, total: rows.reduce((s, r) => s + r.balance, 0) }]
+    })
+  )
+
+  const totalAssets = byType.asset.total
+  const totalLiabilities = byType.liability.total
+  const totalEquity = byType.equity.total
+  const totalRevenue = byType.revenue.total
+  const totalExpenses = byType.expense.total
+
+  res.json({
+    byType,
+    summary: {
+      totalAssets,
+      totalLiabilities,
+      totalEquity,
+      totalRevenue,
+      totalExpenses,
+      netIncome: totalRevenue - totalExpenses,
+    },
+  })
+})
+
+// GET /accounting/ledger — posted journal lines for one account with a
+// running balance, newest activity last (classic ledger card view).
+router.get('/ledger', async (req: Request, res: Response) => {
+  const { accountId, branchId, fromDate, toDate } = req.query as Record<string, string>
+  if (!accountId) throw new AppError('accountId is required', 400, 'VALIDATION_ERROR')
+  const orgId = req.user.organizationId
+
+  const account = await prisma.account.findFirst({ where: { id: accountId, organizationId: orgId } })
+  if (!account) throw new AppError('Account not found', 404, 'NOT_FOUND')
+
+  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
+  if (branchId) entryWhere.branchId = branchId
+  if (fromDate || toDate) {
+    entryWhere.entryDate = {
+      ...(fromDate && { gte: new Date(fromDate) }),
+      ...(toDate && { lte: new Date(toDate) }),
+    }
+  }
+
+  const lines = await prisma.journalLine.findMany({
+    where: { accountId, journalEntry: entryWhere },
+    include: {
+      journalEntry: {
+        select: { entryNo: true, entryDate: true, description: true, referenceType: true, referenceId: true },
+      },
+    },
+    orderBy: [{ journalEntry: { entryDate: 'asc' } }, { journalEntry: { createdAt: 'asc' } }],
+  })
+
+  let running = 0
+  const rows = lines.map((l) => {
+    running += account.normalBalance === 'debit' ? l.debitAmount - l.creditAmount : l.creditAmount - l.debitAmount
+    return {
+      id: l.id,
+      entryNo: l.journalEntry.entryNo,
+      entryDate: l.journalEntry.entryDate,
+      description: l.description || l.journalEntry.description,
+      referenceType: l.journalEntry.referenceType,
+      referenceId: l.journalEntry.referenceId,
+      debitAmount: l.debitAmount,
+      creditAmount: l.creditAmount,
+      runningBalance: running,
+    }
+  })
+
+  res.json({ account, lines: rows, closingBalance: running })
+})
+
 // POST /accounting/journals/:id/void
 router.post('/journals/:id/void', async (req: Request, res: Response) => {
   const { voidReason } = req.body

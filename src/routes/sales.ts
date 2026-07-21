@@ -5,6 +5,7 @@ import { authenticate } from '../middleware/auth'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { postJournalEntry, GL } from '../utils/ledger'
 
 const router = Router()
 
@@ -222,73 +223,31 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
   if (sale.status !== 'submitted') throw new AppError('Only submitted sales can be approved', 400, 'INVALID_STATUS')
 
-  // Find relevant accounts
-  const [cashAccount, salesAccount, vatAccount] = await Promise.all([
-    prisma.account.findFirst({ where: { organizationId: req.user.organizationId, code: '1000' } }),
-    prisma.account.findFirst({ where: { organizationId: req.user.organizationId, code: '4000' } }),
-    prisma.account.findFirst({ where: { organizationId: req.user.organizationId, code: '2100' } }),
-  ])
+  // Standardized double-entry posting: every payment method is debited to
+  // where that money actually sits; revenue is recognized as the plug so
+  // the entry always balances regardless of discount/refund composition.
+  const totalReceived = sale.cashAmount + sale.cardAmount + sale.deliveryAmount + sale.bankTransferAmount + sale.otherAmount
 
-  // Create journal entry for the sale
-  const year = new Date().getFullYear()
-  const jeCount = await prisma.journalEntry.count({
-    where: { organizationId: req.user.organizationId, entryNo: { startsWith: `JE-${year}-` } },
+  const je = await postJournalEntry(prisma, {
+    organizationId: req.user.organizationId,
+    branchId: sale.branchId,
+    entryDate: sale.saleDate,
+    referenceType: 'daily_sale',
+    referenceId: sale.id,
+    description: `Daily Sales - ${sale.saleNo}`,
+    createdBy: req.user.id,
+    lines: [
+      { accountCode: GL.CASH, description: 'Cash received', debitAmount: sale.cashAmount },
+      { accountCode: GL.CARD_CLEARING, description: 'Card receipts', debitAmount: sale.cardAmount },
+      { accountCode: GL.DELIVERY_CLEARING, description: 'Delivery platform receipts', debitAmount: sale.deliveryAmount },
+      { accountCode: GL.BANK, description: 'Bank transfer receipts', debitAmount: sale.bankTransferAmount },
+      { accountCode: GL.CASH, description: 'Other receipts', debitAmount: sale.otherAmount },
+      { accountCode: GL.VAT_PAYABLE, description: 'VAT payable', creditAmount: sale.vatAmount },
+      { accountCode: GL.SALES_REVENUE, description: 'Sales revenue', creditAmount: totalReceived - sale.vatAmount },
+    ],
   })
-  const entryNo = `JE-${year}-${(jeCount + 1).toString().padStart(4, '0')}`
 
-  const lines = []
-  if (cashAccount) {
-    lines.push({
-      accountId: cashAccount.id,
-      description: 'Cash from sales',
-      debitAmount: sale.cashAmount,
-      creditAmount: 0,
-      lineOrder: 1,
-    })
-  }
-  if (salesAccount) {
-    lines.push({
-      accountId: salesAccount.id,
-      description: 'Sales revenue',
-      debitAmount: 0,
-      creditAmount: sale.subtotal,
-      lineOrder: 2,
-    })
-  }
-  if (vatAccount && sale.vatAmount > 0) {
-    lines.push({
-      accountId: vatAccount.id,
-      description: 'VAT payable',
-      debitAmount: 0,
-      creditAmount: sale.vatAmount,
-      lineOrder: 3,
-    })
-  }
-
-  let journalEntryId: string | undefined
-
-  if (lines.length > 0) {
-    const je = await prisma.journalEntry.create({
-      data: {
-        organizationId: req.user.organizationId,
-        branchId: sale.branchId,
-        entryNo,
-        entryDate: sale.saleDate,
-        referenceType: 'daily_sale',
-        referenceId: sale.id,
-        description: `Daily Sales - ${sale.saleNo}`,
-        status: 'posted',
-        totalDebit: sale.cashAmount,
-        totalCredit: sale.subtotal + sale.vatAmount,
-        isBalanced: Math.abs(sale.cashAmount - (sale.subtotal + sale.vatAmount)) < 0.01,
-        postedBy: req.user.id,
-        postedAt: new Date(),
-        createdBy: req.user.id,
-        lines: { create: lines },
-      },
-    })
-    journalEntryId = je.id
-  }
+  const journalEntryId = je?.id
 
   const updated = await prisma.dailySale.update({
     where: { id: req.params.id },

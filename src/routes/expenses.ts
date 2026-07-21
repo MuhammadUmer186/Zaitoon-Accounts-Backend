@@ -5,6 +5,7 @@ import { authenticate } from '../middleware/auth'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { postJournalEntry, getOrCreateAccount, accountCodeForPaymentMethod, GL } from '../utils/ledger'
 
 const router = Router()
 
@@ -187,13 +188,36 @@ router.post('/:id/submit', async (req: Request, res: Response) => {
 router.post('/:id/approve', async (req: Request, res: Response) => {
   const expense = await prisma.expense.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: { category: true },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
   if (expense.status !== 'submitted') throw new AppError('Only submitted expenses can be approved', 400, 'INVALID_STATUS')
 
+  const expenseAccount = expense.category.accountId
+    ? { id: expense.category.accountId }
+    : await getOrCreateAccount(prisma, req.user.organizationId, GL.MISC_EXPENSE)
+
+  const je = await postJournalEntry(prisma, {
+    organizationId: req.user.organizationId,
+    branchId: expense.branchId,
+    entryDate: expense.expenseDate,
+    referenceType: 'expense',
+    referenceId: expense.id,
+    description: `Expense - ${expense.expenseNo} (${expense.description})`,
+    createdBy: req.user.id,
+    lines: [
+      { accountId: expenseAccount.id, description: expense.description, debitAmount: expense.totalAmount },
+      {
+        accountCode: expense.supplierId ? GL.AP : accountCodeForPaymentMethod(expense.paymentMethod),
+        description: 'Payment / payable for expense',
+        creditAmount: expense.totalAmount,
+      },
+    ],
+  })
+
   const updated = await prisma.expense.update({
     where: { id: req.params.id },
-    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date() },
+    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId: je?.id },
   })
   res.json(updated)
 })

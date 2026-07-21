@@ -8,6 +8,7 @@ import { paginate, paginatedResponse, parsePageParams } from '../utils/paginatio
 import { applyStockIn } from '../utils/stock'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { postJournalEntry, GL } from '../utils/ledger'
 
 const router = Router()
 
@@ -33,14 +34,19 @@ router.get('/stock', async (req: Request, res: Response) => {
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, quantityOnHand: { gt: 0 } }
   if (branchId) where.branchId = branchId
 
-  const stocks = await prisma.branchStock.findMany({
-    where,
-    include: {
-      item: true,
-      branch: { select: { id: true, name: true } },
-    },
-    orderBy: [{ branch: { name: 'asc' } }, { item: { name: 'asc' } }],
-  })
+  const [stocks, org] = await Promise.all([
+    prisma.branchStock.findMany({
+      where,
+      include: {
+        item: true,
+        branch: { select: { id: true, name: true } },
+      },
+      orderBy: [{ branch: { name: 'asc' } }, { item: { name: 'asc' } }],
+    }),
+    prisma.organization.findUnique({ where: { id: req.user.organizationId }, select: { lowStockThreshold: true } }),
+  ])
+  const globalThreshold = org?.lowStockThreshold ?? null
+  const thresholdFor = (st: { reorderPoint: number }) => globalThreshold ?? st.reorderPoint
 
   let filtered = stocks
 
@@ -54,7 +60,7 @@ router.get('/stock', async (req: Request, res: Response) => {
   }
 
   if (lowStock === 'true') {
-    filtered = filtered.filter((st) => st.quantityOnHand <= st.reorderPoint)
+    filtered = filtered.filter((st) => st.quantityOnHand < thresholdFor(st))
   }
 
   const data = filtered.map((st) => ({
@@ -70,7 +76,7 @@ router.get('/stock', async (req: Request, res: Response) => {
     averageCost: st.averageCost,
     totalValue: st.totalValue,
     reorderPoint: st.reorderPoint,
-    isLowStock: st.quantityOnHand <= st.reorderPoint,
+    isLowStock: st.quantityOnHand < thresholdFor(st),
     lastUpdated: st.lastUpdated,
   }))
 
@@ -206,8 +212,23 @@ router.post('/purchases', upload.single('file'), async (req: Request, res: Respo
         },
       })
 
+      const billJe = await postJournalEntry(tx as unknown as typeof prisma, {
+        organizationId: req.user.organizationId,
+        branchId: order.branchId,
+        entryDate: new Date(body.purchaseDate),
+        referenceType: 'bill',
+        referenceId: createdBill.id,
+        description: `Supplier Bill ${billNo} (PO ${order.poNo})`,
+        createdBy: req.user.id,
+        lines: [
+          { accountCode: GL.INVENTORY, description: 'Stock received', debitAmount: body.totalAmount },
+          { accountCode: GL.AP, description: 'Payable to supplier', creditAmount: body.totalAmount },
+        ],
+      })
+      await tx.bill.update({ where: { id: createdBill.id }, data: { journalEntryId: billJe?.id } })
+
       if (paidAmount > 0) {
-        await tx.payment.create({
+        const payment = await tx.payment.create({
           data: {
             organizationId: req.user.organizationId,
             branchId: order.branchId,
@@ -218,6 +239,21 @@ router.post('/purchases', upload.single('file'), async (req: Request, res: Respo
             createdBy: req.user.id,
           },
         })
+
+        const paymentJe = await postJournalEntry(tx as unknown as typeof prisma, {
+          organizationId: req.user.organizationId,
+          branchId: order.branchId,
+          entryDate: new Date(body.paymentDate),
+          referenceType: 'payment',
+          referenceId: payment.id,
+          description: `Payment for Bill ${billNo}`,
+          createdBy: req.user.id,
+          lines: [
+            { accountCode: GL.AP, description: 'Payable settled', debitAmount: paidAmount },
+            { accountCode: GL.CASH, description: 'Cash paid to supplier', creditAmount: paidAmount },
+          ],
+        })
+        await tx.payment.update({ where: { id: payment.id }, data: { journalEntryId: paymentJe?.id } })
       }
 
       if (req.file) {
@@ -375,9 +411,23 @@ router.post('/wastage/:id/approve', async (req: Request, res: Response) => {
     })
   }
 
+  const je = await postJournalEntry(prisma, {
+    organizationId: req.user.organizationId,
+    branchId: report.branchId,
+    entryDate: report.reportDate,
+    referenceType: 'wastage_report',
+    referenceId: report.id,
+    description: `Wastage Report - ${report.id}`,
+    createdBy: req.user.id,
+    lines: [
+      { accountCode: GL.WASTAGE_EXPENSE, description: 'Stock written off as wastage', debitAmount: report.totalValue },
+      { accountCode: GL.INVENTORY, description: 'Inventory reduction (wastage)', creditAmount: report.totalValue },
+    ],
+  })
+
   const updated = await prisma.wastageReport.update({
     where: { id: req.params.id },
-    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date() },
+    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId: je?.id },
     include: { items: { include: { item: true } }, branch: true },
   })
 

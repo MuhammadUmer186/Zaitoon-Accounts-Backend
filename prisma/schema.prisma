@@ -21,6 +21,7 @@ model Organization {
   currency          String            @default("SAR")
   fiscalYearStart   String            @default("01-01")
   logoUrl           String?
+  lowStockThreshold Float?
   isActive          Boolean           @default(true)
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
@@ -518,6 +519,7 @@ model WastageReport {
   totalValue     Float         @default(0)
   status         String        @default("draft")
   notes          String?
+  journalEntryId String?
   approvedBy     String?
   approvedAt     DateTime?
   createdBy      String

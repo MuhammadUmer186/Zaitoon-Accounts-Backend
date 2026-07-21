@@ -85,15 +85,20 @@ router.get('/dashboard', async (req: Request, res: Response) => {
     }),
   ])
 
-  // Low stock: compare quantityOnHand <= reorderPoint in application code
-  // (Prisma does not support field-to-field comparisons in filters)
-  const allStocks = await prisma.branchStock.findMany({
-    where: { organizationId: orgId, ...(branchId ? { branchId } : {}) },
-    select: { quantityOnHand: true, reorderPoint: true },
-  })
+  // Low stock: compare quantityOnHand against the org-wide threshold when
+  // set (overrides every item's individual reorder point), else per-item
+  // reorder point. (Prisma does not support field-to-field comparisons.)
+  const [allStocks, orgForThreshold] = await Promise.all([
+    prisma.branchStock.findMany({
+      where: { organizationId: orgId, ...(branchId ? { branchId } : {}) },
+      select: { quantityOnHand: true, reorderPoint: true },
+    }),
+    prisma.organization.findUnique({ where: { id: orgId }, select: { lowStockThreshold: true } }),
+  ])
+  const globalThreshold = orgForThreshold?.lowStockThreshold ?? null
   type StockRow = { quantityOnHand: number; reorderPoint: number }
   const lowStockCount = (allStocks as StockRow[]).filter(
-    (s: StockRow) => s.quantityOnHand <= s.reorderPoint
+    (s: StockRow) => s.quantityOnHand < (globalThreshold ?? s.reorderPoint)
   ).length
 
   // Cash position from most recent approved closings
@@ -389,7 +394,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   }
 
   // ── Pending approvals & overdue bills ─────────────────────────────────────
-  const [pendingSales, pendingExp, pendingCC, overdueBills, lowStockItems] = await Promise.all([
+  const [pendingSales, pendingExp, pendingCC, overdueBills, lowStockItems, orgForThreshold] = await Promise.all([
     prisma.dailySale.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
     prisma.expense.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
     prisma.cashClosing.count({ where: { ...orgFilter, ...branchFilter, status: 'submitted' } }),
@@ -400,9 +405,11 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       where: { organizationId: orgId, ...(branchId ? { branchId } : {}) },
       select: { quantityOnHand: true, reorderPoint: true, itemId: true, branchId: true },
     }),
+    prisma.organization.findUnique({ where: { id: orgId }, select: { lowStockThreshold: true } }),
   ])
 
-  const lowStockCount = lowStockItems.filter((s) => s.quantityOnHand <= s.reorderPoint).length
+  const globalThreshold = orgForThreshold?.lowStockThreshold ?? null
+  const lowStockCount = lowStockItems.filter((s) => s.quantityOnHand < (globalThreshold ?? s.reorderPoint)).length
 
   // ── Recent activity ───────────────────────────────────────────────────────
   const auditLogs = await prisma.auditLog.findMany({
@@ -551,18 +558,23 @@ router.get('/inventory-health', async (req: Request, res: Response) => {
 
   const branchFilter = branchId ? { branchId } : {}
 
-  const stocks = await prisma.branchStock.findMany({
-    where: { organizationId: orgId, ...branchFilter },
-    include: {
-      item: { select: { id: true, name: true, code: true, unit: true } },
-      branch: { select: { id: true, name: true } },
-    },
-  })
+  const [stocks, orgForThreshold] = await Promise.all([
+    prisma.branchStock.findMany({
+      where: { organizationId: orgId, ...branchFilter },
+      include: {
+        item: { select: { id: true, name: true, code: true, unit: true } },
+        branch: { select: { id: true, name: true } },
+      },
+    }),
+    prisma.organization.findUnique({ where: { id: orgId }, select: { lowStockThreshold: true } }),
+  ])
+  const globalThreshold = orgForThreshold?.lowStockThreshold ?? null
+  const thresholdFor = (st: { reorderPoint: number }) => globalThreshold ?? st.reorderPoint
 
   const totalStockValue = stocks.reduce((s, st) => s + st.totalValue, 0)
 
-  const lowStockStocks = stocks.filter((st) => st.quantityOnHand <= st.reorderPoint && st.quantityOnHand > st.reorderPoint * 0.5)
-  const criticalStockStocks = stocks.filter((st) => st.quantityOnHand <= st.reorderPoint * 0.5)
+  const lowStockStocks = stocks.filter((st) => st.quantityOnHand < thresholdFor(st) && st.quantityOnHand > thresholdFor(st) * 0.5)
+  const criticalStockStocks = stocks.filter((st) => st.quantityOnHand <= thresholdFor(st) * 0.5)
   const purchaseRequired = lowStockStocks.length + criticalStockStocks.length
 
   // Movement velocity: count stock_out movements per item in the last 30 days
@@ -592,16 +604,16 @@ router.get('/inventory-health', async (req: Request, res: Response) => {
   })
 
   const lowStockList = [...criticalStockStocks, ...lowStockStocks]
-    .sort((a, b) => (a.quantityOnHand / (a.reorderPoint || 1)) - (b.quantityOnHand / (b.reorderPoint || 1)))
+    .sort((a, b) => (a.quantityOnHand / (thresholdFor(a) || 1)) - (b.quantityOnHand / (thresholdFor(b) || 1)))
     .slice(0, 10)
     .map((st) => ({
       item: st.item.name,
       branch: st.branch.name,
       current: st.quantityOnHand,
-      minimum: st.reorderPoint,
+      minimum: thresholdFor(st),
       unit: st.item.unit,
-      status: st.quantityOnHand <= st.reorderPoint * 0.5 ? 'critical' : 'low',
-      recommended: Math.max(0, Math.round(st.reorderPoint * 2 - st.quantityOnHand)),
+      status: st.quantityOnHand <= thresholdFor(st) * 0.5 ? 'critical' : 'low',
+      recommended: Math.max(0, Math.round(thresholdFor(st) * 2 - st.quantityOnHand)),
     }))
 
   res.json({
