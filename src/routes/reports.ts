@@ -230,7 +230,10 @@ router.get('/financial', async (req: Request, res: Response) => {
     }),
   ])
 
-  const grossProfit = (totalSales._sum.netAmount ?? 0) - (totalExpenses._sum.totalAmount ?? 0)
+  // Supplier purchases (bills) count toward expenses alongside manually
+  // recorded Expense entries.
+  const combinedExpenses = (totalExpenses._sum.totalAmount ?? 0) + (totalBills._sum.totalAmount ?? 0)
+  const grossProfit = (totalSales._sum.netAmount ?? 0) - combinedExpenses
 
   res.json({
     revenue: {
@@ -239,7 +242,7 @@ router.get('/financial', async (req: Request, res: Response) => {
       saleCount: totalSales._count,
     },
     expenses: {
-      totalExpenses: totalExpenses._sum.totalAmount ?? 0,
+      totalExpenses: combinedExpenses,
       vatPaid: totalExpenses._sum.vatAmount ?? 0,
       expenseCount: totalExpenses._count,
     },
@@ -250,7 +253,7 @@ router.get('/financial', async (req: Request, res: Response) => {
       billCount: totalBills._count,
     },
     grossProfit,
-    netProfit: grossProfit - (totalBills._sum.totalAmount ?? 0),
+    netProfit: grossProfit,
   })
 })
 
@@ -351,6 +354,22 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   const orgFilter = { organizationId: orgId }
   const branchFilter = branchId ? { branchId } : {}
 
+  // Number of calendar days in the selected range — used for "average per
+  // day" figures instead of a fabricated "orders" concept this system has
+  // no real data for. For 'overall' (no lower bound), falls back to the
+  // earliest recorded sale.
+  let daysInPeriod: number
+  if (rangeStart) {
+    daysInPeriod = Math.max(1, Math.floor((rangeEnd.getTime() - rangeStart.getTime()) / 86400000) + 1)
+  } else {
+    const earliestSale = await prisma.dailySale.aggregate({
+      where: { ...orgFilter, ...branchFilter, ...notVoid },
+      _min: { saleDate: true },
+    })
+    const start = earliestSale._min.saleDate ?? rangeEnd
+    daysInPeriod = Math.max(1, Math.floor((rangeEnd.getTime() - start.getTime()) / 86400000) + 1)
+  }
+
   const branches = await prisma.branch.findMany({
     where: { ...orgFilter, isActive: true, ...(branchId ? { id: branchId } : {}) },
     select: { id: true, name: true, code: true },
@@ -403,7 +422,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     branches.map(async (branch) => {
       const bf = { branchId: branch.id }
 
-      const [salesAgg, expAgg, prevSalesAgg] = await Promise.all([
+      const [salesAgg, expAgg, billsAgg, prevSalesAgg] = await Promise.all([
         prisma.dailySale.aggregate({
           where: { ...orgFilter, ...bf, ...notVoid, saleDate: dateFilter },
           _sum: {
@@ -418,6 +437,12 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
           _sum: { totalAmount: true },
           _count: true,
         }),
+        // Supplier purchases (bills) count toward expenses too — food cost /
+        // net profit shouldn't ignore what was actually spent on stock.
+        prisma.bill.aggregate({
+          where: { ...orgFilter, ...bf, status: { not: 'void' }, billDate: dateFilter },
+          _sum: { totalAmount: true },
+        }),
         // Previous equivalent period, for the growth comparison
         previousRange
           ? prisma.dailySale.aggregate({
@@ -428,7 +453,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       ])
 
       const totalSales = salesAgg._sum.netAmount ?? 0
-      const totalExpenses = expAgg._sum.totalAmount ?? 0
+      const totalExpenses = (expAgg._sum.totalAmount ?? 0) + (billsAgg._sum.totalAmount ?? 0)
       const grossProfit = totalSales - totalExpenses
       const prevSales = prevSalesAgg._sum.netAmount ?? 0
       const salesGrowth = prevSales > 0 ? ((totalSales - prevSales) / prevSales) * 100 : 0
@@ -445,6 +470,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
         prevPeriodSales: prevSales,
         salesGrowth: Math.round(salesGrowth * 10) / 10,
         foodCostPct: Math.round(foodCostPct * 10) / 10,
+        avgPerDaySale: totalSales / daysInPeriod,
         saleCount: salesAgg._count,
         paymentBreakdown: {
           cash: salesAgg._sum.cashAmount ?? 0,
@@ -521,13 +547,20 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   })
 
   // ── Totals for the selected range ─────────────────────────────────────────
-  const [periodSalesAgg, periodExpensesAgg, previousPeriodSalesAgg] = await Promise.all([
+  // "Expenses" here includes supplier purchases (bills) alongside manually
+  // recorded Expense entries — purchases are real spend and belong in the
+  // same figure, not a number this dashboard silently ignores.
+  const [periodSalesAgg, periodExpensesAgg, periodBillsAgg, previousPeriodSalesAgg] = await Promise.all([
     prisma.dailySale.aggregate({
       where: { ...orgFilter, ...branchFilter, ...notVoid, saleDate: dateFilter },
       _sum: { netAmount: true },
     }),
     prisma.expense.aggregate({
       where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: dateFilter },
+      _sum: { totalAmount: true },
+    }),
+    prisma.bill.aggregate({
+      where: { ...orgFilter, ...branchFilter, status: { not: 'void' }, billDate: dateFilter },
       _sum: { totalAmount: true },
     }),
     previousRange
@@ -537,6 +570,10 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
         })
       : Promise.resolve({ _sum: { netAmount: 0 } }),
   ])
+
+  // ── Average sales per day — a straightforward, always-meaningful metric
+  // (unlike "orders", which this system has no real concept of) ───────────
+  const avgPerDaySale = (periodSalesAgg._sum.netAmount ?? 0) / daysInPeriod
 
   // ── Week/Month period-over-period comparison (only computed when requested) ─
   let comparison: {
@@ -618,7 +655,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   }
 
   const periodSales = periodSalesAgg._sum.netAmount ?? 0
-  const periodExpenses = periodExpensesAgg._sum.totalAmount ?? 0
+  const periodExpenses = (periodExpensesAgg._sum.totalAmount ?? 0) + (periodBillsAgg._sum.totalAmount ?? 0)
   const previousPeriodSales = previousPeriodSalesAgg._sum.netAmount ?? 0
   const periodSalesChangePct = previousPeriodSales > 0
     ? Math.round(((periodSales - previousPeriodSales) / previousPeriodSales) * 1000) / 10
@@ -631,6 +668,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       periodExpenses,
       periodProfit: periodSales - periodExpenses,
       periodSalesChangePct,
+      avgPerDaySale,
       pendingApprovals: pendingSales + pendingExp + pendingCC,
       overdueSupplierBills: overdueBills,
       lowStockItems: lowStockCount,

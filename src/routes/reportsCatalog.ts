@@ -103,7 +103,7 @@ router.get('/branch-profit', async (req: Request, res: Response) => {
 
   const rows = await Promise.all(
     branches.map(async (b) => {
-      const [salesAgg, expAgg] = await Promise.all([
+      const [salesAgg, expAgg, billsAgg] = await Promise.all([
         prisma.dailySale.aggregate({
           where: { organizationId: orgId, branchId: b.id, status: { not: 'void' }, ...(saleDate && { saleDate }) },
           _sum: { netAmount: true },
@@ -112,9 +112,14 @@ router.get('/branch-profit', async (req: Request, res: Response) => {
           where: { organizationId: orgId, branchId: b.id, status: { not: 'void' }, ...(expenseDate && { expenseDate }) },
           _sum: { totalAmount: true },
         }),
+        // Supplier purchases count as expenses here too
+        prisma.bill.aggregate({
+          where: { organizationId: orgId, branchId: b.id, status: { not: 'void' }, ...(expenseDate && { billDate: expenseDate }) },
+          _sum: { totalAmount: true },
+        }),
       ])
       const totalSales = salesAgg._sum.netAmount ?? 0
-      const totalExpenses = expAgg._sum.totalAmount ?? 0
+      const totalExpenses = (expAgg._sum.totalAmount ?? 0) + (billsAgg._sum.totalAmount ?? 0)
       const profit = totalSales - totalExpenses
       return {
         branch: b.name,
@@ -312,7 +317,7 @@ router.get('/profit-loss', async (req: Request, res: Response) => {
   const saleDate = dateRangeFilter(fromDate, toDate)
   const expenseDate = dateRangeFilter(fromDate, toDate)
 
-  const [salesAgg, expByCategory] = await Promise.all([
+  const [salesAgg, expByCategory, billsAgg] = await Promise.all([
     prisma.dailySale.aggregate({
       where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(saleDate && { saleDate }) },
       _sum: { netAmount: true },
@@ -320,6 +325,11 @@ router.get('/profit-loss', async (req: Request, res: Response) => {
     prisma.expense.groupBy({
       by: ['categoryId'],
       where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(expenseDate && { expenseDate }) },
+      _sum: { totalAmount: true },
+    }),
+    // Supplier purchases count as expenses here too
+    prisma.bill.aggregate({
+      where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(expenseDate && { billDate: expenseDate }) },
       _sum: { totalAmount: true },
     }),
   ])
@@ -330,6 +340,8 @@ router.get('/profit-loss', async (req: Request, res: Response) => {
 
   const revenue = salesAgg._sum.netAmount ?? 0
   const expenseLines = expByCategory.map((e) => ({ name: catMap[e.categoryId] ?? e.categoryId, amount: e._sum.totalAmount ?? 0, type: 'line' as const }))
+  const purchasesTotal = billsAgg._sum.totalAmount ?? 0
+  if (purchasesTotal > 0) expenseLines.push({ name: 'Purchases (Supplier Bills)', amount: purchasesTotal, type: 'line' as const })
   const totalExpenses = expenseLines.reduce((s, l) => s + l.amount, 0)
   const netProfit = revenue - totalExpenses
 
