@@ -5,7 +5,7 @@ import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { upload } from '../middleware/upload'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
-import { applyStockIn } from '../utils/stock'
+import { applyStockIn, applyStockOut } from '../utils/stock'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
 import { postJournalEntry, GL } from '../utils/ledger'
@@ -13,6 +13,17 @@ import { postJournalEntry, GL } from '../utils/ledger'
 const router = Router()
 
 router.use(authenticate)
+
+const stockOutSchema = z.object({
+  branchId: z.string(),
+  stockOutDate: z.string().or(z.date()).optional(),
+  reason: z.string().optional(),
+  notes: z.string().optional(),
+  items: z.array(z.object({
+    itemId: z.string(),
+    quantity: z.number().positive(),
+  })).min(1),
+})
 
 const wastageSchema = z.object({
   branchId: z.string(),
@@ -109,6 +120,55 @@ router.get('/items', async (req: Request, res: Response) => {
   ])
 
   res.json(paginatedResponse(items, total, page, limit))
+})
+
+// POST /inventory/stock-out — manual stock removal for any branch, applied
+// immediately (general usage/consumption/adjustment — no approval step,
+// unlike wastage reports). Posts a matching GL entry (Food Cost / Inventory).
+router.post('/stock-out', async (req: Request, res: Response) => {
+  const body = stockOutSchema.parse(req.body)
+
+  const branch = await prisma.branch.findFirst({
+    where: { id: body.branchId, organizationId: req.user.organizationId },
+  })
+  if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+
+  const result = await prisma.$transaction(async (tx) => {
+    const movements = []
+    let totalValue = 0
+
+    for (const line of body.items) {
+      const { movement, totalValue: lineValue } = await applyStockOut(tx as unknown as typeof prisma, {
+        organizationId: req.user.organizationId,
+        branchId: body.branchId,
+        itemId: line.itemId,
+        quantity: line.quantity,
+        referenceType: 'manual_stock_out',
+        notes: body.reason ?? body.notes,
+        createdBy: req.user.id,
+      })
+      movements.push(movement)
+      totalValue += lineValue
+    }
+
+    const je = await postJournalEntry(tx as unknown as typeof prisma, {
+      organizationId: req.user.organizationId,
+      branchId: body.branchId,
+      entryDate: body.stockOutDate ? new Date(body.stockOutDate) : new Date(),
+      referenceType: 'manual_stock_out',
+      referenceId: movements[0]?.id ?? branch.id,
+      description: `Manual Stock Out${body.reason ? ` — ${body.reason}` : ''}`,
+      createdBy: req.user.id,
+      lines: [
+        { accountCode: GL.FOOD_COST, description: 'Stock used/removed', debitAmount: totalValue },
+        { accountCode: GL.INVENTORY, description: 'Inventory reduction (stock out)', creditAmount: totalValue },
+      ],
+    })
+
+    return { movements, totalValue, journalEntryId: je?.id }
+  })
+
+  res.status(201).json(result)
 })
 
 const addPurchaseItemSchema = z.object({
