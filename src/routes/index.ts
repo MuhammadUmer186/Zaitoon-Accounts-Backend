@@ -11,6 +11,7 @@ import suppliersRouter from './suppliers'
 import inventoryRouter from './inventory'
 import accountingRouter from './accounting'
 import reportsRouter from './reports'
+import reportsCatalogRouter from './reportsCatalog'
 import notificationsRouter from './notifications'
 import syncRouter from './sync'
 import targetsRouter from './targets'
@@ -36,6 +37,7 @@ router.use('/suppliers', suppliersRouter)
 router.use('/inventory', inventoryRouter)
 router.use('/accounting', accountingRouter)
 router.use('/reports', reportsRouter)
+router.use('/reports', reportsCatalogRouter)
 router.use('/notifications', notificationsRouter)
 router.use('/sync', syncRouter)
 router.use('/targets', targetsRouter)
