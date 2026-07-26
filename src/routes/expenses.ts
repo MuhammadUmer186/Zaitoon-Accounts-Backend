@@ -5,7 +5,7 @@ import { authenticate } from '../middleware/auth'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
-import { postJournalEntry, getOrCreateAccount, accountCodeForPaymentMethod, GL } from '../utils/ledger'
+import { postJournalEntry, resolveMappedAccount, mappingKeyForPaymentMethod, reverseJournalEntry } from '../utils/ledger'
 
 const router = Router()
 
@@ -193,9 +193,13 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
   if (expense.status !== 'submitted') throw new AppError('Only submitted expenses can be approved', 400, 'INVALID_STATUS')
 
-  const expenseAccount = expense.category.accountId
-    ? { id: expense.category.accountId }
-    : await getOrCreateAccount(prisma, req.user.organizationId, GL.MISC_EXPENSE)
+  const [expenseAccount, inputVat, creditAccount] = await Promise.all([
+    expense.category.accountId
+      ? prisma.account.findUniqueOrThrow({ where: { id: expense.category.accountId } })
+      : resolveMappedAccount(prisma, req.user.organizationId, 'DEFAULT_EXPENSE'),
+    expense.vatAmount > 0 ? resolveMappedAccount(prisma, req.user.organizationId, 'INPUT_VAT') : null,
+    resolveMappedAccount(prisma, req.user.organizationId, expense.supplierId ? 'ACCOUNTS_PAYABLE' : mappingKeyForPaymentMethod(expense.paymentMethod)),
+  ])
 
   const je = await postJournalEntry(prisma, {
     organizationId: req.user.organizationId,
@@ -203,15 +207,14 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
     entryDate: expense.expenseDate,
     referenceType: 'expense',
     referenceId: expense.id,
+    sourceType: 'EXPENSE',
+    sourceKey: `EXPENSE:${expense.id}:APPROVAL`,
     description: `Expense - ${expense.expenseNo} (${expense.description})`,
     createdBy: req.user.id,
     lines: [
-      { accountId: expenseAccount.id, description: expense.description, debitAmount: expense.totalAmount },
-      {
-        accountCode: expense.supplierId ? GL.AP : accountCodeForPaymentMethod(expense.paymentMethod),
-        description: 'Payment / payable for expense',
-        creditAmount: expense.totalAmount,
-      },
+      { accountId: expenseAccount.id, description: expense.description, debitAmount: expense.amount },
+      ...(inputVat ? [{ accountId: inputVat.id, description: 'Input VAT', debitAmount: expense.vatAmount }] : []),
+      { accountId: creditAccount.id, description: 'Payment / payable for expense', creditAmount: expense.totalAmount },
     ],
   })
 
@@ -243,6 +246,11 @@ router.post('/:id/void', async (req: Request, res: Response) => {
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
+  if (expense.status === 'void') throw new AppError('Expense is already voided', 400, 'INVALID_STATUS')
+
+  if (expense.journalEntryId) {
+    await reverseJournalEntry(prisma, expense.journalEntryId, req.user.id, `Void — ${voidReason}`)
+  }
 
   const updated = await prisma.expense.update({
     where: { id: req.params.id },

@@ -8,7 +8,7 @@ import { paginate, paginatedResponse, parsePageParams } from '../utils/paginatio
 import { applyStockIn, applyStockOut } from '../utils/stock'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
-import { postJournalEntry, GL } from '../utils/ledger'
+import { postJournalEntry, resolveMappedAccount } from '../utils/ledger'
 
 const router = Router()
 
@@ -275,17 +275,24 @@ router.post('/stock-out', async (req: Request, res: Response) => {
       totalValue += lineValue
     }
 
+    const [costOfSales, inventory] = await Promise.all([
+      resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'COST_OF_SALES'),
+      resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'INVENTORY'),
+    ])
+
     const je = await postJournalEntry(tx as unknown as typeof prisma, {
       organizationId: req.user.organizationId,
       branchId: body.branchId,
       entryDate: body.stockOutDate ? new Date(body.stockOutDate) : new Date(),
       referenceType: 'manual_stock_out',
       referenceId: movements[0]?.id ?? branch.id,
+      sourceType: 'STOCK_OUT',
+      sourceKey: `STOCK_OUT:${movements[0]?.id ?? branch.id}:POST`,
       description: `Manual Stock Out${body.reason ? ` — ${body.reason}` : ''}`,
       createdBy: req.user.id,
       lines: [
-        { accountCode: GL.FOOD_COST, description: 'Stock used/removed', debitAmount: totalValue },
-        { accountCode: GL.INVENTORY, description: 'Inventory reduction (stock out)', creditAmount: totalValue },
+        { accountId: costOfSales.id, description: 'Stock used/removed', debitAmount: totalValue },
+        { accountId: inventory.id, description: 'Inventory reduction (stock out)', creditAmount: totalValue },
       ],
     })
 
@@ -396,17 +403,26 @@ router.post('/purchases', upload.single('file'), async (req: Request, res: Respo
         },
       })
 
+      const [inventoryAccount, payable] = await Promise.all([
+        resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'INVENTORY'),
+        resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
+      ])
+
+      // Receiving is the effective approval point for a PO-sourced bill (it's
+      // created pre-approved, with no separate draft/approval gap) — post now.
       const billJe = await postJournalEntry(tx as unknown as typeof prisma, {
         organizationId: req.user.organizationId,
         branchId: order.branchId,
         entryDate: new Date(body.purchaseDate),
         referenceType: 'bill',
         referenceId: createdBill.id,
+        sourceType: 'BILL',
+        sourceKey: `BILL:${createdBill.id}:APPROVAL`,
         description: `Supplier Bill ${billNo} (PO ${order.poNo})`,
         createdBy: req.user.id,
         lines: [
-          { accountCode: GL.INVENTORY, description: 'Stock received', debitAmount: body.totalAmount },
-          { accountCode: GL.AP, description: 'Payable to supplier', creditAmount: body.totalAmount },
+          { accountId: inventoryAccount.id, description: 'Stock received', debitAmount: body.totalAmount },
+          { accountId: payable.id, description: 'Payable to supplier', creditAmount: body.totalAmount },
         ],
       })
       await tx.bill.update({ where: { id: createdBill.id }, data: { journalEntryId: billJe?.id } })
@@ -424,17 +440,21 @@ router.post('/purchases', upload.single('file'), async (req: Request, res: Respo
           },
         })
 
+        const cash = await resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'CASH_ON_HAND')
+
         const paymentJe = await postJournalEntry(tx as unknown as typeof prisma, {
           organizationId: req.user.organizationId,
           branchId: order.branchId,
           entryDate: new Date(body.paymentDate),
           referenceType: 'payment',
           referenceId: payment.id,
+          sourceType: 'BILL_PAYMENT',
+          sourceKey: `BILL_PAYMENT:${payment.id}:POST`,
           description: `Payment for Bill ${billNo}`,
           createdBy: req.user.id,
           lines: [
-            { accountCode: GL.AP, description: 'Payable settled', debitAmount: paidAmount },
-            { accountCode: GL.CASH, description: 'Cash paid to supplier', creditAmount: paidAmount },
+            { accountId: payable.id, description: 'Payable settled', debitAmount: paidAmount },
+            { accountId: cash.id, description: 'Cash paid to supplier', creditAmount: paidAmount },
           ],
         })
         await tx.payment.update({ where: { id: payment.id }, data: { journalEntryId: paymentJe?.id } })
@@ -595,17 +615,24 @@ router.post('/wastage/:id/approve', async (req: Request, res: Response) => {
     })
   }
 
+  const [wastageExpense, inventory] = await Promise.all([
+    resolveMappedAccount(prisma, req.user.organizationId, 'WASTAGE_EXPENSE'),
+    resolveMappedAccount(prisma, req.user.organizationId, 'INVENTORY'),
+  ])
+
   const je = await postJournalEntry(prisma, {
     organizationId: req.user.organizationId,
     branchId: report.branchId,
     entryDate: report.reportDate,
     referenceType: 'wastage_report',
     referenceId: report.id,
+    sourceType: 'WASTAGE',
+    sourceKey: `WASTAGE:${report.id}:APPROVAL`,
     description: `Wastage Report - ${report.id}`,
     createdBy: req.user.id,
     lines: [
-      { accountCode: GL.WASTAGE_EXPENSE, description: 'Stock written off as wastage', debitAmount: report.totalValue },
-      { accountCode: GL.INVENTORY, description: 'Inventory reduction (wastage)', creditAmount: report.totalValue },
+      { accountId: wastageExpense.id, description: 'Stock written off as wastage', debitAmount: report.totalValue },
+      { accountId: inventory.id, description: 'Inventory reduction (wastage)', creditAmount: report.totalValue },
     ],
   })
 

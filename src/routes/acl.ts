@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { AppError } from '../middleware/error'
+import { getUserPermissions } from '../utils/permissions'
 
 const router = Router()
 
@@ -231,32 +232,7 @@ router.get('/users/:userId/matrix', async (req: Request, res: Response) => {
   const userId = req.params['userId'] as string
   const orgId = req.user.organizationId
 
-  const userRoles = await prisma.userRole.findMany({
-    where: { userId },
-    include: {
-      role: { include: { permissions: { include: { permission: true } } } },
-    },
-  })
-
-  const permissions = new Set<string>()
-  const roles: string[] = []
-  const moduleAccess = new Set<string>()
-
-  for (const ur of userRoles) {
-    roles.push(ur.role.name)
-    for (const rp of ur.role.permissions) {
-      permissions.add(rp.permission.key)
-      moduleAccess.add(rp.permission.module)
-    }
-  }
-
-  if (roles.includes('super_admin') || roles.includes('admin')) {
-    const allPerms = await prisma.permission.findMany()
-    for (const p of allPerms) {
-      permissions.add(p.key)
-      moduleAccess.add(p.module)
-    }
-  }
+  const { permissions, roles, moduleAccess } = await getUserPermissions(prisma, userId)
 
   const branchAccess = await prisma.userBranchAccess.findMany({
     where: { userId, organizationId: orgId },

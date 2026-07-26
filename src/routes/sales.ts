@@ -5,7 +5,7 @@ import { authenticate } from '../middleware/auth'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
-import { postJournalEntry, GL } from '../utils/ledger'
+import { postJournalEntry, resolveMappedAccount, reverseJournalEntry } from '../utils/ledger'
 
 const router = Router()
 
@@ -206,16 +206,28 @@ router.put('/:id', async (req: Request, res: Response) => {
 })
 
 // Standardized double-entry posting: every payment method is debited to
-// where that money actually sits; revenue is recognized as the plug so
-// the entry always balances regardless of discount/refund composition.
-// Shared by /submit (the normal path — daily sales need no approval) and
-// /approve (kept only to resolve any pre-existing 'submitted' records).
+// where that money actually sits (resolved through Account Mappings, never
+// silently created); revenue is recognized as the plug so the entry always
+// balances regardless of discount/refund composition. Shared by /submit (the
+// normal path — daily sales need no approval) and /approve (kept only to
+// resolve any pre-existing 'submitted' records). Idempotent via sourceKey —
+// retrying either endpoint never double-posts.
 async function postSaleJournalEntry(sale: {
   id: string; saleNo: string; branchId: string; saleDate: Date
   cashAmount: number; cardAmount: number; deliveryAmount: number; bankTransferAmount: number; otherAmount: number
   vatAmount: number
 }, organizationId: string, userId: string) {
   const totalReceived = sale.cashAmount + sale.cardAmount + sale.deliveryAmount + sale.bankTransferAmount + sale.otherAmount
+  const cashLeg = sale.cashAmount + sale.otherAmount
+
+  const [cash, card, receivable, bank, outputVat, revenue] = await Promise.all([
+    cashLeg > 0 ? resolveMappedAccount(prisma, organizationId, 'CASH_ON_HAND') : null,
+    sale.cardAmount > 0 ? resolveMappedAccount(prisma, organizationId, 'CARD_CLEARING') : null,
+    sale.deliveryAmount > 0 ? resolveMappedAccount(prisma, organizationId, 'ACCOUNTS_RECEIVABLE') : null,
+    sale.bankTransferAmount > 0 ? resolveMappedAccount(prisma, organizationId, 'DEFAULT_BANK') : null,
+    sale.vatAmount > 0 ? resolveMappedAccount(prisma, organizationId, 'OUTPUT_VAT') : null,
+    resolveMappedAccount(prisma, organizationId, 'SALES_REVENUE'),
+  ])
 
   return postJournalEntry(prisma, {
     organizationId,
@@ -223,16 +235,17 @@ async function postSaleJournalEntry(sale: {
     entryDate: sale.saleDate,
     referenceType: 'daily_sale',
     referenceId: sale.id,
+    sourceType: 'DAILY_SALE',
+    sourceKey: `DAILY_SALE:${sale.id}:APPROVAL`,
     description: `Daily Sales - ${sale.saleNo}`,
     createdBy: userId,
     lines: [
-      { accountCode: GL.CASH, description: 'Cash received', debitAmount: sale.cashAmount },
-      { accountCode: GL.CARD_CLEARING, description: 'Card receipts', debitAmount: sale.cardAmount },
-      { accountCode: GL.DELIVERY_CLEARING, description: 'Delivery platform receipts', debitAmount: sale.deliveryAmount },
-      { accountCode: GL.BANK, description: 'Bank transfer receipts', debitAmount: sale.bankTransferAmount },
-      { accountCode: GL.CASH, description: 'Other receipts', debitAmount: sale.otherAmount },
-      { accountCode: GL.VAT_PAYABLE, description: 'VAT payable', creditAmount: sale.vatAmount },
-      { accountCode: GL.SALES_REVENUE, description: 'Sales revenue', creditAmount: totalReceived - sale.vatAmount },
+      ...(cash ? [{ accountId: cash.id, description: 'Cash received', debitAmount: cashLeg }] : []),
+      ...(card ? [{ accountId: card.id, description: 'Card receipts', debitAmount: sale.cardAmount }] : []),
+      ...(receivable ? [{ accountId: receivable.id, description: 'Delivery platform receipts', debitAmount: sale.deliveryAmount }] : []),
+      ...(bank ? [{ accountId: bank.id, description: 'Bank transfer receipts', debitAmount: sale.bankTransferAmount }] : []),
+      ...(outputVat ? [{ accountId: outputVat.id, description: 'Output VAT', creditAmount: sale.vatAmount }] : []),
+      { accountId: revenue.id, description: 'Sales revenue', creditAmount: totalReceived - sale.vatAmount },
     ],
   })
 }
@@ -299,6 +312,10 @@ router.post('/:id/void', async (req: Request, res: Response) => {
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
   if (sale.status === 'void') throw new AppError('Sale is already voided', 400, 'INVALID_STATUS')
+
+  if (sale.journalEntryId) {
+    await reverseJournalEntry(prisma, sale.journalEntryId, req.user.id, `Void — ${voidReason}`)
+  }
 
   const updated = await prisma.dailySale.update({
     where: { id: req.params.id },

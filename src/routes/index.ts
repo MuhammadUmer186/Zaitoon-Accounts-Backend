@@ -10,6 +10,11 @@ import expensesRouter from './expenses'
 import suppliersRouter from './suppliers'
 import inventoryRouter from './inventory'
 import accountingRouter from './accounting'
+import accountsRouter from './accounts'
+import bankAccountsRouter from './bankAccounts'
+import taxRatesRouter from './taxRates'
+import accountingSettingsRouter from './accountingSettings'
+import accountingPeriodsRouter from './accountingPeriods'
 import reportsRouter from './reports'
 import reportsCatalogRouter from './reportsCatalog'
 import notificationsRouter from './notifications'
@@ -36,6 +41,11 @@ router.use('/expenses', expensesRouter)
 router.use('/suppliers', suppliersRouter)
 router.use('/inventory', inventoryRouter)
 router.use('/accounting', accountingRouter)
+router.use('/accounts', accountsRouter)
+router.use('/bank-accounts', bankAccountsRouter)
+router.use('/tax-rates', taxRatesRouter)
+router.use('/accounting-settings', accountingSettingsRouter)
+router.use('/accounting-periods', accountingPeriodsRouter)
 router.use('/reports', reportsRouter)
 router.use('/reports', reportsCatalogRouter)
 router.use('/notifications', notificationsRouter)

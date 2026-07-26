@@ -5,6 +5,7 @@ import { prisma } from '../config'
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/jwt'
 import { authenticate } from '../middleware/auth'
 import { AppError } from '../middleware/error'
+import { getUserPermissions } from '../utils/permissions'
 
 const router = Router()
 
@@ -25,41 +26,10 @@ const changePasswordSchema = z.object({
 })
 
 async function buildPermissionMatrix(userId: string, orgId: string) {
-  const userRoles = await prisma.userRole.findMany({
-    where: { userId },
-    include: {
-      role: {
-        include: {
-          permissions: { include: { permission: true } },
-        },
-      },
-    },
-  })
-
-  const permissions = new Set<string>()
-  const roles: string[] = []
-  const moduleAccess = new Set<string>()
-
-  for (const ur of userRoles) {
-    roles.push(ur.role.name)
-    for (const rp of ur.role.permissions) {
-      permissions.add(rp.permission.key)
-      moduleAccess.add(rp.permission.module)
-    }
-  }
-
-  // Super admin gets all permissions
-  if (roles.includes('super_admin') || roles.includes('admin')) {
-    const allPermissions = await prisma.permission.findMany()
-    for (const p of allPermissions) {
-      permissions.add(p.key)
-      moduleAccess.add(p.module)
-    }
-  }
-
-  const branchAccess = await prisma.userBranchAccess.findMany({
-    where: { userId, organizationId: orgId },
-  })
+  const [{ permissions, roles, moduleAccess }, branchAccess] = await Promise.all([
+    getUserPermissions(prisma, userId),
+    prisma.userBranchAccess.findMany({ where: { userId, organizationId: orgId } }),
+  ])
 
   return {
     permissions: Array.from(permissions),

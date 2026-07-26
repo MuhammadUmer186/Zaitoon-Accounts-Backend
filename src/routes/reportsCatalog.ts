@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { tryExportRows, sendRowsCsv, sendRowsExcel, sendRowsPdf } from '../utils/genericExport'
+import { fiscalYearStartFor } from '../utils/fiscalYear'
 
 // Mounted at the same /reports prefix as reports.ts — fills in the rest of
 // the report catalog shown on the Reports page (daily-sales, branch-sales,
@@ -311,57 +312,86 @@ router.get('/audit-log', async (req: Request, res: Response) => {
 })
 
 // GET /reports/profit-loss — income vs expenses for a period
+// Expense reportingGroups that roll up into Cost of Sales rather than
+// Operating Expenses on the P&L — mirrors the standard 5xxx chart section.
+const COST_OF_SALES_GROUPS = new Set(['Cost of Sales', 'Wastage', 'Direct Costs'])
+
+// GET /reports/profit-loss — built entirely from posted JournalLine data
+// (never combined with operational-table totals, which could double-count
+// or diverge from what's actually posted to the ledger).
 router.get('/profit-loss', async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
-  const saleDate = dateRangeFilter(fromDate, toDate)
-  const expenseDate = dateRangeFilter(fromDate, toDate)
 
-  const [salesAgg, expByCategory, billsAgg] = await Promise.all([
-    prisma.dailySale.aggregate({
-      where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(saleDate && { saleDate }) },
-      _sum: { netAmount: true },
-    }),
-    prisma.expense.groupBy({
-      by: ['categoryId'],
-      where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(expenseDate && { expenseDate }) },
-      _sum: { totalAmount: true },
-    }),
-    // Supplier purchases count as expenses here too
-    prisma.bill.aggregate({
-      where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(expenseDate && { billDate: expenseDate }) },
-      _sum: { totalAmount: true },
-    }),
-  ])
+  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
+  if (branchId) entryWhere.branchId = branchId
+  const entryDate = dateRangeFilter(fromDate, toDate)
+  if (entryDate) entryWhere.entryDate = entryDate
 
-  const catIds = expByCategory.map((e) => e.categoryId)
-  const cats = await prisma.expenseCategory.findMany({ where: { id: { in: catIds } }, select: { id: true, name: true } })
-  const catMap = Object.fromEntries(cats.map((c) => [c.id, c.name]))
+  const accounts = await prisma.account.findMany({
+    where: { organizationId: orgId, status: 'ACTIVE', accountClass: { in: ['REVENUE', 'EXPENSE'] } },
+    select: { id: true, name: true, accountClass: true, reportingGroup: true, normalBalance: true },
+  })
+  const lines = await prisma.journalLine.findMany({
+    where: { accountId: { in: accounts.map((a) => a.id) }, journalEntry: entryWhere },
+    select: { accountId: true, debitAmount: true, creditAmount: true },
+  })
 
-  const revenue = salesAgg._sum.netAmount ?? 0
-  const expenseLines = expByCategory.map((e) => ({ name: catMap[e.categoryId] ?? e.categoryId, amount: e._sum.totalAmount ?? 0, type: 'line' as const }))
-  const purchasesTotal = billsAgg._sum.totalAmount ?? 0
-  if (purchasesTotal > 0) expenseLines.push({ name: 'Purchases (Supplier Bills)', amount: purchasesTotal, type: 'line' as const })
-  const totalExpenses = expenseLines.reduce((s, l) => s + l.amount, 0)
-  const netProfit = revenue - totalExpenses
+  const sums = new Map<string, { debit: number; credit: number }>()
+  for (const l of lines) {
+    const s = sums.get(l.accountId) ?? { debit: 0, credit: 0 }
+    s.debit += Number(l.debitAmount)
+    s.credit += Number(l.creditAmount)
+    sums.set(l.accountId, s)
+  }
 
-  const lines = [
-    { name: 'Revenue', amount: revenue, type: 'header' as const },
-    { name: 'Total Revenue', amount: revenue, type: 'subtotal' as const },
-    { name: 'Expenses', amount: 0, type: 'header' as const },
-    ...expenseLines,
-    { name: 'Total Expenses', amount: totalExpenses, type: 'subtotal' as const },
+  const rows = accounts
+    .map((a) => {
+      const s = sums.get(a.id) ?? { debit: 0, credit: 0 }
+      const balance = a.normalBalance === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
+      return { ...a, balance }
+    })
+    .filter((r) => Math.abs(r.balance) > 0.005)
+
+  const otherIncomeRows = rows.filter((r) => r.accountClass === 'REVENUE' && r.reportingGroup === 'Other Income')
+  const discountRows = rows.filter((r) => r.accountClass === 'REVENUE' && r.reportingGroup === 'Discounts')
+  const grossRevenueRows = rows.filter((r) => r.accountClass === 'REVENUE' && r.reportingGroup !== 'Other Income' && r.reportingGroup !== 'Discounts')
+  const costOfSalesRows = rows.filter((r) => r.accountClass === 'EXPENSE' && COST_OF_SALES_GROUPS.has(r.reportingGroup ?? ''))
+  const opexRows = rows.filter((r) => r.accountClass === 'EXPENSE' && !COST_OF_SALES_GROUPS.has(r.reportingGroup ?? ''))
+
+  const grossRevenue = grossRevenueRows.reduce((s, r) => s + r.balance, 0)
+  const discounts = discountRows.reduce((s, r) => s + r.balance, 0)
+  const netRevenue = grossRevenue - discounts
+  const costOfSales = costOfSalesRows.reduce((s, r) => s + r.balance, 0)
+  const grossProfit = netRevenue - costOfSales
+  const operatingExpenses = opexRows.reduce((s, r) => s + r.balance, 0)
+  const otherIncome = otherIncomeRows.reduce((s, r) => s + r.balance, 0)
+  const netProfit = grossProfit - operatingExpenses + otherIncome
+
+  const lines_ = [
+    { name: 'Revenue', amount: 0, type: 'header' as const },
+    ...grossRevenueRows.map((r) => ({ name: r.name, amount: r.balance, type: 'line' as const })),
+    ...(discounts > 0.005 ? [{ name: 'Sales Returns and Discounts', amount: -discounts, type: 'line' as const }] : []),
+    { name: 'Net Revenue', amount: netRevenue, type: 'subtotal' as const },
+    { name: 'Cost of Sales', amount: 0, type: 'header' as const },
+    ...costOfSalesRows.map((r) => ({ name: r.name, amount: r.balance, type: 'line' as const })),
+    { name: 'Gross Profit', amount: grossProfit, type: 'subtotal' as const },
+    { name: 'Operating Expenses', amount: 0, type: 'header' as const },
+    ...opexRows.map((r) => ({ name: r.name, amount: r.balance, type: 'line' as const })),
+    ...(Math.abs(otherIncome) > 0.005 ? [{ name: 'Other Income', amount: otherIncome, type: 'line' as const }] : []),
+    { name: 'Net Profit', amount: netProfit, type: 'subtotal' as const },
   ]
 
-  const report = { revenue, expenses: totalExpenses, grossProfit: netProfit, netProfit, lines }
+  const report = { revenue: netRevenue, expenses: costOfSales + operatingExpenses, grossProfit, netProfit, lines: lines_ }
 
-  if (format === 'csv') { sendRowsCsv(res, lines.filter((l) => l.type !== 'header'), 'profit-loss'); return }
-  if (format === 'excel') { await sendRowsExcel(res, lines.filter((l) => l.type !== 'header'), 'profit-loss', 'Profit & Loss'); return }
-  if (format === 'pdf') { sendRowsPdf(res, lines.filter((l) => l.type !== 'header'), 'profit-loss', 'Profit & Loss Statement'); return }
+  if (format === 'csv') { sendRowsCsv(res, lines_.filter((l) => l.type !== 'header'), 'profit-loss'); return }
+  if (format === 'excel') { await sendRowsExcel(res, lines_.filter((l) => l.type !== 'header'), 'profit-loss', 'Profit & Loss'); return }
+  if (format === 'pdf') { sendRowsPdf(res, lines_.filter((l) => l.type !== 'header'), 'profit-loss', 'Profit & Loss Statement'); return }
   res.json(report)
 })
 
-// GET /reports/trial-balance — all account balances (Equity excluded, same as /accounting/trial-balance)
+// GET /reports/trial-balance — every active account's posted activity
+// (Assets/Liabilities/Equity/Revenue/Expense — same as /accounting/trial-balance)
 router.get('/trial-balance', async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
@@ -372,8 +402,8 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
   if (entryDate) entryWhere.entryDate = entryDate
 
   const accounts = await prisma.account.findMany({
-    where: { organizationId: orgId, isActive: true, accountType: { not: 'equity' } },
-    orderBy: [{ accountType: 'asc' }, { code: 'asc' }],
+    where: { organizationId: orgId, status: 'ACTIVE' },
+    orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
   })
   const lines = await prisma.journalLine.findMany({
     where: { journalEntry: entryWhere },
@@ -383,8 +413,8 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
   const sums = new Map<string, { debit: number; credit: number }>()
   for (const l of lines) {
     const s = sums.get(l.accountId) ?? { debit: 0, credit: 0 }
-    s.debit += l.debitAmount
-    s.credit += l.creditAmount
+    s.debit += Number(l.debitAmount)
+    s.credit += Number(l.creditAmount)
     sums.set(l.accountId, s)
   }
 
@@ -399,7 +429,11 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
   res.json({ accounts: rows })
 })
 
-// GET /reports/balance-sheet — Assets & Liabilities as of a date
+// GET /reports/balance-sheet — Assets, Liabilities & Equity as of a date.
+// Current Year Earnings is computed live from Revenue − Expenses for the
+// fiscal year to date rather than stored, since there is no year-end
+// closing-entry workflow yet; it is reported here but excluded from the
+// real Equity account list to avoid double-counting if that account exists.
 router.get('/balance-sheet', async (req: Request, res: Response) => {
   const { branchId, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
@@ -408,10 +442,14 @@ router.get('/balance-sheet', async (req: Request, res: Response) => {
   const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted', entryDate: { lte: asOf } }
   if (branchId) entryWhere.branchId = branchId
 
-  const accounts = await prisma.account.findMany({
-    where: { organizationId: orgId, isActive: true, accountType: { in: ['asset', 'liability'] } },
-    orderBy: [{ accountType: 'asc' }, { code: 'asc' }],
-  })
+  const [org, accounts] = await Promise.all([
+    prisma.organization.findUnique({ where: { id: orgId }, select: { fiscalYearStart: true } }),
+    prisma.account.findMany({
+      where: { organizationId: orgId, status: 'ACTIVE', accountClass: { in: ['ASSET', 'LIABILITY', 'EQUITY'] } },
+      orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
+    }),
+  ])
+
   const lines = await prisma.journalLine.findMany({
     where: { journalEntry: entryWhere },
     select: { accountId: true, debitAmount: true, creditAmount: true },
@@ -420,34 +458,79 @@ router.get('/balance-sheet', async (req: Request, res: Response) => {
   const sums = new Map<string, { debit: number; credit: number }>()
   for (const l of lines) {
     const s = sums.get(l.accountId) ?? { debit: 0, credit: 0 }
-    s.debit += l.debitAmount
-    s.credit += l.creditAmount
+    s.debit += Number(l.debitAmount)
+    s.credit += Number(l.creditAmount)
     sums.set(l.accountId, s)
   }
 
   const rows = accounts.map((a) => {
     const s = sums.get(a.id) ?? { debit: 0, credit: 0 }
-    const balance = a.normalBalance === 'debit' ? s.debit - s.credit : s.credit - s.debit
-    return { code: a.code, name: a.name, accountType: a.accountType, balance }
+    const balance = a.normalBalance === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
+    return { code: a.code, name: a.name, accountType: a.accountClass, reportingGroup: a.reportingGroup, balance }
   }).filter((r) => r.balance !== 0)
 
-  const assets = rows.filter((r) => r.accountType === 'asset')
-  const liabilities = rows.filter((r) => r.accountType === 'liability')
+  const assets = rows.filter((r) => r.accountType === 'ASSET')
+  const liabilities = rows.filter((r) => r.accountType === 'LIABILITY')
+  // Exclude a real "Current Year Earnings" account (if configured) from the
+  // ledger-derived Equity rows — its balance is computed live below instead.
+  const equity = rows.filter((r) => r.accountType === 'EQUITY' && r.reportingGroup !== 'Current Year Earnings')
+
+  const fyStart = fiscalYearStartFor(asOf, org?.fiscalYearStart ?? '01-01')
+  const pnlEntryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted', entryDate: { gte: fyStart, lte: asOf } }
+  if (branchId) pnlEntryWhere.branchId = branchId
+
+  const pnlAccounts = await prisma.account.findMany({
+    where: { organizationId: orgId, status: 'ACTIVE', accountClass: { in: ['REVENUE', 'EXPENSE'] } },
+    select: { id: true, accountClass: true, normalBalance: true },
+  })
+  const pnlLines = await prisma.journalLine.findMany({
+    where: { journalEntry: pnlEntryWhere },
+    select: { accountId: true, debitAmount: true, creditAmount: true },
+  })
+  const pnlSums = new Map<string, { debit: number; credit: number }>()
+  for (const l of pnlLines) {
+    const s = pnlSums.get(l.accountId) ?? { debit: 0, credit: 0 }
+    s.debit += Number(l.debitAmount)
+    s.credit += Number(l.creditAmount)
+    pnlSums.set(l.accountId, s)
+  }
+  let revenueTotal = 0
+  let expenseTotal = 0
+  for (const a of pnlAccounts) {
+    const s = pnlSums.get(a.id) ?? { debit: 0, credit: 0 }
+    const balance = a.normalBalance === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
+    if (a.accountClass === 'REVENUE') revenueTotal += balance
+    else expenseTotal += balance
+  }
+  const currentYearEarnings = revenueTotal - expenseTotal
+
   const totalAssets = assets.reduce((s, r) => s + r.balance, 0)
   const totalLiabilities = liabilities.reduce((s, r) => s + r.balance, 0)
+  const totalEquity = equity.reduce((s, r) => s + r.balance, 0) + currentYearEarnings
+
+  const equityRows = [
+    ...equity.map(({ code, name, balance }) => ({ code, name, balance })),
+    { code: '3300', name: 'Current Year Earnings', balance: currentYearEarnings },
+  ]
 
   const report = {
     asOf: asOf.toISOString(),
     assets: assets.map(({ code, name, balance }) => ({ code, name, balance })),
     liabilities: liabilities.map(({ code, name, balance }) => ({ code, name, balance })),
+    equity: equityRows,
     totalAssets,
     totalLiabilities,
+    totalEquity,
     netPosition: totalAssets - totalLiabilities,
+    // Assets = Liabilities + Equity — the frontend surfaces this flag directly
+    // rather than silently trusting the arithmetic always lines up.
+    balanced: Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01,
   }
 
   const flatRows = [
     ...report.assets.map((a) => ({ section: 'Asset', code: a.code, name: a.name, balance: a.balance })),
     ...report.liabilities.map((l) => ({ section: 'Liability', code: l.code, name: l.name, balance: l.balance })),
+    ...report.equity.map((e) => ({ section: 'Equity', code: e.code, name: e.name, balance: e.balance })),
   ]
 
   if (format === 'csv') { sendRowsCsv(res, flatRows, 'balance-sheet'); return }
@@ -460,42 +543,61 @@ router.get('/balance-sheet', async (req: Request, res: Response) => {
 router.get('/vat-summary', async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
-  const saleDate = dateRangeFilter(fromDate, toDate)
-  const expenseDate = dateRangeFilter(fromDate, toDate)
-  const billDate = dateRangeFilter(fromDate, toDate)
 
-  const [salesVat, expenseVat, billVat] = await Promise.all([
-    prisma.dailySale.aggregate({
-      where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(saleDate && { saleDate }) },
-      _sum: { vatAmount: true },
-    }),
-    prisma.expense.aggregate({
-      where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(expenseDate && { expenseDate }) },
-      _sum: { vatAmount: true },
-    }),
-    prisma.bill.aggregate({
-      where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(billDate && { billDate }) },
-      _sum: { vatAmount: true },
-    }),
+  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
+  if (branchId) entryWhere.branchId = branchId
+  const entryDate = dateRangeFilter(fromDate, toDate)
+  if (entryDate) entryWhere.entryDate = entryDate
+
+  // Sourced from Output VAT / Input VAT account activity (captured at
+  // posting time) rather than raw vatAmount fields on operational records —
+  // changing an account's default tax rate later never alters these figures.
+  const [outputMapping, inputMapping] = await Promise.all([
+    prisma.accountingMapping.findUnique({ where: { organizationId_key: { organizationId: orgId, key: 'OUTPUT_VAT' } } }),
+    prisma.accountingMapping.findUnique({ where: { organizationId_key: { organizationId: orgId, key: 'INPUT_VAT' } } }),
   ])
 
-  const vatCollected = salesVat._sum.vatAmount ?? 0
-  const vatPaid = (expenseVat._sum.vatAmount ?? 0) + (billVat._sum.vatAmount ?? 0)
+  const [outputLines, inputLines] = await Promise.all([
+    outputMapping
+      ? prisma.journalLine.findMany({ where: { accountId: outputMapping.accountId, journalEntry: entryWhere }, select: { debitAmount: true, creditAmount: true } })
+      : Promise.resolve([]),
+    inputMapping
+      ? prisma.journalLine.findMany({
+          where: { accountId: inputMapping.accountId, journalEntry: entryWhere },
+          select: { debitAmount: true, creditAmount: true, journalEntry: { select: { sourceType: true } } },
+        })
+      : Promise.resolve([]),
+  ])
+
+  const vatCollected = outputLines.reduce((s, l) => s + Number(l.creditAmount) - Number(l.debitAmount), 0)
+
+  let vatPaidExpenses = 0
+  let vatPaidBills = 0
+  let vatPaidOther = 0
+  for (const l of inputLines) {
+    const net = Number(l.debitAmount) - Number(l.creditAmount)
+    if (l.journalEntry.sourceType === 'EXPENSE') vatPaidExpenses += net
+    else if (l.journalEntry.sourceType === 'BILL') vatPaidBills += net
+    else vatPaidOther += net
+  }
+  const vatPaid = vatPaidExpenses + vatPaidBills + vatPaidOther
 
   const report = {
     fromDate: fromDate || null,
     toDate: toDate || null,
     vatCollected,
-    vatPaidExpenses: expenseVat._sum.vatAmount ?? 0,
-    vatPaidBills: billVat._sum.vatAmount ?? 0,
+    vatPaidExpenses,
+    vatPaidBills,
     vatPaid,
     netVatPayable: vatCollected - vatPaid,
+    configured: { outputVat: !!outputMapping, inputVat: !!inputMapping },
   }
 
   const flatRows = [
-    { line: 'VAT Collected (Sales)', amount: vatCollected },
-    { line: 'VAT Paid (Expenses)', amount: expenseVat._sum.vatAmount ?? 0 },
-    { line: 'VAT Paid (Supplier Bills)', amount: billVat._sum.vatAmount ?? 0 },
+    { line: 'VAT Collected (Output VAT)', amount: vatCollected },
+    { line: 'VAT Paid (Expenses)', amount: vatPaidExpenses },
+    { line: 'VAT Paid (Supplier Bills)', amount: vatPaidBills },
+    ...(vatPaidOther !== 0 ? [{ line: 'VAT Paid (Other)', amount: vatPaidOther }] : []),
     { line: 'Net VAT Payable', amount: report.netVatPayable },
   ]
 

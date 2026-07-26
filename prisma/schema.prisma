@@ -8,40 +8,44 @@ datasource db {
 }
 
 model Organization {
-  id                String            @id @default(cuid())
-  name              String
-  tradeName         String?
-  registrationNo    String?
-  vatNumber         String?
-  email             String?
-  phone             String?
-  address           String?
-  city              String?
-  country           String            @default("SA")
-  currency          String            @default("SAR")
-  fiscalYearStart   String            @default("01-01")
-  logoUrl           String?
-  lowStockThreshold Float?
-  isActive          Boolean           @default(true)
-  createdAt         DateTime          @default(now())
-  updatedAt         DateTime          @updatedAt
-  branches          Branch[]
-  users             User[]
-  accounts          Account[]
-  roles             Role[]
-  dailySales        DailySale[]
-  cashClosings      CashClosing[]
-  expenses          Expense[]
-  expenseCategories ExpenseCategory[]
-  suppliers         Supplier[]
-  bills             Bill[]
-  items             Item[]
-  journalEntries    JournalEntry[]
-  notifications     Notification[]
-  auditLogs         AuditLog[]
-  documents         Document[]
-  purchaseOrders    PurchaseOrder[]
-  itemCategories    ItemCategory[]
+  id                 String               @id @default(cuid())
+  name               String
+  tradeName          String?
+  registrationNo     String?
+  vatNumber          String?
+  email              String?
+  phone              String?
+  address            String?
+  city               String?
+  country            String               @default("SA")
+  currency           String               @default("SAR")
+  fiscalYearStart    String               @default("01-01")
+  logoUrl            String?
+  lowStockThreshold  Float?
+  isActive           Boolean              @default(true)
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  branches           Branch[]
+  users              User[]
+  accounts           Account[]
+  roles              Role[]
+  dailySales         DailySale[]
+  cashClosings       CashClosing[]
+  expenses           Expense[]
+  expenseCategories  ExpenseCategory[]
+  suppliers          Supplier[]
+  bills              Bill[]
+  items              Item[]
+  journalEntries     JournalEntry[]
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+  documents          Document[]
+  purchaseOrders     PurchaseOrder[]
+  itemCategories     ItemCategory[]
+  bankAccounts       BankAccount[]
+  taxRates           TaxRate[]
+  accountingMappings AccountingMapping[]
+  accountingPeriods  AccountingPeriod[]
 }
 
 model Branch {
@@ -74,6 +78,7 @@ model Branch {
   userAccess     UserBranchAccess[]
   targets        BranchTarget[]
   purchaseOrders PurchaseOrder[]
+  bankAccounts   BankAccount[]
 
   @@unique([organizationId, code])
 }
@@ -180,30 +185,192 @@ model RefreshToken {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
 // Chart of Accounts
+// ─────────────────────────────────────────────────────────────────────────
+
+// AccountClass and NormalBalance are intentionally plain String columns, not
+// native Postgres enums (see src/types/accounting.ts for the TS-level union
+// types) — this schema is production-migrated with `prisma db push` only (no
+// custom migration files), which cannot express the USING-cast required to
+// convert an existing populated String column to a native enum without data
+// loss. Every other new enum below backs either a brand-new column with a
+// default or an entirely new table, so it carries no such risk.
+
+enum AccountStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum AccountingPeriodStatus {
+  OPEN
+  LOCKED
+  CLOSED
+}
+
+enum TaxRateType {
+  INPUT
+  OUTPUT
+  BOTH
+  EXEMPT
+}
+
+// Well-known accounting roles that operational modules (sales, expenses,
+// bills, wastage, cash closing...) post against. Resolved through
+// AccountingMapping at posting time instead of a hardcoded account code, so
+// an org can point "Sales Revenue" at whichever account they actually use.
+enum AccountingMappingKey {
+  CASH_ON_HAND
+  DEFAULT_BANK
+  CARD_CLEARING
+  ACCOUNTS_RECEIVABLE
+  ACCOUNTS_PAYABLE
+  INVENTORY
+  SALES_REVENUE
+  OTHER_INCOME
+  COST_OF_SALES
+  DEFAULT_EXPENSE
+  INPUT_VAT
+  OUTPUT_VAT
+  WASTAGE_EXPENSE
+  CASH_OVER_SHORT
+  RETAINED_EARNINGS
+  OPENING_BALANCE_EQUITY
+}
+
+// Organization-level chart of accounts (never per-branch — branch scoping
+// lives on JournalEntry so balances/reports can still be filtered by branch).
+// Balances are never stored here; they are always derived from posted
+// JournalLine rows (see accounts.ts /:id/balance and /:id/ledger).
 model Account {
-  id             String        @id @default(cuid())
+  id                 String        @id @default(cuid())
+  organizationId     String
+  branchId           String?
+  code               String
+  name               String
+  description        String?
+  accountClass       String        @map("accountType")
+  reportingGroup     String?
+  accountSubtype     String?
+  normalBalance      String
+  parentId           String?
+  isHeader           Boolean       @default(false)
+  isSystem           Boolean       @default(false)
+  isControlAccount   Boolean       @default(false)
+  allowManualPosting Boolean       @default(true)
+  status             AccountStatus @default(ACTIVE)
+  defaultTaxRateId   String?
+  archivedAt         DateTime?
+  archivedById       String?
+  createdById        String?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @default(now()) @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id])
+  parent       Account?            @relation("AccountChildren", fields: [parentId], references: [id])
+  children     Account[]           @relation("AccountChildren")
+  journalLines JournalLine[]
+  taxRate      TaxRate?            @relation(fields: [defaultTaxRateId], references: [id])
+  bankAccount  BankAccount?
+  mappings     AccountingMapping[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId, accountClass])
+  @@index([organizationId, status])
+  @@index([parentId])
+}
+
+// A bank account is always backed 1:1 by an ASSET leaf Account that actually
+// receives postings — this row only carries the bank-specific metadata
+// (masked identifiers, branch assignment). Never store full account numbers
+// or IBANs; only masked values / last 4 digits.
+model BankAccount {
+  id                  String    @id @default(cuid())
+  organizationId      String
+  accountId           String    @unique
+  branchId            String?
+  bankName            String
+  accountTitle        String
+  accountNumberMasked String
+  accountNumberLast4  String
+  ibanMasked          String?
+  currency            String
+  openingDate         DateTime?
+  isDefault           Boolean   @default(false)
+  isActive            Boolean   @default(true)
+  createdById         String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  account      Account      @relation(fields: [accountId], references: [id])
+  branch       Branch?      @relation(fields: [branchId], references: [id])
+
+  @@index([organizationId])
+}
+
+// Only a default selection for future transactions — changing an account's
+// default tax rate must never alter historical journal entries or VAT
+// reports, since those already captured their own amounts at posting time.
+model TaxRate {
+  id             String      @id @default(cuid())
   organizationId String
-  branchId       String?
-  code           String
   name           String
-  accountType    String
-  accountSubtype String?
-  parentId       String?
-  isHeader       Boolean       @default(false)
-  isActive       Boolean       @default(true)
-  normalBalance  String        @default("debit")
-  description    String?
-  createdAt      DateTime      @default(now())
-  organization   Organization  @relation(fields: [organizationId], references: [id])
-  parent         Account?      @relation("AccountChildren", fields: [parentId], references: [id])
-  children       Account[]     @relation("AccountChildren")
-  journalLines   JournalLine[]
+  code           String
+  rate           Decimal     @db.Decimal(6, 3)
+  type           TaxRateType
+  isDefault      Boolean     @default(false)
+  isActive       Boolean     @default(true)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  accounts     Account[]
 
   @@unique([organizationId, code])
 }
 
-// Journal Entries
+// Points a well-known operational posting role (AccountingMappingKey) at
+// whichever Account the org has actually configured for it. Operational
+// posting code resolves through this instead of silently creating/guessing
+// an account — see resolveMappedAccount() in ledger.ts.
+model AccountingMapping {
+  id             String               @id @default(cuid())
+  organizationId String
+  key            AccountingMappingKey
+  accountId      String
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  account      Account      @relation(fields: [accountId], references: [id])
+
+  @@unique([organizationId, key])
+}
+
+model AccountingPeriod {
+  id             String                 @id @default(cuid())
+  organizationId String
+  name           String
+  startDate      DateTime
+  endDate        DateTime
+  status         AccountingPeriodStatus @default(OPEN)
+  lockedAt       DateTime?
+  lockedById     String?
+  closedAt       DateTime?
+  closedById     String?
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, startDate, endDate])
+  @@index([organizationId, status])
+}
+
+// Journal Entries — posted/reversed entries are immutable; corrections are
+// made via reverseJournalEntry() creating a new offsetting entry, never by
+// editing or deleting a posted entry's lines.
 model JournalEntry {
   id             String        @id @default(cuid())
   organizationId String
@@ -212,11 +379,18 @@ model JournalEntry {
   entryDate      DateTime
   referenceType  String?
   referenceId    String?
+  // sourceType/sourceKey back the idempotent auto-posting path — sourceKey is
+  // required for system-generated entries (e.g. "BILL:{billId}:APPROVAL") and
+  // left null for manually created drafts, where duplicates are expected.
+  sourceType     String?
+  sourceKey      String?
   description    String
   status         String        @default("draft")
-  totalDebit     Float         @default(0)
-  totalCredit    Float         @default(0)
+  totalDebit     Decimal       @default(0) @db.Decimal(18, 2)
+  totalCredit    Decimal       @default(0) @db.Decimal(18, 2)
   isBalanced     Boolean       @default(false)
+  reversalOfId   String?
+  reversedById   String?
   postedBy       String?
   postedAt       DateTime?
   voidReason     String?
@@ -228,6 +402,9 @@ model JournalEntry {
   lines          JournalLine[]
 
   @@unique([organizationId, entryNo])
+  @@unique([organizationId, sourceKey])
+  @@index([organizationId, status])
+  @@index([organizationId, branchId, entryDate])
 }
 
 model JournalLine {
@@ -235,11 +412,14 @@ model JournalLine {
   journalEntryId String
   accountId      String
   description    String?
-  debitAmount    Float        @default(0)
-  creditAmount   Float        @default(0)
+  debitAmount    Decimal      @default(0) @db.Decimal(18, 2)
+  creditAmount   Decimal      @default(0) @db.Decimal(18, 2)
   lineOrder      Int          @default(0)
   journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
   account        Account      @relation(fields: [accountId], references: [id])
+
+  @@index([accountId])
+  @@index([journalEntryId])
 }
 
 // Daily Sales
@@ -659,4 +839,7 @@ model AuditLog {
   ipAddress      String?
   createdAt      DateTime     @default(now())
   organization   Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, module])
+  @@index([organizationId, resourceType, resourceId])
 }

@@ -12,11 +12,11 @@ router.use(authenticate)
 const accountSchema = z.object({
   code: z.string().min(1),
   name: z.string().min(1),
-  accountType: z.enum(['asset', 'liability', 'equity', 'revenue', 'expense']),
+  accountClass: z.enum(['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE']),
   accountSubtype: z.string().optional(),
   parentId: z.string().optional(),
   isHeader: z.boolean().default(false),
-  normalBalance: z.enum(['debit', 'credit']).default('debit'),
+  normalBalance: z.enum(['DEBIT', 'CREDIT']).default('DEBIT'),
   description: z.string().optional(),
   branchId: z.string().optional(),
 })
@@ -44,14 +44,14 @@ router.get('/accounts', async (req: Request, res: Response) => {
 
   const where: Record<string, unknown> = {
     organizationId: req.user.organizationId,
-    isActive: true,
+    status: 'ACTIVE',
   }
-  if (accountType) where.accountType = accountType
+  if (accountType) where.accountClass = accountType.toUpperCase()
   if (branchId) where.branchId = branchId
 
   const accounts = await prisma.account.findMany({
     where,
-    orderBy: [{ accountType: 'asc' }, { code: 'asc' }],
+    orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
     include: { children: { select: { id: true, code: true, name: true } } },
   })
 
@@ -88,7 +88,7 @@ router.put('/accounts/:id', async (req: Request, res: Response) => {
   if (!account) throw new AppError('Account not found', 404, 'NOT_FOUND')
 
   const body = accountSchema.partial().parse(req.body)
-  const updated = await prisma.account.update({ where: { id: req.params.id }, data: body })
+  const updated = await prisma.account.update({ where: { id: req.params.id }, data: { ...body } })
   res.json(updated)
 })
 
@@ -104,8 +104,8 @@ router.delete('/accounts/:id', async (req: Request, res: Response) => {
 
   const hasLines = await prisma.journalLine.count({ where: { accountId: req.params.id } })
   if (hasLines > 0) {
-    await prisma.account.update({ where: { id: req.params.id }, data: { isActive: false } })
-    return res.json({ message: 'Account deactivated (has journal entries)' })
+    await prisma.account.update({ where: { id: req.params.id }, data: { status: 'ARCHIVED', archivedAt: new Date(), archivedById: req.user.id } })
+    return res.json({ message: 'Account archived (has journal entries)' })
   }
 
   await prisma.account.delete({ where: { id: req.params.id } })
@@ -256,10 +256,8 @@ router.post('/journals/:id/post', async (req: Request, res: Response) => {
 })
 
 // GET /accounting/trial-balance — General Ledger summary grouped by
-// Assets / Liabilities / Revenue / Expenses, built from posted journal
-// lines only (draft/void entries never affect the ledger). Equity is
-// excluded from GL reporting entirely — legacy equity accounts (if any)
-// still exist in the chart of accounts, they just aren't reported here.
+// Assets / Liabilities / Equity / Revenue / Expenses, built from posted
+// journal lines only (draft/void entries never affect the ledger).
 router.get('/trial-balance', async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
   const orgId = req.user.organizationId
@@ -274,8 +272,8 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
   }
 
   const accounts = await prisma.account.findMany({
-    where: { organizationId: orgId, isActive: true, accountType: { not: 'equity' } },
-    orderBy: [{ accountType: 'asc' }, { code: 'asc' }],
+    where: { organizationId: orgId, status: 'ACTIVE' },
+    orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
   })
 
   const lines = await prisma.journalLine.findMany({
@@ -286,18 +284,18 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
   const sums: Record<string, { debit: number; credit: number }> = {}
   for (const l of lines) {
     if (!sums[l.accountId]) sums[l.accountId] = { debit: 0, credit: 0 }
-    sums[l.accountId].debit += l.debitAmount
-    sums[l.accountId].credit += l.creditAmount
+    sums[l.accountId].debit += Number(l.debitAmount)
+    sums[l.accountId].credit += Number(l.creditAmount)
   }
 
   const accountRows = accounts.map((a) => {
     const s = sums[a.id] ?? { debit: 0, credit: 0 }
-    const balance = a.normalBalance === 'debit' ? s.debit - s.credit : s.credit - s.debit
+    const balance = a.normalBalance === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
     return {
       accountId: a.id,
       code: a.code,
       name: a.name,
-      accountType: a.accountType,
+      accountType: a.accountClass,
       normalBalance: a.normalBalance,
       totalDebit: s.debit,
       totalCredit: s.credit,
@@ -305,7 +303,7 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
     }
   }).filter((r) => r.totalDebit > 0 || r.totalCredit > 0)
 
-  const types = ['asset', 'liability', 'revenue', 'expense'] as const
+  const types = ['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE'] as const
   const byType = Object.fromEntries(
     types.map((t) => {
       const rows = accountRows.filter((r) => r.accountType === t)
@@ -313,16 +311,18 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
     })
   )
 
-  const totalAssets = byType.asset.total
-  const totalLiabilities = byType.liability.total
-  const totalRevenue = byType.revenue.total
-  const totalExpenses = byType.expense.total
+  const totalAssets = byType.ASSET.total
+  const totalLiabilities = byType.LIABILITY.total
+  const totalEquity = byType.EQUITY.total
+  const totalRevenue = byType.REVENUE.total
+  const totalExpenses = byType.EXPENSE.total
 
   res.json({
     byType,
     summary: {
       totalAssets,
       totalLiabilities,
+      totalEquity,
       totalRevenue,
       totalExpenses,
       netIncome: totalRevenue - totalExpenses,
@@ -361,7 +361,9 @@ router.get('/ledger', async (req: Request, res: Response) => {
 
   let running = 0
   const rows = lines.map((l) => {
-    running += account.normalBalance === 'debit' ? l.debitAmount - l.creditAmount : l.creditAmount - l.debitAmount
+    const debitAmount = Number(l.debitAmount)
+    const creditAmount = Number(l.creditAmount)
+    running += account.normalBalance === 'DEBIT' ? debitAmount - creditAmount : creditAmount - debitAmount
     return {
       id: l.id,
       entryNo: l.journalEntry.entryNo,
@@ -369,8 +371,8 @@ router.get('/ledger', async (req: Request, res: Response) => {
       description: l.description || l.journalEntry.description,
       referenceType: l.journalEntry.referenceType,
       referenceId: l.journalEntry.referenceId,
-      debitAmount: l.debitAmount,
-      creditAmount: l.creditAmount,
+      debitAmount,
+      creditAmount,
       runningBalance: running,
     }
   })

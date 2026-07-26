@@ -30,6 +30,10 @@ async function main() {
   await prisma.journalLine.deleteMany()
   await prisma.journalEntry.deleteMany()
   await prisma.document.deleteMany()
+  await prisma.accountingMapping.deleteMany()
+  await prisma.bankAccount.deleteMany()
+  await prisma.taxRate.deleteMany()
+  await prisma.accountingPeriod.deleteMany()
   await prisma.account.deleteMany()
   await prisma.rolePermission.deleteMany()
   await prisma.permission.deleteMany()
@@ -116,51 +120,114 @@ async function main() {
   console.log('Branches created:', branches.map((b) => b.name).join(', '))
 
   // ─── Chart of Accounts ────────────────────────────────────────────────────────
+  // Standard structure recommended for the Chart of Accounts module: control
+  // (header) accounts group leaf posting accounts by accountClass; Equity is
+  // fully represented (previously excluded from reporting entirely).
   const accountsData = [
-    // Assets
-    { code: '1000', name: 'Cash', accountType: 'asset', normalBalance: 'debit', isHeader: false },
-    { code: '1010', name: 'Bank Account', accountType: 'asset', normalBalance: 'debit', isHeader: false },
-    { code: '1020', name: 'Petty Cash', accountType: 'asset', normalBalance: 'debit', isHeader: false },
-    { code: '1100', name: 'Accounts Receivable', accountType: 'asset', normalBalance: 'debit', isHeader: false },
-    { code: '1200', name: 'Inventory', accountType: 'asset', normalBalance: 'debit', isHeader: false },
-    { code: '1300', name: 'Prepaid Expenses', accountType: 'asset', normalBalance: 'debit', isHeader: false },
-    // Liabilities
-    { code: '2000', name: 'Accounts Payable', accountType: 'liability', normalBalance: 'credit', isHeader: false },
-    { code: '2100', name: 'VAT Payable', accountType: 'liability', normalBalance: 'credit', isHeader: false },
-    { code: '2200', name: 'Salaries Payable', accountType: 'liability', normalBalance: 'credit', isHeader: false },
-    { code: '2300', name: 'Other Payables', accountType: 'liability', normalBalance: 'credit', isHeader: false },
-    // Equity
-    { code: '3000', name: "Owner's Equity", accountType: 'equity', normalBalance: 'credit', isHeader: false },
-    { code: '3100', name: 'Retained Earnings', accountType: 'equity', normalBalance: 'credit', isHeader: false },
-    // Revenue
-    { code: '4000', name: 'Sales Revenue', accountType: 'revenue', normalBalance: 'credit', isHeader: false },
-    { code: '4010', name: 'Delivery Revenue', accountType: 'revenue', normalBalance: 'credit', isHeader: false },
-    { code: '4020', name: 'Other Revenue', accountType: 'revenue', normalBalance: 'credit', isHeader: false },
-    // COGS
-    { code: '5000', name: 'Cost of Goods Sold', accountType: 'expense', normalBalance: 'debit', isHeader: true },
-    { code: '5100', name: 'Food Cost', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '5200', name: 'Staff Meals', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '5300', name: 'Packaging Cost', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    // Operating Expenses
-    { code: '6000', name: 'Operating Expenses', accountType: 'expense', normalBalance: 'debit', isHeader: true },
-    { code: '6100', name: 'Salaries', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '6200', name: 'Rent', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '6300', name: 'Utilities', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '6400', name: 'Delivery Charges', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '6500', name: 'Maintenance', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '6600', name: 'Marketing', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '6700', name: 'Miscellaneous', accountType: 'expense', normalBalance: 'debit', isHeader: false },
-    { code: '6800', name: 'Bank Charges', accountType: 'expense', normalBalance: 'debit', isHeader: false },
+    { code: '1000', name: 'Assets', accountClass: 'ASSET', isControlAccount: true, isSystem: true },
+    { code: '1100', name: 'Current Assets', accountClass: 'ASSET', isControlAccount: true, isSystem: true, parentCode: '1000' },
+    { code: '1110', name: 'Cash on Hand', accountClass: 'ASSET', reportingGroup: 'Cash', parentCode: '1100' },
+    { code: '1120', name: 'Bank Accounts', accountClass: 'ASSET', reportingGroup: 'Bank', parentCode: '1100' },
+    { code: '1150', name: 'Card Clearing', accountClass: 'ASSET', reportingGroup: 'Bank', parentCode: '1100' },
+    { code: '1200', name: 'Accounts Receivable', accountClass: 'ASSET', reportingGroup: 'Accounts Receivable', parentCode: '1100' },
+    { code: '1300', name: 'Inventory', accountClass: 'ASSET', reportingGroup: 'Inventory', parentCode: '1100' },
+    { code: '1400', name: 'Input VAT', accountClass: 'ASSET', reportingGroup: 'Input VAT', parentCode: '1100' },
+    { code: '1500', name: 'Prepayments', accountClass: 'ASSET', reportingGroup: 'Prepayments', parentCode: '1100' },
+    { code: '1600', name: 'Fixed Assets', accountClass: 'ASSET', isControlAccount: true, isSystem: true, parentCode: '1000' },
+    { code: '1610', name: 'Furniture and Equipment', accountClass: 'ASSET', reportingGroup: 'Fixed Assets', parentCode: '1600' },
+    { code: '1620', name: 'Kitchen Equipment', accountClass: 'ASSET', reportingGroup: 'Fixed Assets', parentCode: '1600' },
+    { code: '1690', name: 'Accumulated Depreciation', accountClass: 'ASSET', reportingGroup: 'Accumulated Depreciation', parentCode: '1600' },
+
+    { code: '2000', name: 'Liabilities', accountClass: 'LIABILITY', isControlAccount: true, isSystem: true },
+    { code: '2100', name: 'Current Liabilities', accountClass: 'LIABILITY', isControlAccount: true, isSystem: true, parentCode: '2000' },
+    { code: '2110', name: 'Accounts Payable', accountClass: 'LIABILITY', reportingGroup: 'Accounts Payable', parentCode: '2100' },
+    { code: '2200', name: 'Output VAT', accountClass: 'LIABILITY', reportingGroup: 'Output VAT', parentCode: '2100' },
+    { code: '2300', name: 'Accrued Expenses', accountClass: 'LIABILITY', reportingGroup: 'Accrued Expenses', parentCode: '2100' },
+    { code: '2400', name: 'Loans Payable', accountClass: 'LIABILITY', reportingGroup: 'Loans', parentCode: '2000' },
+    { code: '2500', name: 'Other Liabilities', accountClass: 'LIABILITY', reportingGroup: 'Other Liabilities', parentCode: '2000' },
+
+    { code: '3000', name: 'Equity', accountClass: 'EQUITY', isControlAccount: true, isSystem: true },
+    { code: '3100', name: 'Owner Capital', accountClass: 'EQUITY', reportingGroup: 'Owner Capital', parentCode: '3000' },
+    { code: '3200', name: 'Retained Earnings', accountClass: 'EQUITY', reportingGroup: 'Retained Earnings', parentCode: '3000' },
+    { code: '3300', name: 'Current Year Earnings', accountClass: 'EQUITY', reportingGroup: 'Current Year Earnings', parentCode: '3000', isSystem: true, allowManualPosting: false },
+    { code: '3400', name: 'Owner Drawings', accountClass: 'EQUITY', reportingGroup: 'Drawings', parentCode: '3000' },
+    { code: '3900', name: 'Opening Balance Equity', accountClass: 'EQUITY', reportingGroup: 'Opening Balance Equity', parentCode: '3000', isSystem: true },
+
+    { code: '4000', name: 'Revenue', accountClass: 'REVENUE', isControlAccount: true, isSystem: true },
+    { code: '4100', name: 'Sales Revenue', accountClass: 'REVENUE', reportingGroup: 'Sales Revenue', parentCode: '4000' },
+    { code: '4200', name: 'Service Revenue', accountClass: 'REVENUE', reportingGroup: 'Service Revenue', parentCode: '4000' },
+    { code: '4300', name: 'Other Income', accountClass: 'REVENUE', reportingGroup: 'Other Income', parentCode: '4000' },
+    { code: '4900', name: 'Sales Returns and Discounts', accountClass: 'REVENUE', reportingGroup: 'Discounts', parentCode: '4000' },
+
+    { code: '5000', name: 'Cost of Sales', accountClass: 'EXPENSE', isControlAccount: true, isSystem: true },
+    { code: '5100', name: 'Food Purchases and Cost of Sales', accountClass: 'EXPENSE', reportingGroup: 'Cost of Sales', parentCode: '5000' },
+    { code: '5200', name: 'Inventory Wastage', accountClass: 'EXPENSE', reportingGroup: 'Wastage', parentCode: '5000' },
+    { code: '5300', name: 'Direct Labour', accountClass: 'EXPENSE', reportingGroup: 'Direct Costs', parentCode: '5000' },
+    { code: '5400', name: 'Other Direct Costs', accountClass: 'EXPENSE', reportingGroup: 'Direct Costs', parentCode: '5000' },
+
+    { code: '6000', name: 'Operating Expenses', accountClass: 'EXPENSE', isControlAccount: true, isSystem: true },
+    { code: '6100', name: 'Salaries and Wages', accountClass: 'EXPENSE', reportingGroup: 'Salaries', parentCode: '6000' },
+    { code: '6200', name: 'Rent', accountClass: 'EXPENSE', reportingGroup: 'Rent', parentCode: '6000' },
+    { code: '6300', name: 'Utilities', accountClass: 'EXPENSE', reportingGroup: 'Utilities', parentCode: '6000' },
+    { code: '6400', name: 'Marketing and Advertising', accountClass: 'EXPENSE', reportingGroup: 'Marketing', parentCode: '6000' },
+    { code: '6500', name: 'Bank Charges', accountClass: 'EXPENSE', reportingGroup: 'Bank Charges', parentCode: '6000' },
+    { code: '6600', name: 'Cleaning', accountClass: 'EXPENSE', reportingGroup: 'Operating Expense', parentCode: '6000' },
+    { code: '6700', name: 'Repairs and Maintenance', accountClass: 'EXPENSE', reportingGroup: 'Operating Expense', parentCode: '6000' },
+    { code: '6800', name: 'Depreciation Expense', accountClass: 'EXPENSE', reportingGroup: 'Depreciation', parentCode: '6000' },
+    { code: '6900', name: 'Cash Over or Short', accountClass: 'EXPENSE', reportingGroup: 'Cash Over or Short', parentCode: '6000' },
+    { code: '6990', name: 'Other Operating Expenses', accountClass: 'EXPENSE', reportingGroup: 'Other Expense', parentCode: '6000' },
   ]
+
+  const NORMAL_BALANCE = { ASSET: 'DEBIT', LIABILITY: 'CREDIT', EQUITY: 'CREDIT', REVENUE: 'CREDIT', EXPENSE: 'DEBIT' }
 
   const accounts = {}
   for (const acc of accountsData) {
+    const { parentCode, ...rest } = acc
     const created = await prisma.account.create({
-      data: { ...acc, organizationId: org.id },
+      data: {
+        ...rest,
+        normalBalance: NORMAL_BALANCE[acc.accountClass],
+        isControlAccount: !!acc.isControlAccount,
+        allowManualPosting: acc.allowManualPosting !== undefined ? acc.allowManualPosting : !acc.isControlAccount,
+        isSystem: !!acc.isSystem,
+        organizationId: org.id,
+      },
     })
     accounts[acc.code] = created.id
   }
+  for (const acc of accountsData) {
+    if (acc.parentCode) {
+      await prisma.account.update({ where: { id: accounts[acc.code] }, data: { parentId: accounts[acc.parentCode] } })
+    }
+  }
   console.log(`Created ${accountsData.length} accounts`)
+
+  // ─── Account Mappings ─────────────────────────────────────────────────────
+  // Wires the operational posting roles every module resolves through
+  // (resolveMappedAccount in ledger.ts) to the standard chart above — without
+  // these, no sale/expense/bill/wastage/cash-closing can post at all.
+  const mappingsData = {
+    CASH_ON_HAND: '1110',
+    DEFAULT_BANK: '1120',
+    CARD_CLEARING: '1150',
+    ACCOUNTS_RECEIVABLE: '1200',
+    ACCOUNTS_PAYABLE: '2110',
+    INVENTORY: '1300',
+    SALES_REVENUE: '4100',
+    OTHER_INCOME: '4300',
+    COST_OF_SALES: '5100',
+    DEFAULT_EXPENSE: '6990',
+    INPUT_VAT: '1400',
+    OUTPUT_VAT: '2200',
+    WASTAGE_EXPENSE: '5200',
+    CASH_OVER_SHORT: '6900',
+    RETAINED_EARNINGS: '3200',
+    OPENING_BALANCE_EQUITY: '3900',
+  }
+  for (const [key, code] of Object.entries(mappingsData)) {
+    await prisma.accountingMapping.create({ data: { organizationId: org.id, key, accountId: accounts[code] } })
+  }
+  console.log(`Created ${Object.keys(mappingsData).length} account mappings`)
 
   // ─── Permissions ──────────────────────────────────────────────────────────────
   // Keys must match the PERMISSIONS constants in frontend/src/lib/constants.ts
@@ -205,6 +272,23 @@ async function main() {
     { key: 'can_create_branch', module: 'branches', description: 'Create and manage branches' },
     { key: 'can_view_audit_logs', module: 'settings', description: 'View audit logs' },
     { key: 'can_manage_settings', module: 'settings', description: 'Manage organization settings' },
+    // Chart of Accounts
+    { key: 'accounts_view', module: 'accounts', description: 'View chart of accounts' },
+    { key: 'accounts_create', module: 'accounts', description: 'Create accounts' },
+    { key: 'accounts_edit', module: 'accounts', description: 'Edit accounts' },
+    { key: 'accounts_archive', module: 'accounts', description: 'Archive/restore accounts' },
+    { key: 'accounts_delete_unused', module: 'accounts', description: 'Delete accounts with no journal activity' },
+    { key: 'accounts_import', module: 'accounts', description: 'Import chart of accounts' },
+    { key: 'accounts_export', module: 'accounts', description: 'Export chart of accounts / reports' },
+    { key: 'accounts_view_ledger', module: 'accounts', description: 'View account ledgers and balances' },
+    { key: 'bank_accounts_manage', module: 'accounts', description: 'Manage bank accounts' },
+    { key: 'opening_balances_post', module: 'accounts', description: 'Post opening balances' },
+    { key: 'tax_rates_manage', module: 'accounts', description: 'Manage tax rates' },
+    { key: 'account_mappings_manage', module: 'accounts', description: 'Manage account mappings' },
+    { key: 'accounting_periods_manage', module: 'accounts', description: 'Lock/unlock/close accounting periods' },
+    { key: 'manual_journals_create', module: 'accounts', description: 'Create manual journal entries' },
+    { key: 'manual_journals_post', module: 'accounts', description: 'Post manual journal entries' },
+    { key: 'journals_reverse', module: 'accounts', description: 'Reverse posted journal entries' },
   ]
 
   const permissions = {}
@@ -250,6 +334,10 @@ async function main() {
     'can_manage_accounting', 'can_post_journal', 'can_void_journal',
     'can_view_reports', 'can_view_financial_reports', 'can_export_reports',
     'can_view_approvals', 'can_view_alerts',
+    'accounts_view', 'accounts_create', 'accounts_edit',
+    'accounts_import', 'accounts_export', 'accounts_view_ledger',
+    'opening_balances_post', 'account_mappings_manage', 'accounting_periods_manage',
+    'manual_journals_create', 'manual_journals_post', 'journals_reverse',
   ]
 
   const accountantRole = await prisma.role.create({
@@ -274,6 +362,7 @@ async function main() {
     'can_create_purchase_order', 'can_approve_purchase_order',
     'can_view_approvals', 'can_view_alerts',
     'can_view_reports',
+    'accounts_view', 'accounts_view_ledger',
   ]
 
   const branchManagerRole = await prisma.role.create({
@@ -294,6 +383,7 @@ async function main() {
     'can_create_cash_closing',
     'can_create_expense',
     'can_create_purchase_order',
+    'accounts_view',
   ]
 
   const cashierRole = await prisma.role.create({
@@ -405,11 +495,11 @@ async function main() {
     { name: 'Salaries', accountId: accounts['6100'] },
     { name: 'Rent', accountId: accounts['6200'] },
     { name: 'Utilities', accountId: accounts['6300'] },
-    { name: 'Delivery Charges', accountId: accounts['6400'] },
-    { name: 'Maintenance', accountId: accounts['6500'] },
-    { name: 'Marketing', accountId: accounts['6600'] },
-    { name: 'Miscellaneous', accountId: accounts['6700'] },
-    { name: 'Packaging', accountId: accounts['5300'] },
+    { name: 'Delivery Charges', accountId: accounts['5400'] },
+    { name: 'Maintenance', accountId: accounts['6700'] },
+    { name: 'Marketing', accountId: accounts['6400'] },
+    { name: 'Miscellaneous', accountId: accounts['6990'] },
+    { name: 'Packaging', accountId: accounts['5400'] },
   ]
 
   for (const cat of categoryNames) {

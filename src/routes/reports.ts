@@ -886,11 +886,10 @@ router.get('/general-ledger', async (req: Request, res: Response) => {
     prisma.account.findMany({
       where: {
         organizationId: orgId,
-        isActive: true,
-        accountType: { not: 'equity' },
+        status: 'ACTIVE',
         ...(accountId ? { id: accountId } : {}),
       },
-      orderBy: [{ accountType: 'asc' }, { code: 'asc' }],
+      orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
     }),
     branchId ? prisma.branch.findUnique({ where: { id: branchId }, select: { name: true } }) : Promise.resolve(null),
   ])
@@ -919,16 +918,18 @@ router.get('/general-ledger', async (req: Request, res: Response) => {
       const accLines = byAccount.get(acc.id) ?? []
       let running = 0
       const rows: GLReportLine[] = accLines.map((l) => {
-        running += acc.normalBalance === 'debit' ? l.debitAmount - l.creditAmount : l.creditAmount - l.debitAmount
-        grandDebit += l.debitAmount
-        grandCredit += l.creditAmount
+        const debit = Number(l.debitAmount)
+        const credit = Number(l.creditAmount)
+        running += acc.normalBalance === 'DEBIT' ? debit - credit : credit - debit
+        grandDebit += debit
+        grandCredit += credit
         return {
           date: l.journalEntry.entryDate,
           entryNo: l.journalEntry.entryNo,
           description: l.description || l.journalEntry.description,
           branch: l.journalEntry.branch?.name ?? null,
-          debit: l.debitAmount,
-          credit: l.creditAmount,
+          debit,
+          credit,
           balance: running,
         }
       })
@@ -936,7 +937,7 @@ router.get('/general-ledger', async (req: Request, res: Response) => {
         accountId: acc.id,
         code: acc.code,
         name: acc.name,
-        accountType: acc.accountType,
+        accountType: acc.accountClass,
         lines: rows,
         closingBalance: running,
       }

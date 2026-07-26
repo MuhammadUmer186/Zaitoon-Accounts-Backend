@@ -5,7 +5,7 @@ import { authenticate } from '../middleware/auth'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
-import { postJournalEntry, accountCodeForPaymentMethod, GL } from '../utils/ledger'
+import { postJournalEntry, resolveMappedAccount, mappingKeyForPaymentMethod, reverseJournalEntry } from '../utils/ledger'
 
 const router = Router()
 
@@ -159,6 +159,8 @@ router.post('/bills', async (req: Request, res: Response) => {
 
   const { items, ...billData } = body
 
+  // No journal posting here — a draft bill has no financial impact yet.
+  // Posting happens at /bills/:id/approve, the authoritative posting point.
   const bill = await prisma.bill.create({
     data: {
       ...billData,
@@ -173,28 +175,7 @@ router.post('/bills', async (req: Request, res: Response) => {
     include: { items: true, supplier: true, branch: true },
   })
 
-  // Standardized posting: debit the line-items' accounts when they all agree
-  // on one, otherwise default to Inventory; credit Accounts Payable.
-  const uniformAccountId = items && items.length > 0 && items.every((i) => i.accountId && i.accountId === items[0].accountId)
-    ? items[0].accountId
-    : undefined
-
-  const je = await postJournalEntry(prisma, {
-    organizationId: req.user.organizationId,
-    branchId: bill.branchId,
-    entryDate: bill.billDate,
-    referenceType: 'bill',
-    referenceId: bill.id,
-    description: `Supplier Bill ${billNo}`,
-    createdBy: req.user.id,
-    lines: [
-      { accountId: uniformAccountId, accountCode: uniformAccountId ? undefined : GL.INVENTORY, description: 'Bill items', debitAmount: bill.totalAmount },
-      { accountCode: GL.AP, description: 'Payable to supplier', creditAmount: bill.totalAmount },
-    ],
-  })
-  await prisma.bill.update({ where: { id: bill.id }, data: { journalEntryId: je?.id } })
-
-  res.status(201).json({ ...bill, journalEntryId: je?.id })
+  res.status(201).json(bill)
 })
 
 // GET /bills/:id
@@ -240,17 +221,54 @@ router.put('/bills/:id', async (req: Request, res: Response) => {
   res.json(updated)
 })
 
-// POST /bills/:id/approve
+// POST /bills/:id/approve — the authoritative financial posting point for a
+// manually-created bill (PO-received bills post at receiving time instead —
+// see inventory.ts /purchases — since that path has no separate draft phase).
 router.post('/bills/:id/approve', async (req: Request, res: Response) => {
   const bill = await prisma.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: { items: true },
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
   if (bill.status !== 'draft') throw new AppError('Only draft bills can be approved', 400, 'INVALID_STATUS')
 
+  // Debit the line-items' accounts when they all agree on one, otherwise
+  // default to Inventory; VAT (if any) is split onto its own Input VAT line.
+  const uniformAccountId = bill.items.length > 0 && bill.items.every((i) => i.accountId && i.accountId === bill.items[0].accountId)
+    ? bill.items[0].accountId!
+    : undefined
+
+  const netAmount = bill.totalAmount - bill.vatAmount
+
+  const [debitAccount, inputVat, payable] = await Promise.all([
+    uniformAccountId
+      ? prisma.account.findUniqueOrThrow({ where: { id: uniformAccountId } })
+      : resolveMappedAccount(prisma, req.user.organizationId, 'INVENTORY'),
+    bill.vatAmount > 0 ? resolveMappedAccount(prisma, req.user.organizationId, 'INPUT_VAT') : null,
+    resolveMappedAccount(prisma, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
+  ])
+
+  const je = await postJournalEntry(prisma, {
+    organizationId: req.user.organizationId,
+    branchId: bill.branchId,
+    entryDate: bill.billDate,
+    referenceType: 'bill',
+    referenceId: bill.id,
+    sourceType: 'BILL',
+    sourceKey: `BILL:${bill.id}:APPROVAL`,
+    description: `Supplier Bill ${bill.billNo}`,
+    createdBy: req.user.id,
+    lines: [
+      { accountId: debitAccount.id, description: 'Bill items', debitAmount: netAmount },
+      ...(inputVat ? [{ accountId: inputVat.id, description: 'Input VAT', debitAmount: bill.vatAmount }] : []),
+      { accountId: payable.id, description: 'Payable to supplier', creditAmount: bill.totalAmount },
+    ],
+  })
+
   const updated = await prisma.bill.update({
     where: { id: req.params.id },
-    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date() },
+    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId: je?.id },
+    include: { items: true, payments: true, supplier: true, branch: true },
   })
   res.json(updated)
 })
@@ -264,6 +282,11 @@ router.post('/bills/:id/void', async (req: Request, res: Response) => {
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
+  if (bill.status === 'void') throw new AppError('Bill is already voided', 400, 'INVALID_STATUS')
+
+  if (bill.journalEntryId) {
+    await reverseJournalEntry(prisma, bill.journalEntryId, req.user.id, `Void — ${voidReason}`)
+  }
 
   const updated = await prisma.bill.update({
     where: { id: req.params.id },
@@ -297,17 +320,24 @@ router.post('/bills/:id/payments', async (req: Request, res: Response) => {
     },
   })
 
+  const [payable, paidFrom] = await Promise.all([
+    resolveMappedAccount(prisma, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
+    resolveMappedAccount(prisma, req.user.organizationId, mappingKeyForPaymentMethod(payment.paymentMethod)),
+  ])
+
   const je = await postJournalEntry(prisma, {
     organizationId: req.user.organizationId,
     branchId: bill.branchId,
     entryDate: payment.paymentDate,
     referenceType: 'payment',
     referenceId: payment.id,
+    sourceType: 'BILL_PAYMENT',
+    sourceKey: `BILL_PAYMENT:${payment.id}:POST`,
     description: `Payment for Bill ${bill.billNo}`,
     createdBy: req.user.id,
     lines: [
-      { accountCode: GL.AP, description: 'Payable settled', debitAmount: payment.amount },
-      { accountCode: accountCodeForPaymentMethod(payment.paymentMethod), description: 'Payment made', creditAmount: payment.amount },
+      { accountId: payable.id, description: 'Payable settled', debitAmount: payment.amount },
+      { accountId: paidFrom.id, description: 'Payment made', creditAmount: payment.amount },
     ],
   })
   await prisma.payment.update({ where: { id: payment.id }, data: { journalEntryId: je?.id } })

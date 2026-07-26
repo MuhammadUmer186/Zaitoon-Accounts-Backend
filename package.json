@@ -10,6 +10,7 @@
     "db:clear-data": "node prisma/clear-data.js",
     "db:clear-inventory": "node prisma/clear-inventory.js",
     "db:sync-permissions": "node prisma/sync-permissions.js",
+    "db:upgrade-chart-of-accounts": "node prisma/upgrade-chart-of-accounts.js",
     "db:studio": "prisma studio"
   },
   "dependencies": {

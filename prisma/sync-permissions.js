@@ -50,6 +50,23 @@ const permissionsData = [
   { key: 'can_create_branch', module: 'branches', description: 'Create and manage branches' },
   { key: 'can_view_audit_logs', module: 'settings', description: 'View audit logs' },
   { key: 'can_manage_settings', module: 'settings', description: 'Manage organization settings' },
+  // Chart of Accounts
+  { key: 'accounts_view', module: 'accounts', description: 'View chart of accounts' },
+  { key: 'accounts_create', module: 'accounts', description: 'Create accounts' },
+  { key: 'accounts_edit', module: 'accounts', description: 'Edit accounts' },
+  { key: 'accounts_archive', module: 'accounts', description: 'Archive/restore accounts' },
+  { key: 'accounts_delete_unused', module: 'accounts', description: 'Delete accounts with no journal activity' },
+  { key: 'accounts_import', module: 'accounts', description: 'Import chart of accounts' },
+  { key: 'accounts_export', module: 'accounts', description: 'Export chart of accounts / reports' },
+  { key: 'accounts_view_ledger', module: 'accounts', description: 'View account ledgers and balances' },
+  { key: 'bank_accounts_manage', module: 'accounts', description: 'Manage bank accounts' },
+  { key: 'opening_balances_post', module: 'accounts', description: 'Post opening balances' },
+  { key: 'tax_rates_manage', module: 'accounts', description: 'Manage tax rates' },
+  { key: 'account_mappings_manage', module: 'accounts', description: 'Manage account mappings' },
+  { key: 'accounting_periods_manage', module: 'accounts', description: 'Lock/unlock/close accounting periods' },
+  { key: 'manual_journals_create', module: 'accounts', description: 'Create manual journal entries' },
+  { key: 'manual_journals_post', module: 'accounts', description: 'Post manual journal entries' },
+  { key: 'journals_reverse', module: 'accounts', description: 'Reverse posted journal entries' },
 ]
 
 const accountantPerms = [
@@ -59,6 +76,10 @@ const accountantPerms = [
   'can_manage_accounting', 'can_post_journal', 'can_void_journal',
   'can_view_reports', 'can_view_financial_reports', 'can_export_reports',
   'can_view_approvals', 'can_view_alerts',
+  'accounts_view', 'accounts_create', 'accounts_edit',
+  'accounts_import', 'accounts_export', 'accounts_view_ledger',
+  'opening_balances_post', 'account_mappings_manage', 'accounting_periods_manage',
+  'manual_journals_create', 'manual_journals_post', 'journals_reverse',
 ]
 
 const managerPerms = [
@@ -70,6 +91,7 @@ const managerPerms = [
   'can_create_purchase_order', 'can_approve_purchase_order',
   'can_view_approvals', 'can_view_alerts',
   'can_view_reports',
+  'accounts_view', 'accounts_view_ledger',
 ]
 
 const cashierPerms = [
@@ -77,6 +99,7 @@ const cashierPerms = [
   'can_create_cash_closing',
   'can_create_expense',
   'can_create_purchase_order',
+  'accounts_view',
 ]
 
 const allKeys = permissionsData.map((p) => p.key)

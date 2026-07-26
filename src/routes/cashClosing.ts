@@ -5,6 +5,7 @@ import { authenticate } from '../middleware/auth'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { postJournalEntry, resolveMappedAccount, reverseJournalEntry } from '../utils/ledger'
 
 const router = Router()
 
@@ -180,7 +181,8 @@ router.post('/:id/submit', async (req: Request, res: Response) => {
   res.json(updated)
 })
 
-// POST /cash-closing/:id/approve
+// POST /cash-closing/:id/approve — posts the cash over/short entry, if any.
+// A perfectly balanced closing has nothing to post.
 router.post('/:id/approve', async (req: Request, res: Response) => {
   const closing = await prisma.cashClosing.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
@@ -188,9 +190,41 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
   if (closing.status !== 'submitted') throw new AppError('Only submitted closings can be approved', 400, 'INVALID_STATUS')
 
+  let journalEntryId: string | undefined
+  const diff = Math.abs(closing.difference)
+
+  if (diff > 0.01) {
+    const [cashOverShort, cash] = await Promise.all([
+      resolveMappedAccount(prisma, req.user.organizationId, 'CASH_OVER_SHORT'),
+      resolveMappedAccount(prisma, req.user.organizationId, 'CASH_ON_HAND'),
+    ])
+
+    const je = await postJournalEntry(prisma, {
+      organizationId: req.user.organizationId,
+      branchId: closing.branchId,
+      entryDate: closing.closingDate,
+      referenceType: 'cash_closing',
+      referenceId: closing.id,
+      sourceType: 'CASH_CLOSING',
+      sourceKey: `CASH_CLOSING:${closing.id}:APPROVAL`,
+      description: `Cash Closing ${closing.closingNo} — ${closing.differenceType}`,
+      createdBy: req.user.id,
+      lines: closing.differenceType === 'short'
+        ? [
+            { accountId: cashOverShort.id, description: 'Cash shortage', debitAmount: diff },
+            { accountId: cash.id, description: 'Cash shortage', creditAmount: diff },
+          ]
+        : [
+            { accountId: cash.id, description: 'Cash overage', debitAmount: diff },
+            { accountId: cashOverShort.id, description: 'Cash overage', creditAmount: diff },
+          ],
+    })
+    journalEntryId = je?.id
+  }
+
   const updated = await prisma.cashClosing.update({
     where: { id: req.params.id },
-    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date() },
+    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId },
   })
   res.json(updated)
 })
@@ -204,6 +238,11 @@ router.post('/:id/void', async (req: Request, res: Response) => {
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
+  if (closing.status === 'void') throw new AppError('Cash closing is already voided', 400, 'INVALID_STATUS')
+
+  if (closing.journalEntryId) {
+    await reverseJournalEntry(prisma, closing.journalEntryId, req.user.id, `Void — ${voidReason}`)
+  }
 
   const updated = await prisma.cashClosing.update({
     where: { id: req.params.id },
