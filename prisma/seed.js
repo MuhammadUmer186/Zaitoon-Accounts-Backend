@@ -255,6 +255,8 @@ async function main() {
     // Purchase Orders
     { key: 'can_create_purchase_order', module: 'purchase_orders', description: 'Create purchase orders' },
     { key: 'can_approve_purchase_order', module: 'purchase_orders', description: 'Approve purchase orders and receive stock' },
+    // Purchasing (one-shot vendor purchase entry)
+    { key: 'can_create_purchasing_entry', module: 'purchasing', description: 'Create purchasing entries (vendor purchases)' },
     // Approvals & Alerts
     { key: 'can_view_approvals', module: 'approvals', description: 'View the unified approvals inbox' },
     { key: 'can_view_alerts', module: 'alerts', description: 'View the alerts module' },
@@ -359,7 +361,7 @@ async function main() {
     'can_create_expense', 'can_approve_expense', 'can_void_expense',
     'can_manage_suppliers', 'can_create_bill', 'can_approve_bill',
     'can_manage_inventory', 'can_transfer_stock', 'can_approve_wastage',
-    'can_create_purchase_order', 'can_approve_purchase_order',
+    'can_create_purchase_order', 'can_approve_purchase_order', 'can_create_purchasing_entry',
     'can_view_approvals', 'can_view_alerts',
     'can_view_reports',
     'accounts_view', 'accounts_view_ledger',
@@ -382,7 +384,7 @@ async function main() {
     'can_create_sales',
     'can_create_cash_closing',
     'can_create_expense',
-    'can_create_purchase_order',
+    'can_create_purchase_order', 'can_create_purchasing_entry',
     'accounts_view',
   ]
 

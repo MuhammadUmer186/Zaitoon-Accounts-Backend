@@ -16,6 +16,8 @@ const orgSettingsSchema = z.object({
   address: z.string().optional(),
   city: z.string().optional(),
   lowStockThreshold: z.number().min(0).nullable().optional(),
+  purchaseOrderEnabled: z.boolean().optional(),
+  country: z.string().length(2).optional(),
 })
 
 // GET /orgs/:orgId

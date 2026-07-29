@@ -115,12 +115,13 @@ router.get('/bills/pending-approval', async (req: Request, res: Response) => {
 // GET /bills
 router.get('/bills', async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
-  const { branchId, supplierId, status, fromDate, toDate } = req.query as Record<string, string>
+  const { branchId, supplierId, status, source, fromDate, toDate } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
   if (branchId) where.branchId = branchId
   if (supplierId) where.supplierId = supplierId
   if (status) where.status = status
+  if (source) where.source = source
   if (fromDate || toDate) {
     where.billDate = {
       ...(fromDate && { gte: new Date(fromDate) }),

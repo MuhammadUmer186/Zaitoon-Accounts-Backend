@@ -22,6 +22,7 @@ import syncRouter from './sync'
 import targetsRouter from './targets'
 import documentsRouter from './documents'
 import purchaseOrdersRouter from './purchaseOrders'
+import purchasingRouter from './purchasing'
 import alertsRouter from './alerts'
 
 const router = Router()
@@ -53,6 +54,7 @@ router.use('/sync', syncRouter)
 router.use('/targets', targetsRouter)
 router.use('/documents', documentsRouter)
 router.use('/purchase-orders', purchaseOrdersRouter)
+router.use('/purchasing', purchasingRouter)
 router.use('/alerts', alertsRouter)
 
 export default router

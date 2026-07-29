@@ -22,6 +22,7 @@ model Organization {
   fiscalYearStart    String               @default("01-01")
   logoUrl            String?
   lowStockThreshold  Float?
+  purchaseOrderEnabled Boolean            @default(true)
   isActive           Boolean              @default(true)
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
@@ -586,6 +587,8 @@ model Bill {
   paidAmount     Float        @default(0)
   balanceDue     Float
   status         String       @default("draft")
+  source         String       @default("bill")
+  hijriDate      String?
   notes          String?
   documentId     String?
   journalEntryId String?
@@ -629,6 +632,7 @@ model Payment {
   referenceNo    String?
   notes          String?
   journalEntryId String?
+  documentId     String?
   createdBy      String
   createdAt      DateTime @default(now())
   bill           Bill     @relation(fields: [billId], references: [id])

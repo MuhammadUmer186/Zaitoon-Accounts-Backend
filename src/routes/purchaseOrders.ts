@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express'
+import { Router, Request, Response, NextFunction } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
@@ -9,6 +9,17 @@ import { AppError } from '../middleware/error'
 const router = Router()
 
 router.use(authenticate)
+
+// Super admins can turn the multi-step PO workflow off org-wide (Settings >
+// Modules) once the simpler Purchasing module covers their needs. Existing
+// POs remain viewable (GET routes are unaffected) — only new activity is blocked.
+async function requirePurchaseOrdersEnabled(req: Request, res: Response, next: NextFunction) {
+  const org = await prisma.organization.findUnique({ where: { id: req.user.organizationId } })
+  if (!org?.purchaseOrderEnabled) {
+    throw new AppError('The Purchase Order system is disabled for this organization', 403, 'PURCHASE_ORDERS_DISABLED')
+  }
+  next()
+}
 
 const poItemSchema = z.object({
   itemId: z.string().optional(),
@@ -72,7 +83,7 @@ router.get('/pending-approval', async (req: Request, res: Response) => {
 })
 
 // POST /purchase-orders
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const body = poSchema.parse(req.body)
 
   const branch = await prisma.branch.findFirst({
@@ -110,7 +121,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /purchase-orders/:id
-router.put('/:id', async (req: Request, res: Response) => {
+router.put('/:id', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const order = await prisma.purchaseOrder.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -143,7 +154,7 @@ router.put('/:id', async (req: Request, res: Response) => {
 })
 
 // POST /purchase-orders/:id/submit
-router.post('/:id/submit', async (req: Request, res: Response) => {
+router.post('/:id/submit', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const order = await prisma.purchaseOrder.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -158,7 +169,7 @@ router.post('/:id/submit', async (req: Request, res: Response) => {
 })
 
 // POST /purchase-orders/:id/approve
-router.post('/:id/approve', async (req: Request, res: Response) => {
+router.post('/:id/approve', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const order = await prisma.purchaseOrder.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -173,7 +184,7 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
 })
 
 // POST /purchase-orders/:id/reject
-router.post('/:id/reject', async (req: Request, res: Response) => {
+router.post('/:id/reject', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const { rejectionReason } = req.body as Record<string, string>
   if (!rejectionReason) throw new AppError('Rejection reason is required', 400, 'VALIDATION_ERROR')
 
