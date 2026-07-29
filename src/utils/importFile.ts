@@ -1,5 +1,6 @@
 import { Response } from 'express'
 import ExcelJS from 'exceljs'
+import { AppError } from '../middleware/error'
 
 // Writes a template CSV with the literal column keys as the header row
 // (e.g. "branchName", not "Branch Name") — the round-trip counterpart to
@@ -20,11 +21,23 @@ export async function parseImportFile(file: Express.Multer.File): Promise<Record
   const wb = new ExcelJS.Workbook()
   const isCsv = file.mimetype === 'text/csv' || file.originalname.toLowerCase().endsWith('.csv')
 
-  if (isCsv) {
-    const { Readable } = await import('stream')
-    await wb.csv.read(Readable.from(file.buffer))
-  } else {
-    await wb.xlsx.load(file.buffer as unknown as ExcelJS.Buffer)
+  try {
+    if (isCsv) {
+      const { Readable } = await import('stream')
+      await wb.csv.read(Readable.from(file.buffer))
+    } else {
+      await wb.xlsx.load(file.buffer as unknown as ExcelJS.Buffer)
+    }
+  } catch {
+    // A renamed/corrupt/wrong-type file makes exceljs throw deep inside its
+    // zip/xml parser (e.g. "Cannot read properties of undefined") rather
+    // than a clean error — surface a message the user can act on instead of
+    // a 500.
+    throw new AppError(
+      `Could not read "${file.originalname}" as a CSV or Excel file. Make sure it's a valid .csv or .xlsx file and try again.`,
+      400,
+      'INVALID_IMPORT_FILE'
+    )
   }
 
   const ws = wb.worksheets[0]
@@ -42,4 +55,23 @@ export async function parseImportFile(file: Express.Multer.File): Promise<Record
     if (Object.values(record).some((v) => v !== '')) rows.push(record)
   })
   return rows
+}
+
+// Guards against uploading a spreadsheet whose columns don't match the
+// expected import template at all (wrong file, renamed export, hand-typed
+// headers, ...). Without this, every row would just report every field as
+// "required" — technically correct but useless for figuring out what's
+// actually wrong. Only checks that *some* recognized column made it through;
+// per-row validation still catches individually missing/invalid fields.
+export function assertRecognizedColumns(rows: Record<string, string>[], expectedColumns: string[]): void {
+  if (rows.length === 0) return
+  const foundColumns = Object.keys(rows[0])
+  const matched = expectedColumns.filter((c) => foundColumns.includes(c))
+  if (matched.length === 0) {
+    throw new AppError(
+      `This file's column headers don't match the import template. Expected columns: ${expectedColumns.join(', ')}. Found: ${foundColumns.join(', ') || '(none)'}. Download the template and use its exact header row.`,
+      400,
+      'IMPORT_COLUMNS_MISMATCH'
+    )
+  }
 }

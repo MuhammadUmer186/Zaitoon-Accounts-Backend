@@ -8,7 +8,7 @@ import { requirePermission } from '../middleware/authorize'
 import { upload } from '../middleware/upload'
 import { AppError } from '../middleware/error'
 import { createPurchaseBill, PurchaseItemInput } from '../services/purchasing'
-import { parseImportFile, sendImportTemplate } from '../utils/importFile'
+import { parseImportFile, sendImportTemplate, assertRecognizedColumns } from '../utils/importFile'
 import { logAudit } from '../utils/audit'
 
 const router = Router()
@@ -259,6 +259,7 @@ async function validatePurchaseImportRows(organizationId: string, rows: Record<s
 router.post('/import/validate', requirePermission('can_create_purchasing_entry'), memoryUpload.single('file'), async (req: Request, res: Response) => {
   if (!req.file) throw new AppError('A CSV or Excel file is required', 400, 'VALIDATION_ERROR')
   const rows = await parseImportFile(req.file)
+  assertRecognizedColumns(rows, IMPORT_COLUMNS)
   const results = await validatePurchaseImportRows(req.user.organizationId, rows)
   res.json({
     totalRows: results.length,
@@ -273,6 +274,7 @@ router.post('/import/commit', requirePermission('can_create_purchasing_entry'), 
   if (!req.file) throw new AppError('A CSV or Excel file is required', 400, 'VALIDATION_ERROR')
   const orgId = req.user.organizationId
   const rows = await parseImportFile(req.file)
+  assertRecognizedColumns(rows, IMPORT_COLUMNS)
   const results = await validatePurchaseImportRows(orgId, rows)
 
   if (results.some((r) => r.errors.length > 0)) {

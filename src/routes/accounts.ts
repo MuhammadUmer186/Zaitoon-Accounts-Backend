@@ -15,7 +15,7 @@ import {
   normalBalanceForClass, assertUniqueCode, assertValidParent, assertNoControlManualPostingConflict,
 } from '../services/accounts'
 import { tryExportRows, sendRowsCsv, sendRowsExcel, sendRowsPdf } from '../utils/genericExport'
-import { parseImportFile, sendImportTemplate } from '../utils/importFile'
+import { parseImportFile, sendImportTemplate, assertRecognizedColumns } from '../utils/importFile'
 
 const router = Router()
 router.use(authenticate)
@@ -139,6 +139,7 @@ async function validateImportRows(organizationId: string, rows: Record<string, s
 router.post('/import/validate', requirePermission('accounts_import'), memoryUpload.single('file'), async (req: Request, res: Response) => {
   if (!req.file) throw new AppError('A CSV or Excel file is required', 400, 'VALIDATION_ERROR')
   const rows = await parseImportFile(req.file)
+  assertRecognizedColumns(rows, IMPORT_COLUMNS)
   const results = await validateImportRows(req.user.organizationId, rows)
   res.json({
     totalRows: results.length,
@@ -152,6 +153,7 @@ router.post('/import/commit', requirePermission('accounts_import'), memoryUpload
   if (!req.file) throw new AppError('A CSV or Excel file is required', 400, 'VALIDATION_ERROR')
   const orgId = req.user.organizationId
   const rows = await parseImportFile(req.file)
+  assertRecognizedColumns(rows, IMPORT_COLUMNS)
   const results = await validateImportRows(orgId, rows)
 
   if (results.some((r) => r.errors.length > 0)) {
