@@ -1,19 +1,22 @@
 import fs from 'fs'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
+import multer from 'multer'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
 import { upload } from '../middleware/upload'
-import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
-import { postJournalEntry, resolveMappedAccount, mappingKeyForPaymentMethod } from '../utils/ledger'
-import { applyStockIn } from '../utils/stock'
-import { toHijriDate } from '../utils/hijriDate'
+import { createPurchaseBill, PurchaseItemInput } from '../services/purchasing'
+import { parseImportFile } from '../utils/importFile'
+import { sendRowsCsv } from '../utils/genericExport'
+import { logAudit } from '../utils/audit'
 
 const router = Router()
 
 router.use(authenticate)
+
+const memoryUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 const purchaseItemSchema = z.object({
   itemId: z.string().optional(),
@@ -106,103 +109,22 @@ router.post(
           })
         }
 
-        const billNo = await nextNumber(tx as unknown as typeof prisma, 'bill', 'billNo', 'BILL', req.user.organizationId)
         const supplyDate = new Date(body.supplyDate)
-        const balanceDue = totalAmount - paidAmount
-        const status = balanceDue <= 0.01 ? 'paid' : paidAmount > 0 ? 'partial' : 'approved'
+        const paymentDate = new Date(body.paymentDate)
 
-        const createdBill = await tx.bill.create({
-          data: {
-            organizationId: req.user.organizationId,
-            branchId: body.branchId,
-            supplierId: supplier.id,
-            billNo,
-            billDate: supplyDate,
-            dueDate: new Date(body.paymentDate),
-            subtotal,
-            vatAmount,
-            totalAmount,
-            paidAmount,
-            balanceDue,
-            status,
-            source: 'purchasing',
-            hijriDate: toHijriDate(supplyDate),
-            createdBy: req.user.id,
-            items: {
-              create: itemInputs.map((i) => ({
-                description: i.description,
-                quantity: i.quantity,
-                unitPrice: i.unitCost,
-                vatRate: body.vatPercent,
-                vatAmount: Math.round(i.quantity * i.unitCost * (body.vatPercent / 100) * 100) / 100,
-                totalAmount: Math.round(i.quantity * i.unitCost * (1 + body.vatPercent / 100) * 100) / 100,
-                itemId: i.itemId,
-              })),
-            },
-          },
-        })
-
-        const [inventoryAccount, inputVat, payable] = await Promise.all([
-          resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'INVENTORY'),
-          vatAmount > 0 ? resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'INPUT_VAT') : null,
-          resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
-        ])
-
-        const billJe = await postJournalEntry(tx as unknown as typeof prisma, {
+        const { bill: createdBill, payment: createdPayment } = await createPurchaseBill(tx as unknown as typeof prisma, {
           organizationId: req.user.organizationId,
           branchId: body.branchId,
-          entryDate: supplyDate,
-          referenceType: 'bill',
-          referenceId: createdBill.id,
-          sourceType: 'BILL',
-          sourceKey: `BILL:${createdBill.id}:APPROVAL`,
-          description: `Purchase ${billNo} — ${supplier.name}`,
+          supplierId: supplier.id,
+          supplierName: supplier.name,
+          supplyDate,
+          paymentDate,
+          paymentType: body.paymentType,
+          vatPercent: body.vatPercent,
+          amountPaid: paidAmount,
+          items: itemInputs,
           createdBy: req.user.id,
-          lines: [
-            { accountId: inventoryAccount.id, description: 'Purchased goods', debitAmount: subtotal },
-            ...(inputVat ? [{ accountId: inputVat.id, description: 'Input VAT', debitAmount: vatAmount }] : []),
-            { accountId: payable.id, description: 'Payable to vendor', creditAmount: totalAmount },
-          ],
         })
-        await tx.bill.update({ where: { id: createdBill.id }, data: { journalEntryId: billJe?.id } })
-
-        let createdPayment: { id: string } | null = null
-        if (paidAmount > 0) {
-          createdPayment = await tx.payment.create({
-            data: {
-              organizationId: req.user.organizationId,
-              branchId: body.branchId,
-              billId: createdBill.id,
-              paymentDate: new Date(body.paymentDate),
-              amount: paidAmount,
-              paymentMethod: body.paymentType,
-              createdBy: req.user.id,
-            },
-          })
-
-          const paidFrom = await resolveMappedAccount(
-            tx as unknown as typeof prisma,
-            req.user.organizationId,
-            mappingKeyForPaymentMethod(body.paymentType)
-          )
-
-          const paymentJe = await postJournalEntry(tx as unknown as typeof prisma, {
-            organizationId: req.user.organizationId,
-            branchId: body.branchId,
-            entryDate: new Date(body.paymentDate),
-            referenceType: 'payment',
-            referenceId: createdPayment.id,
-            sourceType: 'BILL_PAYMENT',
-            sourceKey: `BILL_PAYMENT:${createdPayment.id}:POST`,
-            description: `Payment for Purchase ${billNo}`,
-            createdBy: req.user.id,
-            lines: [
-              { accountId: payable.id, description: 'Payable settled', debitAmount: paidAmount },
-              { accountId: paidFrom.id, description: 'Payment made', creditAmount: paidAmount },
-            ],
-          })
-          await tx.payment.update({ where: { id: createdPayment.id }, data: { journalEntryId: paymentJe?.id } })
-        }
 
         if (billFile) {
           const document = await tx.document.create({
@@ -242,21 +164,6 @@ router.post(
           await tx.payment.update({ where: { id: createdPayment.id }, data: { documentId: document.id } })
         }
 
-        for (const item of itemInputs) {
-          if (!item.itemId) continue // free-text lines aren't linked to a stock item
-          await applyStockIn(tx as unknown as typeof prisma, {
-            organizationId: req.user.organizationId,
-            branchId: body.branchId,
-            itemId: item.itemId,
-            quantity: item.quantity,
-            unitCost: item.unitCost,
-            referenceType: 'purchase',
-            referenceId: createdBill.id,
-            notes: `Purchased via Purchasing — ${billNo}`,
-            createdBy: req.user.id,
-          })
-        }
-
         return tx.bill.findUniqueOrThrow({
           where: { id: createdBill.id },
           include: { items: true, payments: true, supplier: true, branch: true },
@@ -270,5 +177,172 @@ router.post(
     }
   }
 )
+
+// ── Bulk import (CSV/Excel) ─────────────────────────────────────────────────
+// Each row is one purchase with a single line item — the common shape for a
+// bulk vendor purchase list. supplierName is matched case-insensitively
+// against existing suppliers in the org; if no match is found a new Supplier
+// is created (mirroring the manual entry form's vendorName behavior). Every
+// other supplier is left untouched.
+const IMPORT_COLUMNS = ['branchName', 'supplierName', 'supplyDate', 'paymentDate', 'paymentType', 'itemCode', 'itemDescription', 'quantity', 'unitCost', 'vatPercent', 'amountPaid']
+
+router.get('/import/template', requirePermission('can_create_purchasing_entry'), async (req: Request, res: Response) => {
+  sendRowsCsv(res, [Object.fromEntries(IMPORT_COLUMNS.map((c) => [c, '']))], 'purchasing-import-template')
+})
+
+interface PurchaseImportRowResult {
+  row: number
+  data: Record<string, string>
+  errors: string[]
+  willCreateSupplier: boolean
+}
+
+async function validatePurchaseImportRows(organizationId: string, rows: Record<string, string>[]): Promise<PurchaseImportRowResult[]> {
+  const [branches, suppliers, items] = await Promise.all([
+    prisma.branch.findMany({ where: { organizationId }, select: { name: true } }),
+    prisma.supplier.findMany({ where: { organizationId }, select: { name: true } }),
+    prisma.item.findMany({ where: { organizationId }, select: { code: true } }),
+  ])
+  const branchNames = new Set(branches.map((b) => b.name.toLowerCase()))
+  const supplierNames = new Set(suppliers.map((s) => s.name.toLowerCase()))
+  const itemCodes = new Set(items.map((i) => i.code.toLowerCase()))
+  const newSupplierNamesSeen = new Set<string>()
+
+  return rows.map((data, i) => {
+    const errors: string[] = []
+
+    const branchName = data.branchName?.trim()
+    if (!branchName) errors.push('branchName is required')
+    else if (!branchNames.has(branchName.toLowerCase())) errors.push(`branch "${branchName}" was not found`)
+
+    const supplierName = data.supplierName?.trim()
+    if (!supplierName) errors.push('supplierName is required')
+
+    const supplyDate = data.supplyDate?.trim()
+    if (!supplyDate || isNaN(Date.parse(supplyDate))) errors.push('supplyDate is required and must be a valid date (YYYY-MM-DD)')
+
+    const paymentDate = data.paymentDate?.trim()
+    if (paymentDate && isNaN(Date.parse(paymentDate))) errors.push('paymentDate must be a valid date (YYYY-MM-DD)')
+
+    const paymentType = data.paymentType?.trim().toLowerCase() || 'cash'
+    if (!['cash', 'bank_transfer'].includes(paymentType)) errors.push('paymentType must be "cash" or "bank_transfer"')
+
+    const itemDescription = data.itemDescription?.trim()
+    if (!itemDescription) errors.push('itemDescription is required')
+
+    const quantity = Number(data.quantity)
+    if (!data.quantity?.trim() || !(quantity > 0)) errors.push('quantity must be a positive number')
+
+    const unitCost = Number(data.unitCost)
+    if (!data.unitCost?.trim() || isNaN(unitCost) || unitCost < 0) errors.push('unitCost must be a non-negative number')
+
+    const vatPercent = data.vatPercent?.trim() ? Number(data.vatPercent) : 0
+    if (isNaN(vatPercent) || vatPercent < 0 || vatPercent > 100) errors.push('vatPercent must be between 0 and 100')
+
+    const amountPaid = data.amountPaid?.trim() ? Number(data.amountPaid) : 0
+    if (isNaN(amountPaid) || amountPaid < 0) errors.push('amountPaid must be a non-negative number')
+
+    const itemCode = data.itemCode?.trim()
+    if (itemCode && !itemCodes.has(itemCode.toLowerCase())) errors.push(`itemCode "${itemCode}" was not found in the item catalog`)
+
+    if (errors.length === 0) {
+      const total = Math.round(quantity * unitCost * (1 + vatPercent / 100) * 100) / 100
+      if (amountPaid > total + 0.01) errors.push('amountPaid cannot exceed the purchase total')
+    }
+
+    const willCreateSupplier = !!supplierName && !supplierNames.has(supplierName.toLowerCase()) && !newSupplierNamesSeen.has(supplierName.toLowerCase())
+    if (supplierName && !supplierNames.has(supplierName.toLowerCase())) newSupplierNamesSeen.add(supplierName.toLowerCase())
+
+    return { row: i + 2, data, errors, willCreateSupplier }
+  })
+}
+
+router.post('/import/validate', requirePermission('can_create_purchasing_entry'), memoryUpload.single('file'), async (req: Request, res: Response) => {
+  if (!req.file) throw new AppError('A CSV or Excel file is required', 400, 'VALIDATION_ERROR')
+  const rows = await parseImportFile(req.file)
+  const results = await validatePurchaseImportRows(req.user.organizationId, rows)
+  res.json({
+    totalRows: results.length,
+    validRows: results.filter((r) => r.errors.length === 0).length,
+    invalidRows: results.filter((r) => r.errors.length > 0).length,
+    newSuppliers: [...new Set(results.filter((r) => r.willCreateSupplier).map((r) => r.data.supplierName.trim()))],
+    rows: results,
+  })
+})
+
+router.post('/import/commit', requirePermission('can_create_purchasing_entry'), memoryUpload.single('file'), async (req: Request, res: Response) => {
+  if (!req.file) throw new AppError('A CSV or Excel file is required', 400, 'VALIDATION_ERROR')
+  const orgId = req.user.organizationId
+  const rows = await parseImportFile(req.file)
+  const results = await validatePurchaseImportRows(orgId, rows)
+
+  if (results.some((r) => r.errors.length > 0)) {
+    throw new AppError('Import contains invalid rows — fix them or re-validate before committing', 400, 'INVALID_IMPORT')
+  }
+  if (results.length === 0) throw new AppError('No rows to import', 400, 'VALIDATION_ERROR')
+
+  const created = await prisma.$transaction(async (tx) => {
+    const [branches, items] = await Promise.all([
+      tx.branch.findMany({ where: { organizationId: orgId }, select: { id: true, name: true } }),
+      tx.item.findMany({ where: { organizationId: orgId }, select: { id: true, code: true } }),
+    ])
+    const branchIdByName = new Map(branches.map((b) => [b.name.toLowerCase(), b.id]))
+    const itemIdByCode = new Map(items.map((it) => [it.code.toLowerCase(), it.id]))
+    const supplierCache = new Map<string, { id: string; name: string }>()
+
+    const bills = []
+    // Sequential on purpose — createPurchaseBill allocates bill/journal-entry
+    // numbers by counting existing rows, so parallel creates within the same
+    // transaction could race and collide on the same number.
+    for (const r of results) {
+      const supplierNameTrimmed = r.data.supplierName.trim()
+      const supplierKey = supplierNameTrimmed.toLowerCase()
+      let supplier = supplierCache.get(supplierKey)
+      if (!supplier) {
+        const existing = await tx.supplier.findFirst({
+          where: { organizationId: orgId, name: { equals: supplierNameTrimmed, mode: 'insensitive' } },
+        })
+        supplier = existing ?? (await tx.supplier.create({ data: { organizationId: orgId, name: supplierNameTrimmed } }))
+        supplierCache.set(supplierKey, supplier)
+      }
+
+      const branchId = branchIdByName.get(r.data.branchName.trim().toLowerCase())!
+      const itemCode = r.data.itemCode?.trim()
+      const itemId = itemCode ? itemIdByCode.get(itemCode.toLowerCase()) : undefined
+      const supplyDate = new Date(r.data.supplyDate.trim())
+      const paymentDateStr = r.data.paymentDate?.trim()
+      const paymentDate = paymentDateStr ? new Date(paymentDateStr) : supplyDate
+      const paymentType = (r.data.paymentType?.trim().toLowerCase() || 'cash') as 'cash' | 'bank_transfer'
+      const vatPercent = r.data.vatPercent?.trim() ? Number(r.data.vatPercent) : 0
+      const amountPaid = r.data.amountPaid?.trim() ? Number(r.data.amountPaid) : 0
+      const items_: PurchaseItemInput[] = [{
+        itemId,
+        description: r.data.itemDescription.trim(),
+        quantity: Number(r.data.quantity),
+        unitCost: Number(r.data.unitCost),
+      }]
+
+      const { bill } = await createPurchaseBill(tx as unknown as typeof prisma, {
+        organizationId: orgId,
+        branchId,
+        supplierId: supplier.id,
+        supplierName: supplier.name,
+        supplyDate,
+        paymentDate,
+        paymentType,
+        vatPercent,
+        amountPaid,
+        items: items_,
+        createdBy: req.user.id,
+      })
+      bills.push(bill)
+    }
+    return bills
+  }, { maxWait: 10000, timeout: 120000 })
+
+  await logAudit(prisma, { req, action: 'purchasing.imported', module: 'purchasing', resourceType: 'purchasing_import', newData: { count: created.length } })
+
+  res.status(201).json({ imported: created.length })
+})
 
 export default router

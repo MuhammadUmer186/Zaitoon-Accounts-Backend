@@ -1,7 +1,6 @@
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import multer from 'multer'
-import ExcelJS from 'exceljs'
 import { prisma } from '../config'
 import { AccountClass } from '../types/accounting'
 import { authenticate } from '../middleware/auth'
@@ -16,6 +15,7 @@ import {
   normalBalanceForClass, assertUniqueCode, assertValidParent, assertNoControlManualPostingConflict,
 } from '../services/accounts'
 import { tryExportRows, sendRowsCsv, sendRowsExcel, sendRowsPdf } from '../utils/genericExport'
+import { parseImportFile } from '../utils/importFile'
 
 const router = Router()
 router.use(authenticate)
@@ -96,34 +96,6 @@ const IMPORT_COLUMNS = ['code', 'name', 'description', 'accountClass', 'reportin
 router.get('/import/template', requirePermission('accounts_import'), async (req: Request, res: Response) => {
   sendRowsCsv(res, [Object.fromEntries(IMPORT_COLUMNS.map((c) => [c, '']))], 'chart-of-accounts-import-template')
 })
-
-async function parseImportFile(file: Express.Multer.File): Promise<Record<string, string>[]> {
-  const wb = new ExcelJS.Workbook()
-  const isCsv = file.mimetype === 'text/csv' || file.originalname.toLowerCase().endsWith('.csv')
-
-  if (isCsv) {
-    const { Readable } = await import('stream')
-    await wb.csv.read(Readable.from(file.buffer))
-  } else {
-    await wb.xlsx.load(file.buffer as unknown as ExcelJS.Buffer)
-  }
-
-  const ws = wb.worksheets[0]
-  if (!ws) return []
-
-  const headerRow = ws.getRow(1).values as unknown[]
-  const headers = headerRow.slice(1).map((h) => String(h ?? '').trim())
-
-  const rows: Record<string, string>[] = []
-  ws.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return
-    const values = row.values as unknown[]
-    const record: Record<string, string> = {}
-    headers.forEach((h, i) => { record[h] = String(values[i + 1] ?? '').trim() })
-    if (Object.values(record).some((v) => v !== '')) rows.push(record)
-  })
-  return rows
-}
 
 interface ImportRowResult {
   row: number

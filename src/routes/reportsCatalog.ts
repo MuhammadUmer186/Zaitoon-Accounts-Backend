@@ -195,6 +195,38 @@ router.get('/expenses', async (req: Request, res: Response) => {
   res.json({ data: rows })
 })
 
+// GET /reports/purchases — every supplier bill in the period (Purchasing
+// module one-shot entries, Purchase Order receipts, and manually created
+// bills alike), one row per bill
+router.get('/purchases', async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+  const billDate = dateRangeFilter(fromDate, toDate)
+
+  const bills = await prisma.bill.findMany({
+    where: { organizationId: orgId, ...(branchId && { branchId }), status: { not: 'void' }, ...(billDate && { billDate }) },
+    include: { supplier: { select: { name: true } }, branch: { select: { name: true } } },
+    orderBy: { billDate: 'desc' },
+  })
+
+  const rows = bills.map((b) => ({
+    purchaseNo: b.billNo,
+    date: b.billDate.toISOString().slice(0, 10),
+    supplier: b.supplier.name,
+    branch: b.branch.name,
+    subtotal: b.subtotal,
+    vat: b.vatAmount,
+    totalAmount: b.totalAmount,
+    paidAmount: b.paidAmount,
+    balanceDue: b.balanceDue,
+    status: b.status,
+    source: b.source,
+  }))
+
+  if (await tryExportRows(res, format, rows, 'purchases', 'Purchase Report')) return
+  res.json({ data: rows })
+})
+
 // GET /reports/supplier-payable — outstanding bills with aging analysis
 router.get('/supplier-payable', async (req: Request, res: Response) => {
   const { branchId, format } = req.query as Record<string, string>
