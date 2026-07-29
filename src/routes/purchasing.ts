@@ -179,21 +179,35 @@ router.post(
 
 // ── Bulk import (CSV/Excel) ─────────────────────────────────────────────────
 // Each row is one purchase with a single line item — the common shape for a
-// bulk vendor purchase list. supplierName is matched case-insensitively
-// against existing suppliers in the org; if no match is found a new Supplier
-// is created (mirroring the manual entry form's vendorName behavior). Every
-// other supplier is left untouched.
-const IMPORT_COLUMNS = ['branchName', 'supplierName', 'supplyDate', 'paymentDate', 'paymentType', 'itemCode', 'itemDescription', 'quantity', 'unitCost', 'vatPercent', 'amountPaid']
+// bulk vendor purchase list. supplierName and itemCode are both matched
+// case-insensitively against existing records; when either doesn't match, a
+// new Supplier / Item is created (mirroring the manual entry form's
+// vendorName behavior). Anything that does match is reused untouched — an
+// import never edits an existing supplier or item.
+const IMPORT_COLUMNS = ['branchName', 'supplierName', 'supplyDate', 'paymentDate', 'paymentType', 'itemCode', 'itemDescription', 'itemUnit', 'quantity', 'unitCost', 'vatPercent', 'amountPaid']
 
 router.get('/import/template', requirePermission('can_create_purchasing_entry'), async (req: Request, res: Response) => {
   sendImportTemplate(res, IMPORT_COLUMNS, 'purchasing-import-template')
 })
+
+// Accepts the manual entry form's own vocabulary ("Online Transfer") plus
+// common human variants, not just the literal stored value "bank_transfer" —
+// spreadsheets get typed by hand, not selected from the form's dropdown.
+function normalizePaymentType(raw: string | undefined): 'cash' | 'bank_transfer' | null {
+  const v = (raw ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (!v || v === 'cash') return 'cash'
+  const bankTransferSynonyms = new Set([
+    'bank_transfer', 'banktransfer', 'bank', 'online_transfer', 'onlinetransfer', 'online', 'transfer', 'wire_transfer', 'wiretransfer',
+  ])
+  return bankTransferSynonyms.has(v) ? 'bank_transfer' : null
+}
 
 interface PurchaseImportRowResult {
   row: number
   data: Record<string, string>
   errors: string[]
   willCreateSupplier: boolean
+  willCreateItem: boolean
 }
 
 async function validatePurchaseImportRows(organizationId: string, rows: Record<string, string>[]): Promise<PurchaseImportRowResult[]> {
@@ -206,6 +220,7 @@ async function validatePurchaseImportRows(organizationId: string, rows: Record<s
   const supplierNames = new Set(suppliers.map((s) => s.name.toLowerCase()))
   const itemCodes = new Set(items.map((i) => i.code.toLowerCase()))
   const newSupplierNamesSeen = new Set<string>()
+  const newItemCodesSeen = new Set<string>()
 
   return rows.map((data, i) => {
     const errors: string[] = []
@@ -223,8 +238,9 @@ async function validatePurchaseImportRows(organizationId: string, rows: Record<s
     const paymentDate = data.paymentDate?.trim()
     if (paymentDate && isNaN(Date.parse(paymentDate))) errors.push('paymentDate must be a valid date (YYYY-MM-DD)')
 
-    const paymentType = data.paymentType?.trim().toLowerCase() || 'cash'
-    if (!['cash', 'bank_transfer'].includes(paymentType)) errors.push('paymentType must be "cash" or "bank_transfer"')
+    if (normalizePaymentType(data.paymentType) === null) {
+      errors.push(`paymentType "${data.paymentType}" is not recognized — use "cash" or "bank_transfer" (also accepts "Online Transfer")`)
+    }
 
     const itemDescription = data.itemDescription?.trim()
     if (!itemDescription) errors.push('itemDescription is required')
@@ -241,18 +257,21 @@ async function validatePurchaseImportRows(organizationId: string, rows: Record<s
     const amountPaid = data.amountPaid?.trim() ? Number(data.amountPaid) : 0
     if (isNaN(amountPaid) || amountPaid < 0) errors.push('amountPaid must be a non-negative number')
 
-    const itemCode = data.itemCode?.trim()
-    if (itemCode && !itemCodes.has(itemCode.toLowerCase())) errors.push(`itemCode "${itemCode}" was not found in the item catalog`)
-
     if (errors.length === 0) {
       const total = Math.round(quantity * unitCost * (1 + vatPercent / 100) * 100) / 100
       if (amountPaid > total + 0.01) errors.push('amountPaid cannot exceed the purchase total')
     }
 
-    const willCreateSupplier = !!supplierName && !supplierNames.has(supplierName.toLowerCase()) && !newSupplierNamesSeen.has(supplierName.toLowerCase())
-    if (supplierName && !supplierNames.has(supplierName.toLowerCase())) newSupplierNamesSeen.add(supplierName.toLowerCase())
+    const supplierKey = supplierName?.toLowerCase()
+    const willCreateSupplier = !!supplierKey && !supplierNames.has(supplierKey) && !newSupplierNamesSeen.has(supplierKey)
+    if (supplierKey && !supplierNames.has(supplierKey)) newSupplierNamesSeen.add(supplierKey)
 
-    return { row: i + 2, data, errors, willCreateSupplier }
+    const itemCode = data.itemCode?.trim()
+    const itemKey = itemCode?.toLowerCase()
+    const willCreateItem = !!itemKey && !itemCodes.has(itemKey) && !newItemCodesSeen.has(itemKey)
+    if (itemKey && !itemCodes.has(itemKey)) newItemCodesSeen.add(itemKey)
+
+    return { row: i + 2, data, errors, willCreateSupplier, willCreateItem }
   })
 }
 
@@ -266,6 +285,7 @@ router.post('/import/validate', requirePermission('can_create_purchasing_entry')
     validRows: results.filter((r) => r.errors.length === 0).length,
     invalidRows: results.filter((r) => r.errors.length > 0).length,
     newSuppliers: [...new Set(results.filter((r) => r.willCreateSupplier).map((r) => r.data.supplierName.trim()))],
+    newItems: [...new Set(results.filter((r) => r.willCreateItem).map((r) => r.data.itemCode.trim()))],
     rows: results,
   })
 })
@@ -283,13 +303,10 @@ router.post('/import/commit', requirePermission('can_create_purchasing_entry'), 
   if (results.length === 0) throw new AppError('No rows to import', 400, 'VALIDATION_ERROR')
 
   const created = await prisma.$transaction(async (tx) => {
-    const [branches, items] = await Promise.all([
-      tx.branch.findMany({ where: { organizationId: orgId }, select: { id: true, name: true } }),
-      tx.item.findMany({ where: { organizationId: orgId }, select: { id: true, code: true } }),
-    ])
+    const branches = await tx.branch.findMany({ where: { organizationId: orgId }, select: { id: true, name: true } })
     const branchIdByName = new Map(branches.map((b) => [b.name.toLowerCase(), b.id]))
-    const itemIdByCode = new Map(items.map((it) => [it.code.toLowerCase(), it.id]))
     const supplierCache = new Map<string, { id: string; name: string }>()
+    const itemCache = new Map<string, { id: string }>()
 
     const bills = []
     // Sequential on purpose — createPurchaseBill allocates bill/journal-entry
@@ -308,12 +325,32 @@ router.post('/import/commit', requirePermission('can_create_purchasing_entry'), 
       }
 
       const branchId = branchIdByName.get(r.data.branchName.trim().toLowerCase())!
-      const itemCode = r.data.itemCode?.trim()
-      const itemId = itemCode ? itemIdByCode.get(itemCode.toLowerCase()) : undefined
+      const itemCodeTrimmed = r.data.itemCode?.trim()
+      let itemId: string | undefined
+      if (itemCodeTrimmed) {
+        const itemKey = itemCodeTrimmed.toLowerCase()
+        let item = itemCache.get(itemKey)
+        if (!item) {
+          const existingItem = await tx.item.findFirst({
+            where: { organizationId: orgId, code: { equals: itemCodeTrimmed, mode: 'insensitive' } },
+          })
+          item = existingItem ?? (await tx.item.create({
+            data: {
+              organizationId: orgId,
+              code: itemCodeTrimmed,
+              name: r.data.itemDescription.trim(),
+              unit: r.data.itemUnit?.trim() || 'kg',
+              costPrice: Number(r.data.unitCost),
+            },
+          }))
+          itemCache.set(itemKey, item)
+        }
+        itemId = item.id
+      }
       const supplyDate = new Date(r.data.supplyDate.trim())
       const paymentDateStr = r.data.paymentDate?.trim()
       const paymentDate = paymentDateStr ? new Date(paymentDateStr) : supplyDate
-      const paymentType = (r.data.paymentType?.trim().toLowerCase() || 'cash') as 'cash' | 'bank_transfer'
+      const paymentType = normalizePaymentType(r.data.paymentType) ?? 'cash'
       const vatPercent = r.data.vatPercent?.trim() ? Number(r.data.vatPercent) : 0
       const amountPaid = r.data.amountPaid?.trim() ? Number(r.data.amountPaid) : 0
       const items_: PurchaseItemInput[] = [{
