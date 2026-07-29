@@ -68,7 +68,9 @@ router.post(
     const subtotal = itemInputs.reduce((sum, i) => sum + i.quantity * i.unitCost, 0)
     const vatAmount = Math.round(subtotal * (body.vatPercent / 100) * 100) / 100
     const totalAmount = subtotal + vatAmount
-    const paidAmount = body.amountPaid ?? totalAmount
+    // Not paid unless the user explicitly enters an amount — a purchase
+    // shouldn't silently post as fully paid just because Amount Paid was left blank.
+    const paidAmount = body.amountPaid ?? 0
     if (paidAmount > totalAmount + 0.01) throw new AppError('Amount paid cannot exceed total payment', 400, 'VALIDATION_ERROR')
     if (body.paymentType === 'bank_transfer' && paidAmount > 0 && !paymentSlipFile) {
       throw new AppError('A transfer slip attachment is required for online transfer payments', 400, 'VALIDATION_ERROR')

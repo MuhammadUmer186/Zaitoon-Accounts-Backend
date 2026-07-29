@@ -109,7 +109,7 @@ router.get('/bills/pending-approval', async (req: Request, res: Response) => {
       branch: { select: { id: true, name: true } },
     },
   })
-  res.json({ data: bills })
+  res.json({ data: bills.map((b) => ({ ...b, supplierName: b.supplier?.name, branchName: b.branch?.name })) })
 })
 
 // GET /bills
@@ -143,7 +143,8 @@ router.get('/bills', async (req: Request, res: Response) => {
     prisma.bill.count({ where }),
   ])
 
-  res.json(paginatedResponse(bills, total, page, limit))
+  const rows = bills.map((b) => ({ ...b, supplierName: b.supplier?.name, branchName: b.branch?.name }))
+  res.json(paginatedResponse(rows, total, page, limit))
 })
 
 // POST /bills
