@@ -1,4 +1,17 @@
+import { Response } from 'express'
 import ExcelJS from 'exceljs'
+
+// Writes a template CSV with the literal column keys as the header row
+// (e.g. "branchName", not "Branch Name") — the round-trip counterpart to
+// parseImportFile below, which reads header text back verbatim to build each
+// row's keys. Deliberately does NOT use genericExport's sendRowsCsv, which
+// humanizes headers for human-readable report downloads and would silently
+// break every import that re-uploads its own template.
+export function sendImportTemplate(res: Response, columns: string[], reportName: string): void {
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader('Content-Disposition', `attachment; filename="${reportName}.csv"`)
+  res.send(columns.join(',') + '\r\n')
+}
 
 // Shared CSV/Excel row parser for every "upload a spreadsheet" import flow
 // (Chart of Accounts, Purchasing, ...). Reads the first sheet, treats row 1

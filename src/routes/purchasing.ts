@@ -8,8 +8,7 @@ import { requirePermission } from '../middleware/authorize'
 import { upload } from '../middleware/upload'
 import { AppError } from '../middleware/error'
 import { createPurchaseBill, PurchaseItemInput } from '../services/purchasing'
-import { parseImportFile } from '../utils/importFile'
-import { sendRowsCsv } from '../utils/genericExport'
+import { parseImportFile, sendImportTemplate } from '../utils/importFile'
 import { logAudit } from '../utils/audit'
 
 const router = Router()
@@ -187,7 +186,7 @@ router.post(
 const IMPORT_COLUMNS = ['branchName', 'supplierName', 'supplyDate', 'paymentDate', 'paymentType', 'itemCode', 'itemDescription', 'quantity', 'unitCost', 'vatPercent', 'amountPaid']
 
 router.get('/import/template', requirePermission('can_create_purchasing_entry'), async (req: Request, res: Response) => {
-  sendRowsCsv(res, [Object.fromEntries(IMPORT_COLUMNS.map((c) => [c, '']))], 'purchasing-import-template')
+  sendImportTemplate(res, IMPORT_COLUMNS, 'purchasing-import-template')
 })
 
 interface PurchaseImportRowResult {

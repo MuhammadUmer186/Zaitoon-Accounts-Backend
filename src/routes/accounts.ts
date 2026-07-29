@@ -15,7 +15,7 @@ import {
   normalBalanceForClass, assertUniqueCode, assertValidParent, assertNoControlManualPostingConflict,
 } from '../services/accounts'
 import { tryExportRows, sendRowsCsv, sendRowsExcel, sendRowsPdf } from '../utils/genericExport'
-import { parseImportFile } from '../utils/importFile'
+import { parseImportFile, sendImportTemplate } from '../utils/importFile'
 
 const router = Router()
 router.use(authenticate)
@@ -94,7 +94,7 @@ router.get('/export/:format', requirePermission('accounts_export'), async (req: 
 const IMPORT_COLUMNS = ['code', 'name', 'description', 'accountClass', 'reportingGroup', 'parentCode', 'defaultTaxCode', 'isControlAccount', 'allowManualPosting']
 
 router.get('/import/template', requirePermission('accounts_import'), async (req: Request, res: Response) => {
-  sendRowsCsv(res, [Object.fromEntries(IMPORT_COLUMNS.map((c) => [c, '']))], 'chart-of-accounts-import-template')
+  sendImportTemplate(res, IMPORT_COLUMNS, 'chart-of-accounts-import-template')
 })
 
 interface ImportRowResult {
