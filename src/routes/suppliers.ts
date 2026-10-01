@@ -117,7 +117,7 @@ router.get('/bills/pending-approval', async (req: Request, res: Response) => {
 // GET /bills
 router.get('/bills', async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
-  const { branchId, supplierId, status, source, categoryId, search, fromDate, toDate } = req.query as Record<string, string>
+  const { branchId, supplierId, status, source, categoryId, search, billNo, fromDate, toDate } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
   const bf = await branchFilter(req, branchId)
@@ -127,6 +127,8 @@ router.get('/bills', async (req: Request, res: Response) => {
   if (status) where.status = status.includes(',') ? { in: status.split(',') } : status
   if (source) where.source = source
   if (categoryId) where.categoryId = categoryId
+  // Purchase-number-only filter (search below also matches vendor names)
+  if (billNo) where.billNo = { contains: billNo.trim(), mode: 'insensitive' }
   if (search) {
     where.OR = [
       { billNo: { contains: search, mode: 'insensitive' } },
