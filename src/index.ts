@@ -1,11 +1,14 @@
 import 'dotenv/config'
 import app from './app'
 import { config, prisma } from './config'
+import { bootstrapSuperAdmin } from './utils/bootstrapSuperAdmin'
 
 async function main() {
   try {
     await prisma.$connect()
     console.log('Database connected successfully')
+
+    await bootstrapSuperAdmin(prisma)
 
     app.listen(config.port, () => {
       console.log(`Zaitoon Backend running on http://localhost:${config.port}`)

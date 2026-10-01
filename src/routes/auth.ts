@@ -10,7 +10,7 @@ import { getUserPermissions } from '../utils/permissions'
 const router = Router()
 
 const loginSchema = z.object({
-  email: z.string().email(),
+  email: z.string().trim().email(),
   password: z.string().min(1),
 })
 
@@ -44,9 +44,11 @@ router.post('/login', async (req: Request, res: Response) => {
   try {
     const body = loginSchema.parse(req.body)
 
-    // Find user by email across all orgs (email is unique per org, find any matching)
+    // Find user by email across all orgs (email is unique per org, find any
+    // matching). Case-insensitive and trimmed — mobile keyboards capitalize
+    // the first letter and autofill can add a trailing space.
     const user = await prisma.user.findFirst({
-      where: { email: body.email, isActive: true },
+      where: { email: { equals: body.email.trim(), mode: 'insensitive' }, isActive: true },
       include: { organization: true },
     })
 
