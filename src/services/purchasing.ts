@@ -16,6 +16,7 @@ export interface CreatePurchaseBillParams {
   branchId: string
   supplierId: string
   supplierName: string
+  categoryId?: string
   supplyDate: Date
   paymentDate: Date
   paymentType: 'cash' | 'bank_transfer'
@@ -56,6 +57,7 @@ export async function createPurchaseBill(prisma: PrismaClient, params: CreatePur
       balanceDue,
       status,
       source: 'purchasing',
+      categoryId: params.categoryId,
       hijriDate: toHijriDate(params.supplyDate),
       createdBy: params.createdBy,
       items: {

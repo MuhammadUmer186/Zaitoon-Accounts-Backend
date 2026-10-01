@@ -1,7 +1,9 @@
+import fs from 'fs'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { upload } from '../middleware/upload'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
@@ -90,6 +92,9 @@ router.get('/', async (req: Request, res: Response) => {
     }
   }
 
+  const { source } = req.query as Record<string, string>
+  if (source) where.source = source
+
   const [expenses, total] = await Promise.all([
     prisma.expense.findMany({
       where,
@@ -103,7 +108,152 @@ router.get('/', async (req: Request, res: Response) => {
     prisma.expense.count({ where }),
   ])
 
-  res.json(paginatedResponse(expenses, total, page, limit))
+  const rows = expenses.map((e) => ({ ...e, branchName: e.branch?.name, categoryName: e.category?.name }))
+  res.json(paginatedResponse(rows, total, page, limit))
+})
+
+const purchasingPaymentSchema = z.object({
+  billId: z.string(),
+  paymentDate: z.string(),
+  paymentMethod: z.enum(['cash', 'bank_transfer', 'card', 'cheque']),
+  amount: z.coerce.number().positive(),
+  paidBy: z.string().trim().min(1, 'Paid By is required'),
+  referenceNo: z.string().optional(),
+  notes: z.string().optional(),
+})
+
+// POST /expenses/purchasing-payment — the "Purchasing" mode of New Expense:
+// pays (fully or partially) a pending Purchasing bill. Posts the payment
+// journal entry (Accounts Payable → Cash/Bank) exactly like a bill payment,
+// and records a matching Expense row (source "purchasing") so the payment is
+// visible in the Expenses module. The Expense reuses the payment's journal
+// entry rather than posting its own — the purchase cost was already booked
+// when the bill was created, so a second posting would double count it.
+router.post('/purchasing-payment', upload.single('paymentSlip'), async (req: Request, res: Response) => {
+  const slip = req.file
+  const cleanup = () => { if (slip) { try { fs.unlinkSync(slip.path) } catch { /* best-effort cleanup */ } } }
+
+  const parsed = purchasingPaymentSchema.safeParse(req.body)
+  if (!parsed.success) { cleanup(); throw parsed.error }
+  const body = parsed.data
+  if (body.paymentMethod === 'bank_transfer' && !slip) {
+    throw new AppError('A transfer slip attachment is required for bank transfer payments', 400, 'VALIDATION_ERROR')
+  }
+
+  try {
+    const expense = await prisma.$transaction(async (tx) => {
+      const db = tx as unknown as typeof prisma
+      const bill = await tx.bill.findFirst({
+        where: { id: body.billId, organizationId: req.user.organizationId, source: 'purchasing' },
+        include: { supplier: true, branch: true },
+      })
+      if (!bill) throw new AppError('Purchase not found', 404, 'NOT_FOUND')
+      if (!['approved', 'partial'].includes(bill.status)) {
+        throw new AppError(`Purchase ${bill.billNo} is not pending payment (status: ${bill.status})`, 400, 'INVALID_STATUS')
+      }
+      if (!bill.categoryId) throw new AppError('This purchase has no category — it cannot be paid as an expense', 400, 'VALIDATION_ERROR')
+      if (body.amount > bill.balanceDue + 0.01) {
+        throw new AppError(`Amount exceeds the balance due (${bill.balanceDue.toFixed(2)})`, 400, 'OVERPAYMENT')
+      }
+
+      const paymentDate = new Date(body.paymentDate)
+      const payment = await tx.payment.create({
+        data: {
+          organizationId: req.user.organizationId,
+          branchId: bill.branchId,
+          billId: bill.id,
+          paymentDate,
+          amount: body.amount,
+          paymentMethod: body.paymentMethod,
+          referenceNo: body.referenceNo,
+          notes: body.notes,
+          paidBy: body.paidBy,
+          createdBy: req.user.id,
+        },
+      })
+
+      const [payable, paidFrom] = await Promise.all([
+        resolveMappedAccount(db, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
+        resolveMappedAccount(db, req.user.organizationId, mappingKeyForPaymentMethod(body.paymentMethod)),
+      ])
+      const je = await postJournalEntry(db, {
+        organizationId: req.user.organizationId,
+        branchId: bill.branchId,
+        entryDate: paymentDate,
+        referenceType: 'payment',
+        referenceId: payment.id,
+        sourceType: 'BILL_PAYMENT',
+        sourceKey: `BILL_PAYMENT:${payment.id}:POST`,
+        description: `Payment for Purchase ${bill.billNo} — ${bill.supplier.name}`,
+        createdBy: req.user.id,
+        lines: [
+          { accountId: payable.id, description: 'Payable settled', debitAmount: body.amount },
+          { accountId: paidFrom.id, description: `Paid by ${body.paidBy}`, creditAmount: body.amount },
+        ],
+      })
+
+      let slipDocumentId: string | undefined
+      if (slip) {
+        const doc = await tx.document.create({
+          data: {
+            organizationId: req.user.organizationId,
+            branchId: bill.branchId,
+            originalFilename: slip.originalname,
+            storedFilename: slip.filename,
+            filePath: slip.path,
+            fileType: slip.mimetype,
+            fileSize: slip.size,
+            documentType: 'payment_slip',
+            linkedType: 'payment',
+            linkedId: payment.id,
+            uploadedBy: req.user.id,
+          },
+        })
+        slipDocumentId = doc.id
+      }
+      await tx.payment.update({ where: { id: payment.id }, data: { journalEntryId: je?.id, documentId: slipDocumentId } })
+
+      const newPaid = bill.paidAmount + body.amount
+      const newBalance = Math.max(0, Math.round((bill.totalAmount - newPaid) * 100) / 100)
+      await tx.bill.update({
+        where: { id: bill.id },
+        data: { paidAmount: newPaid, balanceDue: newBalance, status: newBalance <= 0.01 ? 'paid' : 'partial' },
+      })
+
+      const expenseNo = await nextNumber(db, 'expense', 'expenseNo', bill.branch.expensePrefix || 'EXP', req.user.organizationId)
+      return tx.expense.create({
+        data: {
+          organizationId: req.user.organizationId,
+          branchId: bill.branchId,
+          expenseNo,
+          expenseDate: paymentDate,
+          categoryId: bill.categoryId,
+          description: `Payment for Purchase ${bill.billNo} — ${bill.supplier.name}`,
+          amount: body.amount,
+          vatAmount: 0,
+          vatRate: 0,
+          totalAmount: body.amount,
+          paymentMethod: body.paymentMethod,
+          source: 'purchasing',
+          billId: bill.id,
+          paymentId: payment.id,
+          paidBy: body.paidBy,
+          supplierId: bill.supplierId,
+          receiptDocumentId: slipDocumentId,
+          status: 'approved',
+          approvedBy: req.user.id,
+          approvedAt: new Date(),
+          journalEntryId: je?.id,
+          notes: body.notes,
+          createdBy: req.user.id,
+        },
+      })
+    })
+    res.status(201).json(expense)
+  } catch (err) {
+    cleanup()
+    throw err
+  }
 })
 
 // POST /expenses
@@ -144,7 +294,33 @@ router.get('/:id', async (req: Request, res: Response) => {
     include: { branch: true, category: true },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
-  res.json(expense)
+
+  // Purchasing-mode expenses carry the paid bill (with its attachment) and
+  // the payment's transfer slip, so the detail page can show both.
+  let bill = null
+  if (expense.billId) {
+    const b = await prisma.bill.findUnique({
+      where: { id: expense.billId },
+      include: { items: true, supplier: { select: { id: true, name: true, vatNumber: true, city: true } } },
+    })
+    if (b) {
+      const document = b.documentId
+        ? await prisma.document.findUnique({ where: { id: b.documentId }, select: { id: true, originalFilename: true, fileType: true } })
+        : null
+      bill = { ...b, supplierName: b.supplier.name, document }
+    }
+  }
+  const receiptDocument = expense.receiptDocumentId
+    ? await prisma.document.findUnique({ where: { id: expense.receiptDocumentId }, select: { id: true, originalFilename: true, fileType: true } })
+    : null
+
+  res.json({
+    ...expense,
+    branchName: expense.branch?.name,
+    categoryName: expense.category?.name,
+    bill,
+    receiptDocument,
+  })
 })
 
 // PUT /expenses/:id
@@ -154,6 +330,7 @@ router.put('/:id', async (req: Request, res: Response) => {
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
   if (expense.status !== 'draft') throw new AppError('Only draft expenses can be edited', 400, 'INVALID_STATUS')
+  if (expense.source === 'purchasing') throw new AppError('Purchasing payments cannot be edited — void and re-enter instead', 400, 'INVALID_STATUS')
 
   const body = expenseSchema.partial().parse(req.body)
 
@@ -248,13 +425,38 @@ router.post('/:id/void', async (req: Request, res: Response) => {
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
   if (expense.status === 'void') throw new AppError('Expense is already voided', 400, 'INVALID_STATUS')
 
-  if (expense.journalEntryId) {
-    await reverseJournalEntry(prisma, expense.journalEntryId, req.user.id, `Void — ${voidReason}`)
-  }
+  const updated = await prisma.$transaction(async (tx) => {
+    const db = tx as unknown as typeof prisma
+    if (expense.journalEntryId) {
+      await reverseJournalEntry(db, expense.journalEntryId, req.user.id, `Void — ${voidReason}`)
+    }
 
-  const updated = await prisma.expense.update({
-    where: { id: req.params.id },
-    data: { status: 'void', voidReason },
+    // A purchasing-mode expense is a bill payment: voiding it must also undo
+    // the payment so the purchase shows as pending (balance due) again.
+    if (expense.source === 'purchasing' && expense.billId && expense.paymentId) {
+      const [bill, payment] = await Promise.all([
+        tx.bill.findUnique({ where: { id: expense.billId } }),
+        tx.payment.findUnique({ where: { id: expense.paymentId } }),
+      ])
+      if (bill && payment) {
+        const newPaid = Math.max(0, bill.paidAmount - payment.amount)
+        const newBalance = Math.round((bill.totalAmount - newPaid) * 100) / 100
+        await tx.bill.update({
+          where: { id: bill.id },
+          data: {
+            paidAmount: newPaid,
+            balanceDue: newBalance,
+            status: bill.status === 'void' ? 'void' : newPaid > 0.01 ? 'partial' : 'approved',
+          },
+        })
+        await tx.payment.delete({ where: { id: payment.id } })
+      }
+    }
+
+    return tx.expense.update({
+      where: { id: req.params.id },
+      data: { status: 'void', voidReason },
+    })
   })
   res.json(updated)
 })

@@ -31,11 +31,9 @@ const createPurchaseSchema = z
     vendorName: z.string().optional(),
     vendorCity: z.string().optional(),
     vendorVatNumber: z.string().optional(),
+    categoryId: z.string().min(1, 'Category is required'),
     supplyDate: z.string(),
-    paymentDate: z.string(),
-    paymentType: z.enum(['cash', 'bank_transfer']),
     vatPercent: z.coerce.number().min(0).max(100),
-    amountPaid: z.coerce.number().min(0).optional(),
     items: z.string(), // JSON-stringified purchaseItemSchema[]
   })
   .refine((b) => b.supplierId || b.vendorName, {
@@ -44,44 +42,40 @@ const createPurchaseSchema = z
   })
 
 // POST /purchasing — one-shot vendor purchase entry: creates/uses a Supplier,
-// posts the Bill approval journal entry, optionally records payment (full or
-// partial), attaches the reference bill / payment slip, and updates branch
-// stock for any catalog-linked line — all in a single transaction. This is
-// the "Purchasing" module's only endpoint; listing/detail reuse the existing
-// /suppliers/bills* routes filtered by source=purchasing.
+// posts the Bill approval journal entry (as an unpaid payable), attaches the
+// mandatory reference bill, and updates branch stock for any catalog-linked
+// line — all in a single transaction. No payment is taken here: it's recorded
+// later from Expenses → New Expense → Purchasing, which settles the bill
+// fully or partially (see expenses.ts /purchasing-payment).
 router.post(
   '/',
   requirePermission('can_create_purchasing_entry'),
-  upload.fields([{ name: 'file', maxCount: 1 }, { name: 'paymentSlip', maxCount: 1 }]),
+  upload.fields([{ name: 'file', maxCount: 1 }]),
   async (req: Request, res: Response) => {
-    const body = createPurchaseSchema.parse(req.body)
     const files = req.files as Record<string, Express.Multer.File[]> | undefined
     const billFile = files?.file?.[0]
-    const paymentSlipFile = files?.paymentSlip?.[0]
+    const cleanupFiles = () => {
+      if (billFile) { try { fs.unlinkSync(billFile.path) } catch { /* best-effort cleanup */ } }
+    }
+
+    const parsed = createPurchaseSchema.safeParse(req.body)
+    if (!parsed.success) {
+      cleanupFiles()
+      throw parsed.error
+    }
+    const body = parsed.data
+    if (!billFile) throw new AppError('Attaching the reference bill (PDF/JPG/PNG) is required', 400, 'VALIDATION_ERROR')
 
     let itemInputs: z.infer<typeof purchaseItemSchema>[]
     try {
       itemInputs = z.array(purchaseItemSchema).parse(JSON.parse(body.items))
     } catch {
+      cleanupFiles()
       throw new AppError('Invalid items payload', 400, 'VALIDATION_ERROR')
     }
-    if (itemInputs.length === 0) throw new AppError('At least one purchased product is required', 400, 'VALIDATION_ERROR')
-
-    const subtotal = itemInputs.reduce((sum, i) => sum + i.quantity * i.unitCost, 0)
-    const vatAmount = Math.round(subtotal * (body.vatPercent / 100) * 100) / 100
-    const totalAmount = subtotal + vatAmount
-    // Not paid unless the user explicitly enters an amount — a purchase
-    // shouldn't silently post as fully paid just because Amount Paid was left blank.
-    const paidAmount = body.amountPaid ?? 0
-    if (paidAmount > totalAmount + 0.01) throw new AppError('Amount paid cannot exceed total payment', 400, 'VALIDATION_ERROR')
-    if (body.paymentType === 'bank_transfer' && paidAmount > 0 && !paymentSlipFile) {
-      throw new AppError('A transfer slip attachment is required for online transfer payments', 400, 'VALIDATION_ERROR')
-    }
-
-    const cleanupFiles = () => {
-      for (const f of [billFile, paymentSlipFile]) {
-        if (f) { try { fs.unlinkSync(f.path) } catch { /* best-effort cleanup */ } }
-      }
+    if (itemInputs.length === 0) {
+      cleanupFiles()
+      throw new AppError('At least one purchased product is required', 400, 'VALIDATION_ERROR')
     }
 
     try {
@@ -90,6 +84,11 @@ router.post(
           where: { id: body.branchId, organizationId: req.user.organizationId },
         })
         if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+
+        const category = await tx.expenseCategory.findFirst({
+          where: { id: body.categoryId, organizationId: req.user.organizationId },
+        })
+        if (!category) throw new AppError('Category not found', 404, 'NOT_FOUND')
 
         let supplier
         if (body.supplierId) {
@@ -109,23 +108,23 @@ router.post(
         }
 
         const supplyDate = new Date(body.supplyDate)
-        const paymentDate = new Date(body.paymentDate)
 
-        const { bill: createdBill, payment: createdPayment } = await createPurchaseBill(tx as unknown as typeof prisma, {
+        const { bill: createdBill } = await createPurchaseBill(tx as unknown as typeof prisma, {
           organizationId: req.user.organizationId,
           branchId: body.branchId,
           supplierId: supplier.id,
           supplierName: supplier.name,
+          categoryId: category.id,
           supplyDate,
-          paymentDate,
-          paymentType: body.paymentType,
+          paymentDate: supplyDate,
+          paymentType: 'cash',
           vatPercent: body.vatPercent,
-          amountPaid: paidAmount,
+          amountPaid: 0,
           items: itemInputs,
           createdBy: req.user.id,
         })
 
-        if (billFile) {
+        {
           const document = await tx.document.create({
             data: {
               organizationId: req.user.organizationId,
@@ -144,28 +143,9 @@ router.post(
           await tx.bill.update({ where: { id: createdBill.id }, data: { documentId: document.id } })
         }
 
-        if (paymentSlipFile && createdPayment) {
-          const document = await tx.document.create({
-            data: {
-              organizationId: req.user.organizationId,
-              branchId: body.branchId,
-              originalFilename: paymentSlipFile.originalname,
-              storedFilename: paymentSlipFile.filename,
-              filePath: paymentSlipFile.path,
-              fileType: paymentSlipFile.mimetype,
-              fileSize: paymentSlipFile.size,
-              documentType: 'payment_slip',
-              linkedType: 'payment',
-              linkedId: createdPayment.id,
-              uploadedBy: req.user.id,
-            },
-          })
-          await tx.payment.update({ where: { id: createdPayment.id }, data: { documentId: document.id } })
-        }
-
         return tx.bill.findUniqueOrThrow({
           where: { id: createdBill.id },
-          include: { items: true, payments: true, supplier: true, branch: true },
+          include: { items: true, payments: true, supplier: true, branch: true, category: true },
         })
       })
 
@@ -184,7 +164,7 @@ router.post(
 // new Supplier / Item is created (mirroring the manual entry form's
 // vendorName behavior). Anything that does match is reused untouched — an
 // import never edits an existing supplier or item.
-const IMPORT_COLUMNS = ['branchName', 'supplierName', 'supplyDate', 'paymentDate', 'paymentType', 'itemCode', 'itemDescription', 'itemUnit', 'quantity', 'unitCost', 'vatPercent', 'amountPaid']
+const IMPORT_COLUMNS = ['branchName', 'supplierName', 'categoryName', 'supplyDate', 'paymentDate', 'paymentType', 'itemCode', 'itemDescription', 'itemUnit', 'quantity', 'unitCost', 'vatPercent', 'amountPaid']
 
 router.get('/import/template', requirePermission('can_create_purchasing_entry'), async (req: Request, res: Response) => {
   sendImportTemplate(res, IMPORT_COLUMNS, 'purchasing-import-template')
@@ -211,11 +191,13 @@ interface PurchaseImportRowResult {
 }
 
 async function validatePurchaseImportRows(organizationId: string, rows: Record<string, string>[]): Promise<PurchaseImportRowResult[]> {
-  const [branches, suppliers, items] = await Promise.all([
+  const [branches, suppliers, items, categories] = await Promise.all([
     prisma.branch.findMany({ where: { organizationId }, select: { name: true } }),
     prisma.supplier.findMany({ where: { organizationId }, select: { name: true } }),
     prisma.item.findMany({ where: { organizationId }, select: { code: true } }),
+    prisma.expenseCategory.findMany({ where: { organizationId, isActive: true }, select: { name: true } }),
   ])
+  const categoryNames = new Set(categories.map((c) => c.name.toLowerCase()))
   const branchNames = new Set(branches.map((b) => b.name.toLowerCase()))
   const supplierNames = new Set(suppliers.map((s) => s.name.toLowerCase()))
   const itemCodes = new Set(items.map((i) => i.code.toLowerCase()))
@@ -231,6 +213,9 @@ async function validatePurchaseImportRows(organizationId: string, rows: Record<s
 
     const supplierName = data.supplierName?.trim()
     if (!supplierName) errors.push('supplierName is required')
+
+    const categoryName = data.categoryName?.trim()
+    if (categoryName && !categoryNames.has(categoryName.toLowerCase())) errors.push(`expense category "${categoryName}" was not found`)
 
     const supplyDate = data.supplyDate?.trim()
     if (!supplyDate || isNaN(Date.parse(supplyDate))) errors.push('supplyDate is required and must be a valid date (YYYY-MM-DD)')
@@ -305,6 +290,8 @@ router.post('/import/commit', requirePermission('can_create_purchasing_entry'), 
   const created = await prisma.$transaction(async (tx) => {
     const branches = await tx.branch.findMany({ where: { organizationId: orgId }, select: { id: true, name: true } })
     const branchIdByName = new Map(branches.map((b) => [b.name.toLowerCase(), b.id]))
+    const categories = await tx.expenseCategory.findMany({ where: { organizationId: orgId, isActive: true }, select: { id: true, name: true } })
+    const categoryIdByName = new Map(categories.map((c) => [c.name.toLowerCase(), c.id]))
     const supplierCache = new Map<string, { id: string; name: string }>()
     const itemCache = new Map<string, { id: string }>()
 
@@ -365,6 +352,7 @@ router.post('/import/commit', requirePermission('can_create_purchasing_entry'), 
         branchId,
         supplierId: supplier.id,
         supplierName: supplier.name,
+        categoryId: r.data.categoryName?.trim() ? categoryIdByName.get(r.data.categoryName.trim().toLowerCase()) : undefined,
         supplyDate,
         paymentDate,
         paymentType,

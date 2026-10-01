@@ -30,15 +30,29 @@ const itemSchema = z.object({
   reorderPoint: z.number().min(0).default(0),
 })
 
-const stockOutSchema = z.object({
-  branchId: z.string(),
-  stockOutDate: z.string().or(z.date()).optional(),
-  reason: z.string().optional(),
-  notes: z.string().optional(),
-  items: z.array(z.object({
-    itemId: z.string(),
-    quantity: z.number().positive(),
-  })).min(1),
+// Stock Out is one of two movements out of a branch store:
+//  - branch_transfer: store → another branch's store (toBranchId)
+//  - section:         store → a section of the same branch (sectionId), e.g. Juices/Broast/Kitchen
+const stockOutSchema = z
+  .object({
+    type: z.enum(['branch_transfer', 'section']),
+    branchId: z.string(),
+    toBranchId: z.string().optional(),
+    sectionId: z.string().optional(),
+    stockOutDate: z.string().or(z.date()).optional(),
+    reason: z.string().optional(),
+    notes: z.string().optional(),
+    items: z.array(z.object({
+      itemId: z.string(),
+      quantity: z.number().positive(),
+    })).min(1),
+  })
+  .refine((b) => b.type !== 'branch_transfer' || !!b.toBranchId, { message: 'Destination branch is required', path: ['toBranchId'] })
+  .refine((b) => b.type !== 'section' || !!b.sectionId, { message: 'Section is required', path: ['sectionId'] })
+
+const sectionSchema = z.object({
+  name: z.string().trim().min(1),
+  description: z.string().optional(),
 })
 
 const wastageSchema = z.object({
@@ -246,60 +260,345 @@ router.delete('/items/:id', async (req: Request, res: Response) => {
   res.json({ message: 'Item deactivated' })
 })
 
-// POST /inventory/stock-out — manual stock removal for any branch, applied
-// immediately (general usage/consumption/adjustment — no approval step,
-// unlike wastage reports). Posts a matching GL entry (Food Cost / Inventory).
+// ── Branch sections (Juices, Broast, Kitchen, ...) ──────────────────────────
+
+// GET /inventory/sections?branchId=&includeInactive=
+router.get('/sections', async (req: Request, res: Response) => {
+  const { branchId, includeInactive } = req.query as Record<string, string>
+  const sections = await prisma.branchSection.findMany({
+    where: {
+      organizationId: req.user.organizationId,
+      ...(branchId && { branchId }),
+      ...(includeInactive !== 'true' && { isActive: true }),
+    },
+    include: { branch: { select: { id: true, name: true } }, _count: { select: { stockOuts: true } } },
+    orderBy: [{ branch: { name: 'asc' } }, { name: 'asc' }],
+  })
+  res.json({ data: sections.map((s) => ({ ...s, branchName: s.branch.name, stockOutCount: s._count.stockOuts })) })
+})
+
+// POST /inventory/sections — create a section in one branch, or (with
+// allBranches: true) the same-named section in every active branch that
+// doesn't already have it.
+router.post('/sections', async (req: Request, res: Response) => {
+  const body = sectionSchema.extend({
+    branchId: z.string().optional(),
+    allBranches: z.boolean().optional(),
+  }).parse(req.body)
+  if (!body.allBranches && !body.branchId) throw new AppError('Branch is required', 400, 'VALIDATION_ERROR')
+
+  const branches = await prisma.branch.findMany({
+    where: {
+      organizationId: req.user.organizationId,
+      ...(body.allBranches ? { isActive: true } : { id: body.branchId }),
+    },
+    select: { id: true },
+  })
+  if (branches.length === 0) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+
+  const created = []
+  for (const b of branches) {
+    const existing = await prisma.branchSection.findUnique({ where: { branchId_name: { branchId: b.id, name: body.name } } })
+    if (existing) {
+      if (!existing.isActive) {
+        created.push(await prisma.branchSection.update({ where: { id: existing.id }, data: { isActive: true, description: body.description } }))
+      } else if (!body.allBranches) {
+        throw new AppError(`Section "${body.name}" already exists in this branch`, 400, 'DUPLICATE')
+      }
+      continue
+    }
+    created.push(await prisma.branchSection.create({
+      data: { organizationId: req.user.organizationId, branchId: b.id, name: body.name, description: body.description },
+    }))
+  }
+  res.status(201).json({ data: created, created: created.length })
+})
+
+// PUT /inventory/sections/:id
+router.put('/sections/:id', async (req: Request, res: Response) => {
+  const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
+  if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
+  const body = sectionSchema.partial().extend({ isActive: z.boolean().optional() }).parse(req.body)
+  const updated = await prisma.branchSection.update({ where: { id: section.id }, data: body })
+  res.json(updated)
+})
+
+// DELETE /inventory/sections/:id — deactivates when the section has stock-out
+// history (so past issues keep their section), otherwise deletes.
+router.delete('/sections/:id', async (req: Request, res: Response) => {
+  const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
+  if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
+  const inUse = await prisma.stockOut.count({ where: { sectionId: section.id } })
+  if (inUse > 0) {
+    await prisma.branchSection.update({ where: { id: section.id }, data: { isActive: false } })
+    return res.json({ message: 'Section deactivated (has stock out history)' })
+  }
+  await prisma.branchSection.delete({ where: { id: section.id } })
+  res.json({ message: 'Section deleted' })
+})
+
+// GET /inventory/sections/summary?branchId=&fromDate=&toDate= — what each
+// section has received from its branch store: total value, number of issues,
+// and per-item quantities.
+router.get('/sections/summary', async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate } = req.query as Record<string, string>
+  const movements = await prisma.stockMovement.findMany({
+    where: {
+      organizationId: req.user.organizationId,
+      sectionId: { not: null },
+      ...(branchId && { branchId }),
+      ...((fromDate || toDate) && {
+        createdAt: {
+          ...(fromDate && { gte: new Date(fromDate) }),
+          ...(toDate && { lte: new Date(`${toDate}T23:59:59.999`) }),
+        },
+      }),
+    },
+    include: { item: { select: { id: true, name: true, code: true, unit: true } } },
+  })
+  const sections = await prisma.branchSection.findMany({
+    where: { organizationId: req.user.organizationId, ...(branchId && { branchId }) },
+    include: { branch: { select: { name: true } } },
+    orderBy: [{ branch: { name: 'asc' } }, { name: 'asc' }],
+  })
+
+  const bySection = new Map<string, { totalValue: number; refs: Set<string>; items: Map<string, { itemId: string; itemName: string; itemCode: string; unit: string; quantity: number; value: number }> }>()
+  for (const m of movements) {
+    const key = m.sectionId!
+    let entry = bySection.get(key)
+    if (!entry) { entry = { totalValue: 0, refs: new Set(), items: new Map() }; bySection.set(key, entry) }
+    entry.totalValue += m.totalValue
+    if (m.referenceId) entry.refs.add(m.referenceId)
+    const it = entry.items.get(m.itemId) ?? { itemId: m.itemId, itemName: m.item.name, itemCode: m.item.code, unit: m.item.unit, quantity: 0, value: 0 }
+    it.quantity += Math.abs(m.quantity)
+    it.value += m.totalValue
+    entry.items.set(m.itemId, it)
+  }
+
+  const data = sections
+    .filter((s) => s.isActive || bySection.has(s.id))
+    .map((s) => {
+      const entry = bySection.get(s.id)
+      return {
+        sectionId: s.id,
+        sectionName: s.name,
+        branchId: s.branchId,
+        branchName: s.branch.name,
+        isActive: s.isActive,
+        issueCount: entry?.refs.size ?? 0,
+        totalValue: entry?.totalValue ?? 0,
+        items: entry ? [...entry.items.values()].sort((a, b) => b.value - a.value) : [],
+      }
+    })
+  res.json({ data })
+})
+
+// ── Stock Out ────────────────────────────────────────────────────────────────
+
+// POST /inventory/stock-out — applied immediately, no approval step:
+//  - branch_transfer: moves stock at the source's weighted-average cost into
+//    the destination branch store. Inventory stays inventory, so no GL entry.
+//  - section: issues stock from the branch store to one of its sections —
+//    that's consumption, posted as Food Cost / Inventory.
 router.post('/stock-out', async (req: Request, res: Response) => {
   const body = stockOutSchema.parse(req.body)
+  const orgId = req.user.organizationId
 
-  const branch = await prisma.branch.findFirst({
-    where: { id: body.branchId, organizationId: req.user.organizationId },
-  })
+  const branch = await prisma.branch.findFirst({ where: { id: body.branchId, organizationId: orgId } })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
 
-  const result = await prisma.$transaction(async (tx) => {
-    const movements = []
-    let totalValue = 0
+  let toBranch: { id: string; name: string } | null = null
+  let section: { id: string; name: string } | null = null
+  if (body.type === 'branch_transfer') {
+    if (body.toBranchId === body.branchId) throw new AppError('Destination branch must be different from the source branch', 400, 'VALIDATION_ERROR')
+    toBranch = await prisma.branch.findFirst({ where: { id: body.toBranchId, organizationId: orgId }, select: { id: true, name: true } })
+    if (!toBranch) throw new AppError('Destination branch not found', 404, 'NOT_FOUND')
+  } else {
+    section = await prisma.branchSection.findFirst({
+      where: { id: body.sectionId, organizationId: orgId, branchId: body.branchId, isActive: true },
+      select: { id: true, name: true },
+    })
+    if (!section) throw new AppError('Section not found in this branch', 404, 'NOT_FOUND')
+  }
 
+  const stockOutDate = body.stockOutDate ? new Date(body.stockOutDate) : new Date()
+
+  const result = await prisma.$transaction(async (tx) => {
+    const db = tx as unknown as typeof prisma
+    const stockOutNo = await nextNumber(db, 'stockOut', 'stockOutNo', 'SO', orgId)
+    const header = await tx.stockOut.create({
+      data: {
+        organizationId: orgId,
+        branchId: body.branchId,
+        stockOutNo,
+        stockOutDate,
+        type: body.type,
+        toBranchId: toBranch?.id,
+        sectionId: section?.id,
+        reason: body.reason,
+        notes: body.notes,
+        createdBy: req.user.id,
+      },
+    })
+
+    const destinationLabel = toBranch ? `to ${toBranch.name}` : `to ${section!.name}`
+    let totalValue = 0
     for (const line of body.items) {
-      const { movement, totalValue: lineValue } = await applyStockOut(tx as unknown as typeof prisma, {
-        organizationId: req.user.organizationId,
+      const { unitCost, totalValue: lineValue } = await applyStockOut(db, {
+        organizationId: orgId,
         branchId: body.branchId,
         itemId: line.itemId,
         quantity: line.quantity,
-        referenceType: 'manual_stock_out',
-        notes: body.reason ?? body.notes,
+        movementType: toBranch ? 'transfer_out' : 'stock_out',
+        transferBranchId: toBranch?.id,
+        sectionId: section?.id,
+        referenceType: 'stock_out',
+        referenceId: header.id,
+        notes: `${stockOutNo} ${destinationLabel}${body.reason ? ` — ${body.reason}` : ''}`,
         createdBy: req.user.id,
       })
-      movements.push(movement)
       totalValue += lineValue
+
+      if (toBranch) {
+        await applyStockIn(db, {
+          organizationId: orgId,
+          branchId: toBranch.id,
+          itemId: line.itemId,
+          quantity: line.quantity,
+          unitCost,
+          movementType: 'transfer_in',
+          transferBranchId: body.branchId,
+          referenceType: 'stock_out',
+          referenceId: header.id,
+          notes: `${stockOutNo} from ${branch.name}`,
+          createdBy: req.user.id,
+        })
+      }
     }
 
-    const [costOfSales, inventory] = await Promise.all([
-      resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'COST_OF_SALES'),
-      resolveMappedAccount(tx as unknown as typeof prisma, req.user.organizationId, 'INVENTORY'),
-    ])
+    let journalEntryId: string | undefined
+    if (section && totalValue > 0) {
+      const [costOfSales, inventory] = await Promise.all([
+        resolveMappedAccount(db, orgId, 'COST_OF_SALES'),
+        resolveMappedAccount(db, orgId, 'INVENTORY'),
+      ])
+      const je = await postJournalEntry(db, {
+        organizationId: orgId,
+        branchId: body.branchId,
+        entryDate: stockOutDate,
+        referenceType: 'stock_out',
+        referenceId: header.id,
+        sourceType: 'STOCK_OUT',
+        sourceKey: `STOCK_OUT:${header.id}:POST`,
+        description: `Stock Out ${stockOutNo} — issued to ${section.name}`,
+        createdBy: req.user.id,
+        lines: [
+          { accountId: costOfSales.id, description: `Issued to ${section.name}`, debitAmount: totalValue },
+          { accountId: inventory.id, description: 'Inventory reduction (stock out)', creditAmount: totalValue },
+        ],
+      })
+      journalEntryId = je?.id
+    }
 
-    const je = await postJournalEntry(tx as unknown as typeof prisma, {
-      organizationId: req.user.organizationId,
-      branchId: body.branchId,
-      entryDate: body.stockOutDate ? new Date(body.stockOutDate) : new Date(),
-      referenceType: 'manual_stock_out',
-      referenceId: movements[0]?.id ?? branch.id,
-      sourceType: 'STOCK_OUT',
-      sourceKey: `STOCK_OUT:${movements[0]?.id ?? branch.id}:POST`,
-      description: `Manual Stock Out${body.reason ? ` — ${body.reason}` : ''}`,
-      createdBy: req.user.id,
-      lines: [
-        { accountId: costOfSales.id, description: 'Stock used/removed', debitAmount: totalValue },
-        { accountId: inventory.id, description: 'Inventory reduction (stock out)', creditAmount: totalValue },
-      ],
-    })
-
-    return { movements, totalValue, journalEntryId: je?.id }
+    return tx.stockOut.update({ where: { id: header.id }, data: { totalValue, journalEntryId } })
   })
 
   res.status(201).json(result)
+})
+
+// GET /inventory/stock-outs?branchId=&type=&sectionId=&toBranchId=&fromDate=&toDate=
+// branchId matches either side of a transfer, so a branch sees what it
+// sent and what it received.
+router.get('/stock-outs', async (req: Request, res: Response) => {
+  const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
+  const { branchId, type, sectionId, toBranchId, fromDate, toDate } = req.query as Record<string, string>
+
+  const where: Record<string, unknown> = { organizationId: req.user.organizationId }
+  if (branchId) where.OR = [{ branchId }, { toBranchId: branchId }]
+  if (type) where.type = type
+  if (sectionId) where.sectionId = sectionId
+  if (toBranchId) where.toBranchId = toBranchId
+  if (fromDate || toDate) {
+    where.stockOutDate = {
+      ...(fromDate && { gte: new Date(fromDate) }),
+      ...(toDate && { lte: new Date(`${toDate}T23:59:59.999`) }),
+    }
+  }
+
+  const [rows, total] = await Promise.all([
+    prisma.stockOut.findMany({
+      where,
+      ...paginate(page, limit),
+      orderBy: [{ stockOutDate: 'desc' }, { createdAt: 'desc' }],
+      include: {
+        branch: { select: { id: true, name: true } },
+        toBranch: { select: { id: true, name: true } },
+        section: { select: { id: true, name: true } },
+      },
+    }),
+    prisma.stockOut.count({ where }),
+  ])
+
+  const ids = rows.map((r) => r.id)
+  const lineCounts = await prisma.stockMovement.groupBy({
+    by: ['referenceId'],
+    where: { referenceType: 'stock_out', referenceId: { in: ids }, quantity: { lt: 0 } },
+    _count: true,
+  })
+  const countById = new Map(lineCounts.map((c) => [c.referenceId, c._count]))
+  const userIds = [...new Set(rows.map((r) => r.createdBy))]
+  const users = await prisma.user.findMany({ where: { id: { in: userIds } }, select: { id: true, firstName: true, lastName: true } })
+  const userName = new Map(users.map((u) => [u.id, `${u.firstName} ${u.lastName}`.trim()]))
+
+  const data = rows.map((r) => ({
+    ...r,
+    branchName: r.branch.name,
+    toBranchName: r.toBranch?.name,
+    sectionName: r.section?.name,
+    itemCount: countById.get(r.id) ?? 0,
+    createdByName: userName.get(r.createdBy) ?? null,
+  }))
+  res.json(paginatedResponse(data, total, page, limit))
+})
+
+// GET /inventory/stock-outs/:id — header plus its item lines
+router.get('/stock-outs/:id', async (req: Request, res: Response) => {
+  const stockOut = await prisma.stockOut.findFirst({
+    where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: {
+      branch: { select: { id: true, name: true } },
+      toBranch: { select: { id: true, name: true } },
+      section: { select: { id: true, name: true } },
+    },
+  })
+  if (!stockOut) throw new AppError('Stock out not found', 404, 'NOT_FOUND')
+
+  const [lines, user] = await Promise.all([
+    prisma.stockMovement.findMany({
+      where: { referenceType: 'stock_out', referenceId: stockOut.id, branchId: stockOut.branchId },
+      include: { item: { select: { id: true, name: true, code: true, unit: true } } },
+      orderBy: { createdAt: 'asc' },
+    }),
+    prisma.user.findUnique({ where: { id: stockOut.createdBy }, select: { firstName: true, lastName: true } }),
+  ])
+
+  res.json({
+    ...stockOut,
+    branchName: stockOut.branch.name,
+    toBranchName: stockOut.toBranch?.name,
+    sectionName: stockOut.section?.name,
+    createdByName: user ? `${user.firstName} ${user.lastName}`.trim() : null,
+    items: lines.map((l) => ({
+      id: l.id,
+      itemId: l.itemId,
+      itemName: l.item.name,
+      itemCode: l.item.code,
+      unit: l.item.unit,
+      quantity: Math.abs(l.quantity),
+      unitCost: l.unitCost,
+      totalValue: l.totalValue,
+    })),
+  })
 })
 
 const addPurchaseItemSchema = z.object({

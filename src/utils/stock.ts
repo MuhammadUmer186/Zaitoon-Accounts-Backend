@@ -11,6 +11,8 @@ export interface StockInInput {
   referenceId?: string
   notes?: string
   createdBy: string
+  movementType?: string // defaults to "stock_in"; "transfer_in" for branch transfers
+  transferBranchId?: string
 }
 
 // Records a stock-in movement and updates BranchStock using weighted-average costing.
@@ -24,12 +26,13 @@ export async function applyStockIn(prisma: PrismaClient, input: StockInInput) {
       organizationId: input.organizationId,
       branchId: input.branchId,
       itemId: input.itemId,
-      movementType: 'stock_in',
+      movementType: input.movementType ?? 'stock_in',
       quantity: input.quantity,
       unitCost: input.unitCost,
       totalValue,
       referenceType: input.referenceType,
       referenceId: input.referenceId,
+      transferBranchId: input.transferBranchId,
       notes: input.notes,
       createdBy: input.createdBy,
     },
@@ -81,6 +84,9 @@ export interface StockOutInput {
   referenceId?: string
   notes?: string
   createdBy: string
+  movementType?: string // defaults to "stock_out"; "transfer_out" for branch transfers
+  transferBranchId?: string
+  sectionId?: string
 }
 
 // Records a stock-out movement and updates BranchStock, valuing the removed
@@ -109,12 +115,14 @@ export async function applyStockOut(prisma: PrismaClient, input: StockOutInput) 
       organizationId: input.organizationId,
       branchId: input.branchId,
       itemId: input.itemId,
-      movementType: 'stock_out',
+      movementType: input.movementType ?? 'stock_out',
       quantity: -input.quantity,
       unitCost,
       totalValue,
       referenceType: input.referenceType,
       referenceId: input.referenceId,
+      transferBranchId: input.transferBranchId,
+      sectionId: input.sectionId,
       notes: input.notes,
       createdBy: input.createdBy,
     },

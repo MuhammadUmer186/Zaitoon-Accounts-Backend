@@ -115,13 +115,21 @@ router.get('/bills/pending-approval', async (req: Request, res: Response) => {
 // GET /bills
 router.get('/bills', async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
-  const { branchId, supplierId, status, source, fromDate, toDate } = req.query as Record<string, string>
+  const { branchId, supplierId, status, source, categoryId, search, fromDate, toDate } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
   if (branchId) where.branchId = branchId
   if (supplierId) where.supplierId = supplierId
-  if (status) where.status = status
+  // Comma-separated list allowed, e.g. status=approved,partial for "pending" bills
+  if (status) where.status = status.includes(',') ? { in: status.split(',') } : status
   if (source) where.source = source
+  if (categoryId) where.categoryId = categoryId
+  if (search) {
+    where.OR = [
+      { billNo: { contains: search, mode: 'insensitive' } },
+      { supplier: { name: { contains: search, mode: 'insensitive' } } },
+    ]
+  }
   if (fromDate || toDate) {
     where.billDate = {
       ...(fromDate && { gte: new Date(fromDate) }),
@@ -137,13 +145,14 @@ router.get('/bills', async (req: Request, res: Response) => {
       include: {
         supplier: { select: { id: true, name: true } },
         branch: { select: { id: true, name: true } },
+        category: { select: { id: true, name: true } },
         _count: { select: { items: true, payments: true } },
       },
     }),
     prisma.bill.count({ where }),
   ])
 
-  const rows = bills.map((b) => ({ ...b, supplierName: b.supplier?.name, branchName: b.branch?.name }))
+  const rows = bills.map((b) => ({ ...b, supplierName: b.supplier?.name, branchName: b.branch?.name, categoryName: b.category?.name }))
   res.json(paginatedResponse(rows, total, page, limit))
 })
 
@@ -184,10 +193,19 @@ router.post('/bills', async (req: Request, res: Response) => {
 router.get('/bills/:id', async (req: Request, res: Response) => {
   const bill = await prisma.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
-    include: { items: true, payments: true, supplier: true, branch: true },
+    include: { items: true, payments: { orderBy: { paymentDate: 'asc' } }, supplier: true, branch: true, category: true },
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
-  res.json(bill)
+  const document = bill.documentId
+    ? await prisma.document.findUnique({ where: { id: bill.documentId }, select: { id: true, originalFilename: true, fileType: true } })
+    : null
+  res.json({
+    ...bill,
+    supplierName: bill.supplier?.name,
+    branchName: bill.branch?.name,
+    categoryName: bill.category?.name,
+    document,
+  })
 })
 
 // PUT /bills/:id

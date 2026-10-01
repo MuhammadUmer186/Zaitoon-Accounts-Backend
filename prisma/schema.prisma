@@ -8,45 +8,45 @@ datasource db {
 }
 
 model Organization {
-  id                 String               @id @default(cuid())
-  name               String
-  tradeName          String?
-  registrationNo     String?
-  vatNumber          String?
-  email              String?
-  phone              String?
-  address            String?
-  city               String?
-  country            String               @default("SA")
-  currency           String               @default("SAR")
-  fiscalYearStart    String               @default("01-01")
-  logoUrl            String?
-  lowStockThreshold  Float?
-  purchaseOrderEnabled Boolean            @default(true)
-  isActive           Boolean              @default(true)
-  createdAt          DateTime             @default(now())
-  updatedAt          DateTime             @updatedAt
-  branches           Branch[]
-  users              User[]
-  accounts           Account[]
-  roles              Role[]
-  dailySales         DailySale[]
-  cashClosings       CashClosing[]
-  expenses           Expense[]
-  expenseCategories  ExpenseCategory[]
-  suppliers          Supplier[]
-  bills              Bill[]
-  items              Item[]
-  journalEntries     JournalEntry[]
-  notifications      Notification[]
-  auditLogs          AuditLog[]
-  documents          Document[]
-  purchaseOrders     PurchaseOrder[]
-  itemCategories     ItemCategory[]
-  bankAccounts       BankAccount[]
-  taxRates           TaxRate[]
-  accountingMappings AccountingMapping[]
-  accountingPeriods  AccountingPeriod[]
+  id                   String              @id @default(cuid())
+  name                 String
+  tradeName            String?
+  registrationNo       String?
+  vatNumber            String?
+  email                String?
+  phone                String?
+  address              String?
+  city                 String?
+  country              String              @default("SA")
+  currency             String              @default("SAR")
+  fiscalYearStart      String              @default("01-01")
+  logoUrl              String?
+  lowStockThreshold    Float?
+  purchaseOrderEnabled Boolean             @default(true)
+  isActive             Boolean             @default(true)
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  branches             Branch[]
+  users                User[]
+  accounts             Account[]
+  roles                Role[]
+  dailySales           DailySale[]
+  cashClosings         CashClosing[]
+  expenses             Expense[]
+  expenseCategories    ExpenseCategory[]
+  suppliers            Supplier[]
+  bills                Bill[]
+  items                Item[]
+  journalEntries       JournalEntry[]
+  notifications        Notification[]
+  auditLogs            AuditLog[]
+  documents            Document[]
+  purchaseOrders       PurchaseOrder[]
+  itemCategories       ItemCategory[]
+  bankAccounts         BankAccount[]
+  taxRates             TaxRate[]
+  accountingMappings   AccountingMapping[]
+  accountingPeriods    AccountingPeriod[]
 }
 
 model Branch {
@@ -80,6 +80,9 @@ model Branch {
   targets        BranchTarget[]
   purchaseOrders PurchaseOrder[]
   bankAccounts   BankAccount[]
+  sections       BranchSection[]
+  stockOutsFrom  StockOut[]         @relation("StockOutFrom")
+  stockOutsTo    StockOut[]         @relation("StockOutTo")
 
   @@unique([organizationId, code])
 }
@@ -512,6 +515,7 @@ model ExpenseCategory {
   createdAt      DateTime     @default(now())
   organization   Organization @relation(fields: [organizationId], references: [id])
   expenses       Expense[]
+  bills          Bill[]
 
   @@unique([organizationId, name])
 }
@@ -529,6 +533,10 @@ model Expense {
   vatRate           Float           @default(0)
   totalAmount       Float
   paymentMethod     String          @default("cash")
+  source            String          @default("manual")
+  billId            String?
+  paymentId         String?
+  paidBy            String?
   supplierId        String?
   receiptDocumentId String?
   status            String          @default("draft")
@@ -551,7 +559,7 @@ model Expense {
 
 // Suppliers & Bills
 model Supplier {
-  id               String          @id @default(cuid())
+  id               String       @id @default(cuid())
   organizationId   String
   name             String
   tradeName        String?
@@ -561,18 +569,18 @@ model Supplier {
   address          String?
   city             String?
   accountId        String?
-  creditLimit      Float           @default(0)
-  paymentTermsDays Int             @default(30)
-  isActive         Boolean         @default(true)
+  creditLimit      Float        @default(0)
+  paymentTermsDays Int          @default(30)
+  isActive         Boolean      @default(true)
   notes            String?
-  createdAt        DateTime        @default(now())
-  updatedAt        DateTime        @updatedAt
-  organization     Organization    @relation(fields: [organizationId], references: [id])
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  organization     Organization @relation(fields: [organizationId], references: [id])
   bills            Bill[]
 }
 
 model Bill {
-  id             String       @id @default(cuid())
+  id             String           @id @default(cuid())
   organizationId String
   branchId       String
   supplierId     String
@@ -581,13 +589,14 @@ model Bill {
   billDate       DateTime
   dueDate        DateTime
   subtotal       Float
-  discountAmount Float        @default(0)
-  vatAmount      Float        @default(0)
+  discountAmount Float            @default(0)
+  vatAmount      Float            @default(0)
   totalAmount    Float
-  paidAmount     Float        @default(0)
+  paidAmount     Float            @default(0)
   balanceDue     Float
-  status         String       @default("draft")
-  source         String       @default("bill")
+  status         String           @default("draft")
+  source         String           @default("bill")
+  categoryId     String?
   hijriDate      String?
   notes          String?
   documentId     String?
@@ -596,11 +605,12 @@ model Bill {
   approvedAt     DateTime?
   voidReason     String?
   createdBy      String
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  organization   Organization @relation(fields: [organizationId], references: [id])
-  branch         Branch       @relation(fields: [branchId], references: [id])
-  supplier       Supplier     @relation(fields: [supplierId], references: [id])
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  branch         Branch           @relation(fields: [branchId], references: [id])
+  supplier       Supplier         @relation(fields: [supplierId], references: [id])
+  category       ExpenseCategory? @relation(fields: [categoryId], references: [id])
   items          BillItem[]
   payments       Payment[]
 
@@ -631,6 +641,7 @@ model Payment {
   paymentMethod  String
   referenceNo    String?
   notes          String?
+  paidBy         String?
   journalEntryId String?
   documentId     String?
   createdBy      String
@@ -708,11 +719,55 @@ model StockMovement {
   referenceType    String?
   referenceId      String?
   transferBranchId String?
+  sectionId        String?
   notes            String?
   createdBy        String
   createdAt        DateTime @default(now())
   branch           Branch   @relation(fields: [branchId], references: [id])
   item             Item     @relation(fields: [itemId], references: [id])
+}
+
+// A consumption point inside a branch (e.g. Juices, Broast, Kitchen) that
+// store stock is issued to via Stock Out.
+model BranchSection {
+  id             String     @id @default(cuid())
+  organizationId String
+  branchId       String
+  name           String
+  description    String?
+  isActive       Boolean    @default(true)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  branch         Branch     @relation(fields: [branchId], references: [id])
+  stockOuts      StockOut[]
+
+  @@unique([branchId, name])
+}
+
+// Header for one Stock Out — either a branch-store → branch-store transfer
+// (type "branch_transfer", toBranchId set) or a store → same-branch section
+// issue (type "section", sectionId set). Line detail lives in StockMovement
+// rows with referenceType "stock_out" / referenceId = this id.
+model StockOut {
+  id             String         @id @default(cuid())
+  organizationId String
+  branchId       String
+  stockOutNo     String
+  stockOutDate   DateTime
+  type           String
+  toBranchId     String?
+  sectionId      String?
+  reason         String?
+  notes          String?
+  totalValue     Float          @default(0)
+  journalEntryId String?
+  createdBy      String
+  createdAt      DateTime       @default(now())
+  branch         Branch         @relation("StockOutFrom", fields: [branchId], references: [id])
+  toBranch       Branch?        @relation("StockOutTo", fields: [toBranchId], references: [id])
+  section        BranchSection? @relation(fields: [sectionId], references: [id])
+
+  @@unique([organizationId, stockOutNo])
 }
 
 model WastageReport {

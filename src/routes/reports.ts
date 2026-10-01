@@ -47,11 +47,11 @@ router.get('/dashboard', async (req: Request, res: Response) => {
       _sum: { netAmount: true },
     }),
     prisma.expense.aggregate({
-      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: today, lte: endOfToday } },
+      where: { source: { not: 'purchasing' }, ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: today, lte: endOfToday } },
       _sum: { totalAmount: true },
     }),
     prisma.expense.aggregate({
-      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: startOfMonth } },
+      where: { source: { not: 'purchasing' }, ...orgFilter, ...branchFilter, ...notVoid, expenseDate: { gte: startOfMonth } },
       _sum: { totalAmount: true },
     }),
     Promise.all([
@@ -209,7 +209,7 @@ router.get('/financial', async (req: Request, res: Response) => {
       _count: true,
     }),
     prisma.expense.aggregate({
-      where: {
+      where: { source: { not: 'purchasing' },
         organizationId: orgId,
         ...(branchId && { branchId }),
         status: { not: 'void' },
@@ -433,7 +433,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
           _count: true,
         }),
         prisma.expense.aggregate({
-          where: { ...orgFilter, ...bf, ...notVoid, expenseDate: dateFilter },
+          where: { source: { not: 'purchasing' }, ...orgFilter, ...bf, ...notVoid, expenseDate: dateFilter },
           _sum: { totalAmount: true },
           _count: true,
         }),
@@ -485,7 +485,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   // ── Expense breakdown by category (selected range, all/filtered branches) ─
   const expByCategory = await prisma.expense.groupBy({
     by: ['categoryId'],
-    where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: dateFilter },
+    where: { source: { not: 'purchasing' }, ...orgFilter, ...branchFilter, ...notVoid, expenseDate: dateFilter },
     _sum: { totalAmount: true },
   })
   const catIds = expByCategory.map((e) => e.categoryId)
@@ -556,7 +556,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       _sum: { netAmount: true },
     }),
     prisma.expense.aggregate({
-      where: { ...orgFilter, ...branchFilter, ...notVoid, expenseDate: dateFilter },
+      where: { source: { not: 'purchasing' }, ...orgFilter, ...branchFilter, ...notVoid, expenseDate: dateFilter },
       _sum: { totalAmount: true },
     }),
     prisma.bill.aggregate({

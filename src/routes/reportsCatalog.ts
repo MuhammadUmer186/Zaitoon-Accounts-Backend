@@ -110,7 +110,7 @@ router.get('/branch-profit', async (req: Request, res: Response) => {
           _sum: { netAmount: true },
         }),
         prisma.expense.aggregate({
-          where: { organizationId: orgId, branchId: b.id, status: { not: 'void' }, ...(expenseDate && { expenseDate }) },
+          where: { source: { not: 'purchasing' }, organizationId: orgId, branchId: b.id, status: { not: 'void' }, ...(expenseDate && { expenseDate }) },
           _sum: { totalAmount: true },
         }),
         // Supplier purchases count as expenses here too
