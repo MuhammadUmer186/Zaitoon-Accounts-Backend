@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express'
 import bcrypt from 'bcryptjs'
+import { resolveScope } from '../utils/branchScope'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/jwt'
@@ -67,11 +68,12 @@ router.post('/login', async (req: Request, res: Response) => {
     const expiresAt = new Date()
     expiresAt.setDate(expiresAt.getDate() + 7)
 
+    const scope = await resolveScope(user.id, user.organizationId)
     const [, permissionMatrix, branches] = await Promise.all([
       prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } }),
       buildPermissionMatrix(user.id, user.organizationId),
       prisma.branch.findMany({
-        where: { organizationId: user.organizationId, isActive: true },
+        where: { organizationId: user.organizationId, isActive: true, ...(scope.restricted && { id: { in: scope.branchIds } }) },
         orderBy: { name: 'asc' },
       }),
       prisma.refreshToken.create({
@@ -167,8 +169,10 @@ router.get('/me', authenticate, async (req: Request, res: Response) => {
   }
 
   const permissionMatrix = await buildPermissionMatrix(user.id, user.organizationId)
+  // Branch-scoped users (store keeper) only get their own branch
+  const scope = await resolveScope(user.id, user.organizationId)
   const branches = await prisma.branch.findMany({
-    where: { organizationId: user.organizationId, isActive: true },
+    where: { organizationId: user.organizationId, isActive: true, ...(scope.restricted && { id: { in: scope.branchIds } }) },
     orderBy: { name: 'asc' },
   })
 

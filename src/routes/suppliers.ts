@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { assertBranchAccess, branchFilter } from '../utils/branchScope'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
@@ -99,7 +100,8 @@ router.post('/', async (req: Request, res: Response) => {
 router.get('/bills/pending-approval', async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'draft' }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
 
   const bills = await prisma.bill.findMany({
     where,
@@ -118,7 +120,8 @@ router.get('/bills', async (req: Request, res: Response) => {
   const { branchId, supplierId, status, source, categoryId, search, fromDate, toDate } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
   if (supplierId) where.supplierId = supplierId
   // Comma-separated list allowed, e.g. status=approved,partial for "pending" bills
   if (status) where.status = status.includes(',') ? { in: status.split(',') } : status
@@ -196,6 +199,7 @@ router.get('/bills/:id', async (req: Request, res: Response) => {
     include: { items: true, payments: { orderBy: { paymentDate: 'asc' } }, supplier: true, branch: true, category: true },
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, bill.branchId)
   const document = bill.documentId
     ? await prisma.document.findUnique({ where: { id: bill.documentId }, select: { id: true, originalFilename: true, fileType: true } })
     : null
@@ -324,6 +328,11 @@ router.post('/bills/:id/payments', async (req: Request, res: Response) => {
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
   if (bill.status === 'void') throw new AppError('Cannot pay a voided bill', 400, 'INVALID_STATUS')
+  // Purchasing entries are paid only from Expenses → New Expense → Purchasing
+  // (which also records Paid By and the expense row) — never from here.
+  if (bill.source === 'purchasing') {
+    throw new AppError('Purchases are paid from Expenses → New Expense → Purchasing', 400, 'PAY_VIA_EXPENSES')
+  }
 
   if (body.amount > bill.balanceDue) {
     throw new AppError('Payment amount exceeds balance due', 400, 'OVERPAYMENT')

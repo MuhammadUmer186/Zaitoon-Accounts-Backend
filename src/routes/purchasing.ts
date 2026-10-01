@@ -10,6 +10,7 @@ import { AppError } from '../middleware/error'
 import { createPurchaseBill, PurchaseItemInput } from '../services/purchasing'
 import { parseImportFile, sendImportTemplate, assertRecognizedColumns } from '../utils/importFile'
 import { logAudit } from '../utils/audit'
+import { assertBranchAccess, getBranchScope, BranchScope } from '../utils/branchScope'
 
 const router = Router()
 
@@ -84,6 +85,7 @@ router.post(
           where: { id: body.branchId, organizationId: req.user.organizationId },
         })
         if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+        await assertBranchAccess(req, body.branchId)
 
         const category = await tx.expenseCategory.findFirst({
           where: { id: body.categoryId, organizationId: req.user.organizationId },
@@ -190,15 +192,19 @@ interface PurchaseImportRowResult {
   willCreateItem: boolean
 }
 
-async function validatePurchaseImportRows(organizationId: string, rows: Record<string, string>[]): Promise<PurchaseImportRowResult[]> {
+async function validatePurchaseImportRows(organizationId: string, rows: Record<string, string>[], scope?: BranchScope): Promise<PurchaseImportRowResult[]> {
   const [branches, suppliers, items, categories] = await Promise.all([
-    prisma.branch.findMany({ where: { organizationId }, select: { name: true } }),
+    prisma.branch.findMany({ where: { organizationId }, select: { id: true, name: true } }),
     prisma.supplier.findMany({ where: { organizationId }, select: { name: true } }),
     prisma.item.findMany({ where: { organizationId }, select: { code: true } }),
     prisma.expenseCategory.findMany({ where: { organizationId, isActive: true }, select: { name: true } }),
   ])
   const categoryNames = new Set(categories.map((c) => c.name.toLowerCase()))
   const branchNames = new Set(branches.map((b) => b.name.toLowerCase()))
+  // Store keepers may only import into their own branch
+  const forbiddenBranchNames = new Set(
+    scope?.restricted ? branches.filter((b) => !scope.branchIds.includes(b.id)).map((b) => b.name.toLowerCase()) : []
+  )
   const supplierNames = new Set(suppliers.map((s) => s.name.toLowerCase()))
   const itemCodes = new Set(items.map((i) => i.code.toLowerCase()))
   const newSupplierNamesSeen = new Set<string>()
@@ -210,6 +216,7 @@ async function validatePurchaseImportRows(organizationId: string, rows: Record<s
     const branchName = data.branchName?.trim()
     if (!branchName) errors.push('branchName is required')
     else if (!branchNames.has(branchName.toLowerCase())) errors.push(`branch "${branchName}" was not found`)
+    else if (forbiddenBranchNames.has(branchName.toLowerCase())) errors.push(`branch "${branchName}" is not your branch — you can only import into your own branch`)
 
     const supplierName = data.supplierName?.trim()
     if (!supplierName) errors.push('supplierName is required')
@@ -264,7 +271,7 @@ router.post('/import/validate', requirePermission('can_create_purchasing_entry')
   if (!req.file) throw new AppError('A CSV or Excel file is required', 400, 'VALIDATION_ERROR')
   const rows = await parseImportFile(req.file)
   assertRecognizedColumns(rows, IMPORT_COLUMNS)
-  const results = await validatePurchaseImportRows(req.user.organizationId, rows)
+  const results = await validatePurchaseImportRows(req.user.organizationId, rows, await getBranchScope(req))
   res.json({
     totalRows: results.length,
     validRows: results.filter((r) => r.errors.length === 0).length,
@@ -280,7 +287,7 @@ router.post('/import/commit', requirePermission('can_create_purchasing_entry'), 
   const orgId = req.user.organizationId
   const rows = await parseImportFile(req.file)
   assertRecognizedColumns(rows, IMPORT_COLUMNS)
-  const results = await validatePurchaseImportRows(orgId, rows)
+  const results = await validatePurchaseImportRows(orgId, rows, await getBranchScope(req))
 
   if (results.some((r) => r.errors.length > 0)) {
     throw new AppError('Import contains invalid rows — fix them or re-validate before committing', 400, 'INVALID_IMPORT')

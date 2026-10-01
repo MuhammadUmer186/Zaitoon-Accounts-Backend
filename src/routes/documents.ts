@@ -3,6 +3,7 @@ import path from 'path'
 import fs from 'fs'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { assertBranchAccess } from '../utils/branchScope'
 import { upload, UPLOAD_ROOT } from '../middleware/upload'
 import { AppError } from '../middleware/error'
 
@@ -69,6 +70,7 @@ router.get('/:id/file', async (req: Request, res: Response) => {
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!document) throw new AppError('Document not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, document.branchId)
 
   const resolved = path.resolve(document.filePath)
   if (!resolved.startsWith(path.resolve(UPLOAD_ROOT)) || !fs.existsSync(resolved)) {

@@ -104,6 +104,14 @@ const cashierPerms = [
   'accounts_view',
 ]
 
+// Store Keeper: Purchasing + Inventory (incl. branch-to-branch transfers),
+// limited to the single branch assigned to the user — the branch limit is
+// enforced in code (backend/src/utils/branchScope.ts), not by permissions.
+const storeKeeperPerms = [
+  'can_create_purchasing_entry',
+  'can_manage_inventory', 'can_transfer_stock',
+]
+
 const allKeys = permissionsData.map((p) => p.key)
 
 // Administrator has everything except Users & Roles, Branches and Settings
@@ -115,7 +123,13 @@ const roleGrants = {
   accountant: accountantPerms,
   branch_manager: managerPerms,
   cashier: cashierPerms,
+  store_keeper: storeKeeperPerms,
 }
+
+// Roles added after the original seed — created per organization if missing
+const newRoles = [
+  { name: 'store_keeper', displayName: 'Store Keeper', description: 'Purchasing and inventory for one branch, including branch-to-branch transfers' },
+]
 
 async function main() {
   console.log('Syncing permissions...')
@@ -133,6 +147,17 @@ async function main() {
     if (!existing) permsCreated++
   }
   console.log(`Permissions: ${permsCreated} created, ${permissionsData.length - permsCreated} already present.`)
+
+  const orgs = await prisma.organization.findMany({ select: { id: true } })
+  for (const org of orgs) {
+    for (const r of newRoles) {
+      const exists = await prisma.role.findUnique({ where: { organizationId_name: { organizationId: org.id, name: r.name } } })
+      if (!exists) {
+        await prisma.role.create({ data: { organizationId: org.id, isSystemRole: true, ...r } })
+        console.log(`Created role "${r.displayName}"`)
+      }
+    }
+  }
 
   const roles = await prisma.role.findMany({ where: { name: { in: Object.keys(roleGrants) } } })
   console.log(`Found roles: ${roles.map((r) => r.name).join(', ') || '(none matched)'}`)

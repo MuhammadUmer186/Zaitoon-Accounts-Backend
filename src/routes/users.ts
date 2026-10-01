@@ -6,6 +6,20 @@ import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
+import { BRANCH_SCOPED_ROLES } from '../utils/branchScope'
+
+// A branch-scoped role (store keeper) works in exactly one branch — enforce
+// that whenever roles or branch access are set.
+async function assertBranchScopedRoleHasOneBranch(organizationId: string, roleIds: string[], branchIds: string[]) {
+  if (roleIds.length === 0) return
+  const scoped = await prisma.role.findMany({
+    where: { id: { in: roleIds }, organizationId, name: { in: BRANCH_SCOPED_ROLES } },
+    select: { displayName: true },
+  })
+  if (scoped.length > 0 && branchIds.length !== 1) {
+    throw new AppError(`${scoped[0].displayName} must be assigned to exactly one branch`, 400, 'VALIDATION_ERROR')
+  }
+}
 
 const router = Router()
 
@@ -78,6 +92,7 @@ router.get('/', async (req: Request, res: Response) => {
 // POST /users
 router.post('/', async (req: Request, res: Response) => {
   const body = createUserSchema.parse(req.body)
+  await assertBranchScopedRoleHasOneBranch(req.user.organizationId, body.roleIds ?? [], body.branchIds ?? [])
   const passwordHash = await bcrypt.hash(body.password, config.bcryptRounds)
 
   const user = await prisma.user.create({
@@ -147,6 +162,18 @@ router.put('/:id', async (req: Request, res: Response) => {
   if (!user) throw new AppError('User not found', 404, 'NOT_FOUND')
 
   const { roleIds, branchIds, password, ...rest } = body
+
+  if (roleIds !== undefined || branchIds !== undefined) {
+    const [currentRoles, currentBranches] = await Promise.all([
+      prisma.userRole.findMany({ where: { userId: id }, select: { roleId: true } }),
+      prisma.userBranchAccess.findMany({ where: { userId: id }, select: { branchId: true } }),
+    ])
+    await assertBranchScopedRoleHasOneBranch(
+      req.user.organizationId,
+      roleIds ?? currentRoles.map((r) => r.roleId),
+      branchIds ?? currentBranches.map((b) => b.branchId),
+    )
+  }
 
   const updateData: Record<string, unknown> = { ...rest }
   if (password) {

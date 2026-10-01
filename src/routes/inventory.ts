@@ -9,6 +9,7 @@ import { applyStockIn, applyStockOut } from '../utils/stock'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
 import { postJournalEntry, resolveMappedAccount } from '../utils/ledger'
+import { assertBranchAccess, branchFilter, getBranchScope } from '../utils/branchScope'
 
 const router = Router()
 
@@ -122,7 +123,8 @@ router.get('/stock', async (req: Request, res: Response) => {
   const { branchId, search, lowStock } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, quantityOnHand: { gt: 0 } }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
 
   const [stocks, org] = await Promise.all([
     prisma.branchStock.findMany({
@@ -265,10 +267,11 @@ router.delete('/items/:id', async (req: Request, res: Response) => {
 // GET /inventory/sections?branchId=&includeInactive=
 router.get('/sections', async (req: Request, res: Response) => {
   const { branchId, includeInactive } = req.query as Record<string, string>
+  const bf = await branchFilter(req, branchId)
   const sections = await prisma.branchSection.findMany({
     where: {
       organizationId: req.user.organizationId,
-      ...(branchId && { branchId }),
+      ...(bf && { branchId: bf }),
       ...(includeInactive !== 'true' && { isActive: true }),
     },
     include: { branch: { select: { id: true, name: true } }, _count: { select: { stockOuts: true } } },
@@ -286,6 +289,10 @@ router.post('/sections', async (req: Request, res: Response) => {
     allBranches: z.boolean().optional(),
   }).parse(req.body)
   if (!body.allBranches && !body.branchId) throw new AppError('Branch is required', 400, 'VALIDATION_ERROR')
+  if ((await getBranchScope(req)).restricted) {
+    if (body.allBranches) throw new AppError('You can only create sections in your own branch', 403, 'BRANCH_FORBIDDEN')
+    await assertBranchAccess(req, body.branchId)
+  }
 
   const branches = await prisma.branch.findMany({
     where: {
@@ -318,6 +325,7 @@ router.post('/sections', async (req: Request, res: Response) => {
 router.put('/sections/:id', async (req: Request, res: Response) => {
   const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
   if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, section.branchId)
   const body = sectionSchema.partial().extend({ isActive: z.boolean().optional() }).parse(req.body)
   const updated = await prisma.branchSection.update({ where: { id: section.id }, data: body })
   res.json(updated)
@@ -328,6 +336,7 @@ router.put('/sections/:id', async (req: Request, res: Response) => {
 router.delete('/sections/:id', async (req: Request, res: Response) => {
   const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
   if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, section.branchId)
   const inUse = await prisma.stockOut.count({ where: { sectionId: section.id } })
   if (inUse > 0) {
     await prisma.branchSection.update({ where: { id: section.id }, data: { isActive: false } })
@@ -342,11 +351,12 @@ router.delete('/sections/:id', async (req: Request, res: Response) => {
 // and per-item quantities.
 router.get('/sections/summary', async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
+  const bf = await branchFilter(req, branchId)
   const movements = await prisma.stockMovement.findMany({
     where: {
       organizationId: req.user.organizationId,
       sectionId: { not: null },
-      ...(branchId && { branchId }),
+      ...(bf && { branchId: bf }),
       ...((fromDate || toDate) && {
         createdAt: {
           ...(fromDate && { gte: new Date(fromDate) }),
@@ -357,7 +367,7 @@ router.get('/sections/summary', async (req: Request, res: Response) => {
     include: { item: { select: { id: true, name: true, code: true, unit: true } } },
   })
   const sections = await prisma.branchSection.findMany({
-    where: { organizationId: req.user.organizationId, ...(branchId && { branchId }) },
+    where: { organizationId: req.user.organizationId, ...(bf && { branchId: bf }) },
     include: { branch: { select: { name: true } } },
     orderBy: [{ branch: { name: 'asc' } }, { name: 'asc' }],
   })
@@ -406,6 +416,9 @@ router.post('/stock-out', async (req: Request, res: Response) => {
 
   const branch = await prisma.branch.findFirst({ where: { id: body.branchId, organizationId: orgId } })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  // A store keeper sends stock out of their own store only; the destination
+  // of a branch transfer can be any branch.
+  await assertBranchAccess(req, body.branchId)
 
   let toBranch: { id: string; name: string } | null = null
   let section: { id: string; name: string } | null = null
@@ -514,7 +527,8 @@ router.get('/stock-outs', async (req: Request, res: Response) => {
   const { branchId, type, sectionId, toBranchId, fromDate, toDate } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.OR = [{ branchId }, { toBranchId: branchId }]
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.OR = [{ branchId: bf }, { toBranchId: bf }]
   if (type) where.type = type
   if (sectionId) where.sectionId = sectionId
   if (toBranchId) where.toBranchId = toBranchId
@@ -572,6 +586,10 @@ router.get('/stock-outs/:id', async (req: Request, res: Response) => {
     },
   })
   if (!stockOut) throw new AppError('Stock out not found', 404, 'NOT_FOUND')
+  const scope = await getBranchScope(req)
+  if (scope.restricted && !scope.branchIds.includes(stockOut.branchId) && !(stockOut.toBranchId && scope.branchIds.includes(stockOut.toBranchId))) {
+    throw new AppError('You can only access your own branch', 403, 'BRANCH_FORBIDDEN')
+  }
 
   const [lines, user] = await Promise.all([
     prisma.stockMovement.findMany({
@@ -638,6 +656,7 @@ router.post('/purchases', upload.single('file'), async (req: Request, res: Respo
       })
       if (!order) throw new AppError('Purchase order not found', 404, 'NOT_FOUND')
       if (order.status !== 'approved') throw new AppError('Only approved purchase orders can be received', 400, 'INVALID_STATUS')
+      await assertBranchAccess(req, order.branchId)
 
       const supplier = await tx.supplier.findFirst({
         where: { id: body.supplierId, organizationId: req.user.organizationId },
@@ -812,7 +831,8 @@ router.post('/purchases', upload.single('file'), async (req: Request, res: Respo
 router.get('/wastage/pending-approval', async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'draft' }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
 
   const reports = await prisma.wastageReport.findMany({
     where,
@@ -828,7 +848,8 @@ router.get('/wastage', async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
 
   const [reports, total] = await Promise.all([
     prisma.wastageReport.findMany({
@@ -854,6 +875,7 @@ router.post('/wastage', async (req: Request, res: Response) => {
     where: { id: body.branchId, organizationId: req.user.organizationId },
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, body.branchId)
 
   const totalValue = body.items.reduce((sum, i) => sum + i.totalValue, 0)
 
@@ -881,6 +903,7 @@ router.post('/wastage/:id/approve', async (req: Request, res: Response) => {
   })
   if (!report) throw new AppError('Wastage report not found', 404, 'NOT_FOUND')
   if (report.status !== 'draft') throw new AppError('Report already processed', 400, 'INVALID_STATUS')
+  await assertBranchAccess(req, report.branchId)
 
   // Reduce stock for each item
   for (const wi of report.items) {

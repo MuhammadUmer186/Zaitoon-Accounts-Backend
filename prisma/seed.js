@@ -391,6 +391,21 @@ async function main() {
     'accounts_view',
   ]
 
+  // Store Keeper: Purchasing + Inventory for exactly one branch (the branch
+  // limit is enforced in backend/src/utils/branchScope.ts)
+  await prisma.role.create({
+    data: {
+      organizationId: org.id,
+      name: 'store_keeper',
+      displayName: 'Store Keeper',
+      description: 'Purchasing and inventory for one branch, including branch-to-branch transfers',
+      isSystemRole: true,
+      permissions: {
+        create: ['can_create_purchasing_entry', 'can_manage_inventory', 'can_transfer_stock'].map((key) => ({ permissionId: permissions[key] })),
+      },
+    },
+  })
+
   const cashierRole = await prisma.role.create({
     data: {
       organizationId: org.id,
