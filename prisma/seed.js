@@ -316,15 +316,18 @@ async function main() {
     },
   })
 
+  // Administrator: everything except Users & Roles, Branches and Settings
+  const adminExcluded = ['can_manage_users', 'can_manage_roles', 'can_create_branch', 'can_manage_settings']
+  const adminPermIds = Object.entries(permissions).filter(([key]) => !adminExcluded.includes(key)).map(([, id]) => id)
   const adminRole = await prisma.role.create({
     data: {
       organizationId: org.id,
       name: 'admin',
       displayName: 'Administrator',
-      description: 'Organization admin with full access',
+      description: 'Full access except Users & Roles, Branches and Settings',
       isSystemRole: true,
       permissions: {
-        create: allPermIds.map((id) => ({ permissionId: id })),
+        create: adminPermIds.map((id) => ({ permissionId: id })),
       },
     },
   })

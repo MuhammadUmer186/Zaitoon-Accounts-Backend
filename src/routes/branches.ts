@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requirePermission } from '../middleware/authorize'
 import { AppError } from '../middleware/error'
 
 const router = Router()
@@ -34,7 +35,7 @@ router.get('/', async (req: Request, res: Response) => {
 })
 
 // POST /branches
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', requirePermission('can_create_branch'), async (req: Request, res: Response) => {
   const body = branchSchema.parse(req.body)
   const branch = await prisma.branch.create({
     data: { ...body, organizationId: req.user.organizationId },
@@ -53,7 +54,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /branches/:id
-router.put('/:id', async (req: Request, res: Response) => {
+router.put('/:id', requirePermission('can_create_branch'), async (req: Request, res: Response) => {
   const id = req.params['id'] as string
   const body = branchSchema.partial().parse(req.body)
   const branch = await prisma.branch.findFirst({
@@ -65,7 +66,7 @@ router.put('/:id', async (req: Request, res: Response) => {
 })
 
 // DELETE /branches/:id — hard-deletes if no transactions, otherwise 409
-router.delete('/:id', async (req: Request, res: Response) => {
+router.delete('/:id', requirePermission('can_create_branch'), async (req: Request, res: Response) => {
   const id = req.params['id'] as string
 
   const branch = await prisma.branch.findFirst({

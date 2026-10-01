@@ -106,9 +106,12 @@ const cashierPerms = [
 
 const allKeys = permissionsData.map((p) => p.key)
 
+// Administrator has everything except Users & Roles, Branches and Settings
+const adminExcluded = ['can_manage_users', 'can_manage_roles', 'can_create_branch', 'can_manage_settings']
+
 const roleGrants = {
   super_admin: allKeys,
-  admin: allKeys,
+  admin: allKeys.filter((k) => !adminExcluded.includes(k)),
   accountant: accountantPerms,
   branch_manager: managerPerms,
   cashier: cashierPerms,
@@ -149,6 +152,19 @@ async function main() {
     }
   }
   console.log(`Role grants: ${grantsCreated} newly added.`)
+
+  // Older databases gave Administrator every permission — remove the
+  // Super-Admin-only ones from it.
+  const adminRoleIds = roles.filter((r) => r.name === 'admin').map((r) => r.id)
+  const excludedIds = adminExcluded.map((k) => permissionIds[k]).filter(Boolean)
+  const removed = await prisma.rolePermission.deleteMany({
+    where: { roleId: { in: adminRoleIds }, permissionId: { in: excludedIds } },
+  })
+  await prisma.role.updateMany({
+    where: { id: { in: adminRoleIds } },
+    data: { description: 'Full access except Users & Roles, Branches and Settings' },
+  })
+  console.log(`Administrator: ${removed.count} Super-Admin-only grant(s) removed.`)
   console.log('Done. Existing users will see the new modules after their next login/page-refresh.')
 }
 

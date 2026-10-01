@@ -3,12 +3,15 @@ import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { prisma, config } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requirePermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
 
 const router = Router()
 
 router.use(authenticate)
+// Users & Roles is Super Admin territory — Administrator doesn't hold this
+router.use(requirePermission('can_manage_users'))
 
 const createUserSchema = z.object({
   email: z.string().email(),

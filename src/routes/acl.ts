@@ -2,12 +2,15 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requirePermission } from '../middleware/authorize'
 import { AppError } from '../middleware/error'
 import { getUserPermissions } from '../utils/permissions'
 
 const router = Router()
 
 router.use(authenticate)
+router.use(['/roles', '/permissions'], requirePermission('can_manage_roles'))
+router.use('/users', requirePermission('can_manage_users'))
 
 const roleSchema = z.object({
   name: z.string().min(1),

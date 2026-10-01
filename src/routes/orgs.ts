@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requirePermission } from '../middleware/authorize'
+import { getUserPermissions } from '../utils/permissions'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 
 const router = Router()
@@ -45,12 +47,26 @@ router.put('/:orgId', async (req: Request, res: Response) => {
   }
 
   const body = orgSettingsSchema.parse(req.body)
+
+  // Organization settings need can_manage_settings (Super Admin). The one
+  // exception is the low-stock threshold, which the Alerts page edits.
+  const { permissions } = await getUserPermissions(prisma, req.user.id)
+  const touchesSettings = Object.keys(body).some((k) => k !== 'lowStockThreshold')
+  if (touchesSettings && !permissions.has('can_manage_settings')) {
+    res.status(403).json({ message: 'Missing required permission: can_manage_settings', code: 'FORBIDDEN' })
+    return
+  }
+  if (!touchesSettings && !permissions.has('can_manage_settings') && !permissions.has('can_view_alerts')) {
+    res.status(403).json({ message: 'Missing required permission: can_view_alerts', code: 'FORBIDDEN' })
+    return
+  }
+
   const updated = await prisma.organization.update({ where: { id: orgId }, data: body })
   res.json(updated)
 })
 
 // GET /orgs/:orgId/users
-router.get('/:orgId/users', async (req: Request, res: Response) => {
+router.get('/:orgId/users', requirePermission('can_manage_users'), async (req: Request, res: Response) => {
   const { orgId } = req.params
   if (orgId !== req.user.organizationId) {
     res.status(403).json({ message: 'Forbidden', code: 'FORBIDDEN' })
@@ -95,7 +111,7 @@ router.get('/:orgId/users', async (req: Request, res: Response) => {
 })
 
 // PUT /orgs/:orgId/users/:userId/status
-router.put('/:orgId/users/:userId/status', async (req: Request, res: Response) => {
+router.put('/:orgId/users/:userId/status', requirePermission('can_manage_users'), async (req: Request, res: Response) => {
   const { orgId, userId } = req.params
   if (orgId !== req.user.organizationId) {
     res.status(403).json({ message: 'Forbidden', code: 'FORBIDDEN' })
