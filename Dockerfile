@@ -25,6 +25,8 @@ RUN addgroup --system --gid 1001 nodejs \
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/prisma ./prisma
+# Brand assets (logo) used by the PDF / Excel report exports
+COPY --from=builder /app/assets ./assets
 COPY --from=builder /app/package.json ./package.json
 
 # middleware/upload.ts writes to UPLOAD_ROOT/<organizationId>/ at runtime as

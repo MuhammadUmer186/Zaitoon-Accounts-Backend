@@ -2,6 +2,12 @@ import { Response } from 'express'
 import ExcelJS from 'exceljs'
 import PDFDocument from 'pdfkit'
 import { PrismaClient } from '@prisma/client'
+import fs from 'fs'
+import path from 'path'
+
+const LOGO_PATH = path.join(__dirname, '..', '..', 'assets', 'zaitoon-logo.png')
+const LOGO_RATIO = 360 / 210 // width / height of zaitoon-logo.png
+const logoAvailable = () => { try { return fs.existsSync(LOGO_PATH) } catch { return false } }
 
 // "Professional report" model shared by every catalog report. A report is
 // described once (headline KPIs + ordered sections) and rendered three ways:
@@ -171,17 +177,18 @@ export async function sendProReport(res: Response, format: string | undefined, r
 
 // ── PDF ─────────────────────────────────────────────────────────────────────
 
+// Zaitoon brand colours — charcoal and olive green from the logo
 const C = {
-  ink: '#07131b',
-  text: '#1f2933',
-  muted: '#5b6b78',
-  faint: '#8a99a6',
-  accent: '#1d5f7a',
-  amber: '#f5b62b',
-  card: '#edf2f5',
-  zebra: '#f1f5f8',
-  totals: '#dce8ef',
-  rule: '#cfdbe3',
+  ink: '#1f1f1f',
+  text: '#262a22',
+  muted: '#5f6656',
+  faint: '#8c9381',
+  accent: '#5f7230',
+  amber: '#c9d88f', // KPI figure on the dark card (light olive)
+  card: '#f2f4ea',
+  zebra: '#f7f8f2',
+  totals: '#e3e9d1',
+  rule: '#d9dfcb',
   positive: '#15803d',
   negative: '#b91c1c',
   warning: '#b45309',
@@ -220,11 +227,15 @@ function renderPdf(res: Response, report: ProReport, fileBase: string) {
     if (!firstPage) doc.addPage()
     firstPage = false
     doc.rect(0, 0, PAGE.w, 9).fill(C.ink)
+    doc.rect(0, 9, PAGE.w, 2.5).fill(C.accent)
+    const logoH = 46
+    const logoW = logoAvailable() ? logoH * LOGO_RATIO : 0
+    if (logoW) doc.image(LOGO_PATH, PAGE.w - PAGE.m - logoW, 18, { height: logoH })
     doc.font('Helvetica-Bold').fontSize(8.5).fillColor(C.accent)
       .text(pdfSafe(report.eyebrow.toUpperCase()), PAGE.m, 30, { lineBreak: false, characterSpacing: 0.4 })
     doc.font('Helvetica').fontSize(8).fillColor(C.muted)
-      .text(pdfSafe(`${report.orgName.toUpperCase()}  /  ${report.scopeLabel.toUpperCase()}`), PAGE.m, 30, { width: CONTENT_W, align: 'right', lineBreak: false })
-    doc.font('Helvetica-Bold').fontSize(24).fillColor(C.ink).text(pdfSafe(title), PAGE.m, 46, { width: CONTENT_W, lineBreak: false })
+      .text(pdfSafe(`${report.orgName.toUpperCase()}  /  ${report.scopeLabel.toUpperCase()}`), PAGE.m, 30, { width: CONTENT_W - logoW - 14, align: 'right', lineBreak: false })
+    doc.font('Helvetica-Bold').fontSize(24).fillColor(C.ink).text(pdfSafe(title), PAGE.m, 46, { width: CONTENT_W - logoW - 14, lineBreak: false })
     if (subtitle) doc.font('Helvetica').fontSize(9).fillColor(C.muted).text(pdfSafe(subtitle), PAGE.m, 80, { width: CONTENT_W, lineBreak: false })
     y = subtitle ? 104 : 90
   }
@@ -253,7 +264,7 @@ function renderPdf(res: Response, report: ProReport, fileBase: string) {
       const x = PAGE.m + i * (w + gap)
       const dark = k.tone === 'dark'
       doc.roundedRect(x, y, w, h, 6).fill(dark ? C.ink : C.card)
-      doc.font('Helvetica-Bold').fontSize(8).fillColor(dark ? '#9fc3d6' : C.muted)
+      doc.font('Helvetica-Bold').fontSize(8).fillColor(dark ? '#b6c67f' : C.muted)
         .text(pdfSafe(k.label.toUpperCase()), x + 14, y + 13, { width: w - 28, lineBreak: false, characterSpacing: 0.3 })
       const valueColor = dark ? C.amber
         : k.tone === 'positive' ? C.positive : k.tone === 'negative' ? C.negative : k.tone === 'warning' ? C.warning : C.ink
@@ -261,7 +272,7 @@ function renderPdf(res: Response, report: ProReport, fileBase: string) {
       doc.font('Helvetica-Bold').fontSize(valueText.length > 14 ? 17 : 21).fillColor(valueColor)
         .text(pdfSafe(valueText), x + 14, y + 30, { width: w - 28, lineBreak: false, ellipsis: true })
       if (k.hint) {
-        doc.font('Helvetica').fontSize(8).fillColor(dark ? '#d5e3ea' : C.muted)
+        doc.font('Helvetica').fontSize(8).fillColor(dark ? '#e1e6d3' : C.muted)
           .text(pdfSafe(k.hint), x + 14, y + 60, { width: w - 28, lineBreak: false, ellipsis: true })
       }
     })
@@ -541,8 +552,8 @@ function planPages(report: ProReport): PlannedPage[] {
 // "Editable" sheet holds the register as a real Excel table with SUM totals.
 
 const X = {
-  ink: 'FF07131B', text: 'FF1F2933', muted: 'FF5B6B78', faint: 'FF8A99A6', accent: 'FF1D5F7A', amber: 'FFF5B62B',
-  card: 'FFEDF2F5', zebra: 'FFF1F5F8', totals: 'FFDCE8EF', white: 'FFFFFFFF', kpiLabelDark: 'FF9FC3D6', kpiHintDark: 'FFD5E3EA',
+  ink: 'FF1F1F1F', text: 'FF262A22', muted: 'FF5F6656', faint: 'FF8C9381', accent: 'FF5F7230', amber: 'FFC9D88F',
+  card: 'FFF2F4EA', zebra: 'FFF7F8F2', totals: 'FFE3E9D1', white: 'FFFFFFFF', kpiLabelDark: 'FFB6C67F', kpiHintDark: 'FFE1E6D3',
   positive: 'FF15803D', negative: 'FFB91C1C', warning: 'FFB45309',
 }
 const XSTATUS: Record<string, string> = {
@@ -578,11 +589,12 @@ async function renderExcel(res: Response, report: ProReport, fileBase: string) {
   wb.title = report.headline
 
   const pages = planPages(report)
+  const logoId = logoAvailable() ? wb.addImage({ filename: LOGO_PATH, extension: 'png' }) : undefined
   const footerText = `${report.orgName}  |  ${report.periodLabel}  |  Amounts in ${report.currency}  |  Generated ${fmtDateShort(report.generatedAt)}`
 
   pages.forEach((page, pageIndex) => {
     const ws = wb.addWorksheet(page.tabName, {
-      properties: { tabColor: { argb: 'FF17536B' } },
+      properties: { tabColor: { argb: 'FF5F7230' } },
       views: [{ showGridLines: false }],
       pageSetup: {
         paperSize: 9, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, horizontalCentered: true,
@@ -627,7 +639,11 @@ async function renderExcel(res: Response, report: ProReport, fileBase: string) {
     setRow(18)
     const half = C0 + Math.floor(gridCols / 2)
     write(r, C0, half - 1, report.eyebrow.toUpperCase(), { bold: true, size: 9, color: { argb: X.accent } })
-    write(r, half, lastCol, `${report.orgName.toUpperCase()}  /  ${report.scopeLabel.toUpperCase()}`, { size: 8, color: { argb: X.muted } }, { align: 'right' })
+    write(r, half, logoId !== undefined ? lastCol - 1 : lastCol, `${report.orgName.toUpperCase()}  /  ${report.scopeLabel.toUpperCase()}`, { size: 8, color: { argb: X.muted } }, { align: 'right' })
+    if (logoId !== undefined) {
+      // tl is zero-based: column lastCol (1-based) -> lastCol - 1
+      ws.addImage(logoId, { tl: { col: lastCol - 1 + 0.1, row: 1.2 }, ext: { width: Math.round(62 * LOGO_RATIO), height: 62 } })
+    }
     r++
     setRow(36)
     write(r, C0, lastCol, page.title, { bold: true, size: 22, color: { argb: X.ink } })
@@ -695,7 +711,7 @@ async function renderExcel(res: Response, report: ProReport, fileBase: string) {
         const cell = ws.getCell(r, C0 + ci)
         if (ci === indentCol && style === 'indent') cell.alignment = { ...cell.alignment, indent: 3 }
         if (kind === 'total') cell.border = { top: { style: 'thin', color: { argb: X.ink } } }
-        else if (style === 'subtotal') cell.border = { top: { style: 'thin', color: { argb: 'FFCFDBE3' } } }
+        else if (style === 'subtotal') cell.border = { top: { style: 'thin', color: { argb: 'FFD9DFCB' } } }
       })
       r++
     }
@@ -775,7 +791,7 @@ async function renderExcel(res: Response, report: ProReport, fileBase: string) {
 
     // Footer
     r++
-    for (let c = C0; c <= lastCol; c++) ws.getCell(r, c).border = { top: { style: 'thin', color: { argb: 'FFCFDBE3' } } }
+    for (let c = C0; c <= lastCol; c++) ws.getCell(r, c).border = { top: { style: 'thin', color: { argb: 'FFD9DFCB' } } }
     setRow(18)
     const split = C0 + Math.max(1, gridCols - 2)
     write(r, C0, split - 1, footerText, { size: 8, color: { argb: X.muted } })
@@ -789,7 +805,7 @@ async function renderExcel(res: Response, report: ProReport, fileBase: string) {
   if (data) {
     const editableName = report.editableName ?? EDITABLE_NAMES[report.key] ?? 'Editable data'
     const ws = wb.addWorksheet(editableName.slice(0, 31), {
-      properties: { tabColor: { argb: 'FF96C8D7' } },
+      properties: { tabColor: { argb: 'FFB6C67F' } },
       views: [{ state: 'frozen', ySplit: 5, showGridLines: false }],
       pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 },
     })
@@ -798,7 +814,7 @@ async function renderExcel(res: Response, report: ProReport, fileBase: string) {
       ws.getColumn(i + 1).width = c.format === 'money' ? 19 : c.format === 'date' ? 16 : c.format === 'status' ? 14 : isNumericFormat(c.format) ? 14
         : Math.max(18, Math.min(40, Math.round((c.width ?? 1.6) * 14)))
     })
-    const font = (extra: Partial<ExcelJS.Font> = {}) => ({ name: FONT, size: 11, color: { argb: 'FF041219' }, ...extra })
+    const font = (extra: Partial<ExcelJS.Font> = {}) => ({ name: FONT, size: 11, color: { argb: 'FF1F1F1F' }, ...extra })
     ws.getRow(1).height = 24
     ws.getCell('A1').value = editableName
     ws.getCell('A1').font = font({ bold: true, size: 17 })
@@ -814,12 +830,12 @@ async function renderExcel(res: Response, report: ProReport, fileBase: string) {
         ref: 'A5',
         headerRow: true,
         totalsRow: false,
-        style: { theme: 'TableStyleMedium2', showRowStripes: true },
+        style: { theme: 'TableStyleMedium7', showRowStripes: true },
         columns: cols.map((c) => ({ name: c.label, filterButton: true })),
         rows: data.rows.map((row) => cols.map((c) => excelValue(row[c.key], c.format))),
       })
       ws.getRow(5).eachCell((cell) => {
-        cell.fill = solid('FF041219')
+        cell.fill = solid('FF1F1F1F')
         cell.font = font({ bold: true, color: { argb: 'FFF4F7F8' } })
         cell.alignment = { vertical: 'middle' }
       })
@@ -838,7 +854,7 @@ async function renderExcel(res: Response, report: ProReport, fileBase: string) {
       ws.getRow(tr).height = 24
       cols.forEach((c, i) => {
         const cell = ws.getCell(tr, i + 1)
-        cell.fill = solid('FFDCEAF0')
+        cell.fill = solid('FFE3E9D1')
         cell.font = font({ bold: true })
         if (i === 0) cell.value = 'TOTAL'
         else if (c.format === 'money' || c.format === 'integer') {
