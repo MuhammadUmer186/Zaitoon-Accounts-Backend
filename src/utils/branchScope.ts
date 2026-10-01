@@ -2,11 +2,26 @@ import { Request } from 'express'
 import { prisma } from '../config'
 import { AppError } from '../middleware/error'
 
-// Roles whose users only ever see the branch(es) assigned to them in
-// UserBranchAccess. Everyone else keeps org-wide visibility (unchanged
-// behaviour). A store keeper works in exactly one branch's store.
+// Who sees which branches:
+//  - super_admin / owner / admin: every branch, always.
+//  - a store keeper: only the branch(es) ticked under Branch Access — even
+//    none, which shows nothing rather than everything.
+//  - anyone else: the branches ticked under Branch Access; a user with no
+//    branch access rows at all keeps org-wide visibility (so older accounts
+//    that were never given branch rows aren't locked out).
+// Roles are matched by name OR display name, normalised, so a role created
+// by hand as "Store Keeper" behaves the same as the seeded store_keeper.
 export const BRANCH_SCOPED_ROLES = ['store_keeper']
 const UNSCOPED_ROLES = ['super_admin', 'owner', 'admin']
+
+const normalise = (s: string) => s.toLowerCase().replace(/[^a-z]/g, '')
+const UNSCOPED_KEYS = new Set([...UNSCOPED_ROLES.map(normalise), 'superadministrator', 'administrator'])
+const STORE_KEEPER_KEYS = new Set([...BRANCH_SCOPED_ROLES.map(normalise), 'storekeeper', 'storemanager'])
+
+export const isStoreKeeperRole = (r: { name: string; displayName?: string | null }) =>
+  STORE_KEEPER_KEYS.has(normalise(r.name)) || (!!r.displayName && STORE_KEEPER_KEYS.has(normalise(r.displayName)))
+const isUnscopedRole = (r: { name: string; displayName?: string | null }) =>
+  UNSCOPED_KEYS.has(normalise(r.name)) || (!!r.displayName && UNSCOPED_KEYS.has(normalise(r.displayName)))
 
 export interface BranchScope {
   restricted: boolean
@@ -26,11 +41,16 @@ export function getBranchScope(req: Request): Promise<BranchScope> {
 }
 
 export async function resolveScope(userId: string, organizationId: string): Promise<BranchScope> {
-  const roles = (await prisma.userRole.findMany({ where: { userId }, include: { role: { select: { name: true } } } })).map((r) => r.role.name)
-  const restricted = roles.some((r) => BRANCH_SCOPED_ROLES.includes(r)) && !roles.some((r) => UNSCOPED_ROLES.includes(r))
-  if (!restricted) return { restricted: false, branchIds: [] }
-  const access = await prisma.userBranchAccess.findMany({ where: { userId, organizationId }, select: { branchId: true } })
-  return { restricted: true, branchIds: access.map((a) => a.branchId) }
+  const [userRoles, access] = await Promise.all([
+    prisma.userRole.findMany({ where: { userId }, include: { role: { select: { name: true, displayName: true } } } }),
+    prisma.userBranchAccess.findMany({ where: { userId, organizationId }, select: { branchId: true } }),
+  ])
+  const roles = userRoles.map((r) => r.role)
+  if (roles.some(isUnscopedRole)) return { restricted: false, branchIds: [] }
+  const branchIds = access.map((a) => a.branchId)
+  if (roles.some(isStoreKeeperRole)) return { restricted: true, branchIds }
+  if (branchIds.length === 0) return { restricted: false, branchIds: [] }
+  return { restricted: true, branchIds }
 }
 
 // Throws 403 when a branch-scoped user touches another branch.

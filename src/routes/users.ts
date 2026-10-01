@@ -6,16 +6,17 @@ import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
-import { BRANCH_SCOPED_ROLES } from '../utils/branchScope'
+import { isStoreKeeperRole } from '../utils/branchScope'
 
 // A branch-scoped role (store keeper) works in exactly one branch — enforce
 // that whenever roles or branch access are set.
 async function assertBranchScopedRoleHasOneBranch(organizationId: string, roleIds: string[], branchIds: string[]) {
   if (roleIds.length === 0) return
-  const scoped = await prisma.role.findMany({
-    where: { id: { in: roleIds }, organizationId, name: { in: BRANCH_SCOPED_ROLES } },
-    select: { displayName: true },
+  const roles = await prisma.role.findMany({
+    where: { id: { in: roleIds }, organizationId },
+    select: { name: true, displayName: true },
   })
+  const scoped = roles.filter(isStoreKeeperRole)
   if (scoped.length > 0 && branchIds.length !== 1) {
     throw new AppError(`${scoped[0].displayName} must be assigned to exactly one branch`, 400, 'VALIDATION_ERROR')
   }
