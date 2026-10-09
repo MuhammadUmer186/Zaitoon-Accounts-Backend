@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk'
+import OpenAI from 'openai'
 import sharp from 'sharp'
 import { z } from 'zod'
 import { prisma, config } from '../config'
@@ -6,18 +6,14 @@ import { AppError } from '../middleware/error'
 import { hijriToGregorianISO } from '../utils/hijriDate'
 
 // Purchasing → "scan bill": reads an uploaded vendor bill (PDF/JPG/PNG) with
-// Claude and returns a draft purchase — vendor, date, VAT %, line items —
+// OpenAI and returns a draft purchase — vendor, date, VAT %, line items —
 // already matched against this org's suppliers, catalog items and expense
 // categories. Nothing is saved here; the New Purchase form is pre-filled and
 // the user reviews it before Apply (which goes through POST /purchasing as
 // usual, re-uploading the same file as the mandatory attachment).
 
-// Fallbacks ("default" = server-side re-run on another model when a safety
-// classifier declines) are only accepted on these models.
-const FALLBACK_MODELS = new Set(['claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5-5', 'claude-fable-5-1'])
-
-// Phone photos are routinely larger than the API's 5 MB image limit, and
-// detail beyond ~2400px on the long edge doesn't help the model read a bill.
+// Phone photos are often 5–10 MB; detail beyond ~2400px on the long edge
+// doesn't help the model read a bill and only adds upload size and tokens.
 const MAX_IMAGE_EDGE = 2400
 
 const nullableString = { anyOf: [{ type: 'string' }, { type: 'null' }] }
@@ -181,17 +177,17 @@ export interface BillExtractionResult {
   model: string
 }
 
-let client: Anthropic | null = null
-function getClient(): Anthropic {
-  if (!config.anthropicApiKey) {
-    throw new AppError('Bill scanning is not configured — set ANTHROPIC_API_KEY on the server', 503, 'EXTRACTION_UNAVAILABLE')
+let client: OpenAI | null = null
+function getClient(): OpenAI {
+  if (!config.openaiApiKey) {
+    throw new AppError('Bill scanning is not configured — set OPENAI_API_KEY on the server', 503, 'EXTRACTION_UNAVAILABLE')
   }
-  client ??= new Anthropic({ apiKey: config.anthropicApiKey, timeout: 180_000, maxRetries: 2 })
+  client ??= new OpenAI({ apiKey: config.openaiApiKey, timeout: 180_000, maxRetries: 2 })
   return client
 }
 
 export function isBillExtractionEnabled(): boolean {
-  return !!config.anthropicApiKey
+  return !!config.openaiApiKey
 }
 
 const round = (n: number, dp: number) => Math.round(n * 10 ** dp) / 10 ** dp
@@ -231,20 +227,21 @@ function jaccard(a: Set<string>, b: Set<string>): number {
 
 const digitsOnly = (s: string | null | undefined) => (s ?? '').replace(/\D/g, '')
 
-function toDocumentBlock(buffer: Buffer, mimetype: string) {
+function toFileInput(buffer: Buffer, mimetype: string, filename: string) {
   if (mimetype === 'application/pdf') {
     if (buffer.subarray(0, 5).toString('latin1') !== '%PDF-') {
       throw new AppError('This file is not a valid PDF', 400, 'INVALID_FILE')
     }
     return {
-      type: 'document' as const,
-      source: { type: 'base64' as const, media_type: 'application/pdf' as const, data: buffer.toString('base64') },
+      type: 'input_file' as const,
+      filename: filename || 'bill.pdf',
+      file_data: `data:application/pdf;base64,${buffer.toString('base64')}`,
     }
   }
   return null
 }
 
-async function toImageBlock(buffer: Buffer) {
+async function toImageInput(buffer: Buffer) {
   let jpeg: Buffer
   try {
     // .rotate() with no args applies the EXIF orientation, so sideways phone
@@ -259,15 +256,16 @@ async function toImageBlock(buffer: Buffer) {
     throw new AppError('Could not read this image — upload a clear JPG or PNG of the bill', 400, 'INVALID_FILE')
   }
   return {
-    type: 'image' as const,
-    source: { type: 'base64' as const, media_type: 'image/jpeg' as const, data: jpeg.toString('base64') },
+    type: 'input_image' as const,
+    // "high" keeps small print and handwritten quantities legible
+    detail: 'high' as const,
+    image_url: `data:image/jpeg;base64,${jpeg.toString('base64')}`,
   }
 }
 
-async function callClaude(file: Express.Multer.File, orgName: string, categoryNames: string[]): Promise<RawExtraction> {
-  const anthropic = getClient()
-  const fileBlock = toDocumentBlock(file.buffer, file.mimetype) ?? (await toImageBlock(file.buffer))
-  const model = config.billExtractionModel
+async function callModel(file: Express.Multer.File, orgName: string, categoryNames: string[]): Promise<RawExtraction> {
+  const openai = getClient()
+  const fileInput = toFileInput(file.buffer, file.mimetype, file.originalname) ?? (await toImageInput(file.buffer))
 
   const requestText = [
     `Buyer organization (not the vendor): ${orgName}`,
@@ -275,50 +273,57 @@ async function callClaude(file: Express.Multer.File, orgName: string, categoryNa
     'Transcribe this bill.',
   ].join('\n')
 
-  let message: Anthropic.Beta.Messages.BetaMessage
+  let response: OpenAI.Responses.Response
   try {
-    const stream = anthropic.beta.messages.stream({
-      model,
-      max_tokens: 32000,
-      ...(FALLBACK_MODELS.has(model) ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const } : {}),
-      output_config: {
-        effort: 'medium',
-        format: { type: 'json_schema', schema: OUTPUT_SCHEMA },
-      },
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: [fileBlock, { type: 'text', text: requestText }] }],
+    response = await openai.responses.create({
+      model: config.billExtractionModel,
+      instructions: SYSTEM_PROMPT,
+      input: [{ role: 'user', content: [fileInput, { type: 'input_text', text: requestText }] }],
+      max_output_tokens: 32000,
+      // Bills can contain personal/commercial data — don't keep them on OpenAI's side
+      store: false,
+      text: { format: { type: 'json_schema', name: 'purchase_bill', strict: true, schema: OUTPUT_SCHEMA } },
     })
-    message = await stream.finalMessage()
   } catch (err) {
-    if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
+    if (err instanceof OpenAI.AuthenticationError || err instanceof OpenAI.PermissionDeniedError) {
       console.error('Bill extraction auth error:', err.message)
       throw new AppError('Bill scanning is misconfigured on the server (API key rejected)', 503, 'EXTRACTION_UNAVAILABLE')
     }
-    if (err instanceof Anthropic.RateLimitError) {
-      throw new AppError('Bill scanning is busy right now — try again in a minute', 429, 'EXTRACTION_RATE_LIMITED')
+    if (err instanceof OpenAI.RateLimitError) {
+      // 429 also covers an exhausted quota / unpaid billing on the OpenAI account
+      console.error('Bill extraction rate limited:', err.message)
+      throw new AppError('Bill scanning is busy or out of quota right now — try again later or enter the items manually', 429, 'EXTRACTION_RATE_LIMITED')
     }
-    if (err instanceof Anthropic.BadRequestError) {
+    if (err instanceof OpenAI.BadRequestError || err instanceof OpenAI.UnprocessableEntityError) {
       console.error('Bill extraction rejected:', err.message)
       throw new AppError('This file could not be read (it may be corrupted, password-protected or too large)', 422, 'EXTRACTION_FAILED')
     }
-    if (err instanceof Anthropic.APIError) {
+    if (err instanceof OpenAI.APIError) {
       console.error(`Bill extraction API error ${err.status}:`, err.message)
       throw new AppError('Bill scanning service is temporarily unavailable — enter the items manually or retry', 502, 'EXTRACTION_FAILED')
     }
     throw err
   }
 
-  if (message.stop_reason === 'refusal') {
-    throw new AppError('This document could not be processed — enter the items manually', 422, 'EXTRACTION_FAILED')
-  }
-  if (message.stop_reason === 'max_tokens') {
+  if (response.status === 'incomplete') {
+    const reason = response.incomplete_details?.reason
+    if (reason === 'content_filter') {
+      throw new AppError('This document could not be processed — enter the items manually', 422, 'EXTRACTION_FAILED')
+    }
     throw new AppError('This bill is too long to scan in one go — enter the items manually or split the file', 422, 'EXTRACTION_FAILED')
   }
 
-  const text = message.content
-    .filter((b): b is Anthropic.Beta.Messages.BetaTextBlock => b.type === 'text')
-    .map((b) => b.text)
-    .join('')
+  let text = ''
+  for (const item of response.output) {
+    if (item.type !== 'message') continue
+    for (const part of item.content) {
+      if (part.type === 'refusal') {
+        console.error('Bill extraction refused:', part.refusal)
+        throw new AppError('This document could not be processed — enter the items manually', 422, 'EXTRACTION_FAILED')
+      }
+      if (part.type === 'output_text') text += part.text
+    }
+  }
   try {
     return extractionSchema.parse(JSON.parse(text))
   } catch {
@@ -335,7 +340,7 @@ export async function extractBill(organizationId: string, file: Express.Multer.F
     prisma.item.findMany({ where: { organizationId, isActive: true }, select: { id: true, code: true, name: true } }),
   ])
 
-  const raw = await callClaude(file, org?.name ?? 'Unknown', categories.map((c) => c.name))
+  const raw = await callModel(file, org?.name ?? 'Unknown', categories.map((c) => c.name))
   const warnings = [...raw.warnings]
 
   // ── Vendor → existing supplier ──
