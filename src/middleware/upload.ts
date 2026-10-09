@@ -22,7 +22,7 @@ const storage = multer.diskStorage({
   },
 })
 
-function fileFilter(_req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) {
+export function fileFilter(_req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) {
   if (!ALLOWED_MIME.has(file.mimetype)) {
     cb(new AppError('Only PDF, JPG, and PNG files are allowed', 400, 'INVALID_FILE_TYPE'))
     return

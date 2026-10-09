@@ -5,9 +5,10 @@ import multer from 'multer'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
-import { upload } from '../middleware/upload'
+import { upload, fileFilter } from '../middleware/upload'
 import { AppError } from '../middleware/error'
 import { createPurchaseBill, PurchaseItemInput } from '../services/purchasing'
+import { extractBill, isBillExtractionEnabled } from '../services/billExtraction'
 import { parseImportFile, sendImportTemplate, assertRecognizedColumns } from '../utils/importFile'
 import { logAudit } from '../utils/audit'
 import { assertBranchAccess, getBranchScope, BranchScope } from '../utils/branchScope'
@@ -158,6 +159,22 @@ router.post(
     }
   }
 )
+
+// ── Scan bill (auto-fill) ───────────────────────────────────────────────────
+// Reads an uploaded bill and returns a draft purchase for the New Purchase
+// form to pre-fill. Nothing is stored — the file is kept in memory only; the
+// form re-uploads it as the mandatory attachment when the user hits Apply.
+const extractUpload = multer({ storage: multer.memoryStorage(), fileFilter, limits: { fileSize: 10 * 1024 * 1024 } })
+
+router.get('/extract/status', requirePermission('can_create_purchasing_entry'), async (_req: Request, res: Response) => {
+  res.json({ enabled: isBillExtractionEnabled() })
+})
+
+router.post('/extract', requirePermission('can_create_purchasing_entry'), extractUpload.single('file'), async (req: Request, res: Response) => {
+  if (!req.file) throw new AppError('Upload the bill as a PDF, JPG or PNG', 400, 'VALIDATION_ERROR')
+  const result = await extractBill(req.user.organizationId, req.file)
+  res.json(result)
+})
 
 // ── Bulk import (CSV/Excel) ─────────────────────────────────────────────────
 // Each row is one purchase with a single line item — the common shape for a

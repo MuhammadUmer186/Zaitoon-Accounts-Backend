@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
 import { ZodError } from 'zod'
+import { MulterError } from 'multer'
 
 export class AppError extends Error {
   constructor(
@@ -31,6 +32,14 @@ export function errorHandler(
       message: err.errors[0]?.message ?? 'Validation error',
       code: 'VALIDATION_ERROR',
       errors: err.errors,
+    })
+    return
+  }
+
+  if (err instanceof MulterError) {
+    res.status(400).json({
+      message: err.code === 'LIMIT_FILE_SIZE' ? 'File is too large (max 10MB)' : err.message,
+      code: 'INVALID_FILE',
     })
     return
   }
