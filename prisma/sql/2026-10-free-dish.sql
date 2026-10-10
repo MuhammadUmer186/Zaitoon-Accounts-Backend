@@ -65,3 +65,27 @@ DO $$ BEGIN
     ALTER TABLE "FreeDishSubmission" ADD CONSTRAINT "FreeDishSubmission_qrId_fkey" FOREIGN KEY ("qrId") REFERENCES "FreeDishQr"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
   END IF;
 END $$;
+
+-- Free items list (which dish a QR code gives away)
+CREATE TABLE IF NOT EXISTS "FreeDishItem" (
+    "id" TEXT NOT NULL,
+    "organizationId" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "description" TEXT,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "FreeDishItem_pkey" PRIMARY KEY ("id")
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "FreeDishItem_organizationId_name_key" ON "FreeDishItem"("organizationId", "name");
+
+ALTER TABLE "FreeDishQr" ADD COLUMN IF NOT EXISTS "itemId" TEXT;
+ALTER TABLE "FreeDishQr" ADD COLUMN IF NOT EXISTS "quantity" INTEGER NOT NULL DEFAULT 1;
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'FreeDishQr_itemId_fkey') THEN
+    ALTER TABLE "FreeDishQr" ADD CONSTRAINT "FreeDishQr_itemId_fkey" FOREIGN KEY ("itemId") REFERENCES "FreeDishItem"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+  END IF;
+END $$;

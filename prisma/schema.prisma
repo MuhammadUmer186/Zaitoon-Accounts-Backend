@@ -1019,7 +1019,9 @@ model FreeDishQr {
   branchId         String
   sectionId        String
   name             String
-  offer            String               @default("Free dish")
+  offer            String               @default("Free dish") // legacy free-text label; itemId + quantity define the offer
+  itemId           String?
+  quantity         Int                  @default(1)
   token            String               @unique // in the public form URL
   isActive         Boolean              @default(true)
   voucherValidDays Int? // null = vouchers never expire
@@ -1028,9 +1030,24 @@ model FreeDishQr {
   updatedAt        DateTime             @updatedAt
   branch           Branch               @relation(fields: [branchId], references: [id])
   section          BranchSection        @relation(fields: [sectionId], references: [id])
+  item             FreeDishItem?        @relation(fields: [itemId], references: [id])
   submissions      FreeDishSubmission[]
 
   @@index([organizationId])
+}
+
+// The dishes that can be given free (Kunafa, Chicken Shawarma, ...)
+model FreeDishItem {
+  id             String       @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  qrs            FreeDishQr[]
+
+  @@unique([organizationId, name])
 }
 
 model FreeDishSubmission {

@@ -44,8 +44,14 @@ export function extractVoucherCode(input: string): string | null {
 const branchShortName = (name: string) => name.replace(/^zaitoon\s+/i, '').trim() || name
 export const voucherStatement = (branch: string, section: string) => `Go to Zaitoon ${branchShortName(branch)} Branch's ${section} section`
 
-type VoucherWithQr = Prisma.FreeDishSubmissionGetPayload<{ include: { qr: { include: { branch: { select: { name: true } }; section: { select: { name: true } } } } } }>
-const voucherInclude = { qr: { include: { branch: { select: { name: true } }, section: { select: { name: true } } } } } as const
+// What is given away: "Free Kunafa" / "Free 2 × Kunafa" from the QR's free
+// item; QR codes created before free items existed keep their typed label.
+type OfferSource = { offer: string; quantity: number; item?: { name: string } | null }
+export const offerLabel = (q: OfferSource) => (q.item ? `Free ${q.quantity > 1 ? `${q.quantity} × ` : ''}${q.item.name}` : q.offer)
+const itemOf = (q: OfferSource) => ({ itemName: q.item?.name ?? null, quantity: q.quantity })
+
+type VoucherWithQr = Prisma.FreeDishSubmissionGetPayload<{ include: { qr: { include: { branch: { select: { name: true } }; section: { select: { name: true } }; item: { select: { name: true } } } } } }>
+const voucherInclude = { qr: { include: { branch: { select: { name: true } }, section: { select: { name: true } }, item: { select: { name: true } } } } } as const
 
 const isExpired = (v: { expiresAt: Date | null }) => !!v.expiresAt && v.expiresAt < new Date()
 const voucherState = (v: VoucherWithQr) => (v.status === 'redeemed' ? 'redeemed' : isExpired(v) ? 'expired' : 'valid')
@@ -55,7 +61,8 @@ function publicVoucher(v: VoucherWithQr) {
   return {
     code: v.voucherCode,
     firstName: v.name.trim().split(/\s+/)[0],
-    offer: v.qr.offer,
+    offer: offerLabel(v.qr),
+    ...itemOf(v.qr),
     branchName: v.qr.branch.name,
     sectionName: v.qr.section.name,
     statement: voucherStatement(v.qr.branch.name, v.qr.section.name),
@@ -88,7 +95,7 @@ setInterval(() => {
 async function loadActiveQr(token: string) {
   const qr = await prisma.freeDishQr.findUnique({
     where: { token },
-    include: { branch: { select: { name: true, isActive: true } }, section: { select: { name: true } } },
+    include: { branch: { select: { name: true, isActive: true } }, section: { select: { name: true } }, item: { select: { name: true } } },
   })
   if (!qr) throw new AppError('This QR code is not valid', 404, 'NOT_FOUND')
   if (!qr.isActive || !qr.branch.isActive) throw new AppError('This offer is no longer available', 410, 'OFFER_CLOSED')
@@ -97,7 +104,7 @@ async function loadActiveQr(token: string) {
 
 publicFreeDishRouter.get('/qr/:token', async (req: Request, res: Response) => {
   const qr = await loadActiveQr(req.params.token)
-  res.json({ offer: qr.offer, branchName: qr.branch.name, sectionName: qr.section.name, statement: voucherStatement(qr.branch.name, qr.section.name) })
+  res.json({ offer: offerLabel(qr), ...itemOf(qr), branchName: qr.branch.name, sectionName: qr.section.name, statement: voucherStatement(qr.branch.name, qr.section.name) })
 })
 
 const submitSchema = z.object({
@@ -198,10 +205,65 @@ router.post('/sections', requirePermission(PERM_MANAGE), async (req: Request, re
   res.status(201).json({ id: section.id, name: section.name, branchId: branch.id, branchName: branch.name })
 })
 
+// ── Free items (the dishes a QR code can give away)
+router.get('/items', requireAnyPermission(PERM_MANAGE, PERM_REDEEM), async (req: Request, res: Response) => {
+  const items = await prisma.freeDishItem.findMany({
+    where: { organizationId: req.user.organizationId },
+    include: { _count: { select: { qrs: true } } },
+    orderBy: [{ isActive: 'desc' }, { name: 'asc' }],
+  })
+  res.json({ data: items.map((i) => ({ id: i.id, name: i.name, description: i.description, isActive: i.isActive, qrCount: i._count.qrs })) })
+})
+
+const itemSchema = z.object({
+  name: z.string().trim().min(1, 'Enter the item name').max(80),
+  description: z.string().trim().max(200).optional().nullable(),
+  isActive: z.boolean().optional(),
+})
+
+const uniqueName = (err: unknown) => {
+  if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') throw new AppError('An item with this name already exists', 409, 'DUPLICATE')
+  throw err
+}
+
+router.post('/items', requirePermission(PERM_MANAGE), async (req: Request, res: Response) => {
+  const body = itemSchema.parse(req.body)
+  const item = await prisma.freeDishItem.create({
+    data: { organizationId: req.user.organizationId, name: body.name, description: body.description || null, isActive: body.isActive ?? true },
+  }).catch(uniqueName)
+  await logAudit(prisma, { req, action: 'free_dish.item_created', module: 'free_dish', resourceType: 'FreeDishItem', resourceId: item.id, resourceRef: item.name })
+  res.status(201).json({ id: item.id, name: item.name, description: item.description, isActive: item.isActive, qrCount: 0 })
+})
+
+router.put('/items/:id', requirePermission(PERM_MANAGE), async (req: Request, res: Response) => {
+  const item = await prisma.freeDishItem.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
+  if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
+  const body = itemSchema.parse(req.body)
+  await prisma.freeDishItem.update({
+    where: { id: item.id },
+    data: { name: body.name, description: body.description || null, isActive: body.isActive ?? item.isActive },
+  }).catch(uniqueName)
+  await logAudit(prisma, { req, action: 'free_dish.item_updated', module: 'free_dish', resourceType: 'FreeDishItem', resourceId: item.id, resourceRef: body.name })
+  res.json({ success: true })
+})
+
+router.delete('/items/:id', requirePermission(PERM_MANAGE), async (req: Request, res: Response) => {
+  const item = await prisma.freeDishItem.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId }, include: { _count: { select: { qrs: true } } } })
+  if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
+  if (item._count.qrs > 0) {
+    await prisma.freeDishItem.update({ where: { id: item.id }, data: { isActive: false } })
+    return res.json({ message: `"${item.name}" switched off (QR codes use it)` })
+  }
+  await prisma.freeDishItem.delete({ where: { id: item.id } })
+  await logAudit(prisma, { req, action: 'free_dish.item_deleted', module: 'free_dish', resourceType: 'FreeDishItem', resourceId: item.id, resourceRef: item.name })
+  res.json({ message: 'Item deleted' })
+})
+
 // ── QR codes
 const qrInclude = {
   branch: { select: { name: true } },
   section: { select: { name: true } },
+  item: { select: { name: true } },
   _count: { select: { submissions: true } },
 } as const
 
@@ -218,7 +280,7 @@ router.get('/qr-codes', requirePermission(PERM_MANAGE), async (req: Request, res
   const redeemedBy = new Map(redeemed.map((r) => [r.qrId, r._count]))
   res.json({
     data: qrs.map((q) => ({
-      id: q.id, name: q.name, offer: q.offer, token: q.token, isActive: q.isActive, voucherValidDays: q.voucherValidDays,
+      id: q.id, name: q.name, offer: offerLabel(q), itemId: q.itemId, ...itemOf(q), token: q.token, isActive: q.isActive, voucherValidDays: q.voucherValidDays,
       branchId: q.branchId, branchName: q.branch.name, sectionId: q.sectionId, sectionName: q.section.name,
       statement: voucherStatement(q.branch.name, q.section.name),
       submissions: q._count.submissions, redeemed: redeemedBy.get(q.id) ?? 0, createdAt: q.createdAt,
@@ -228,12 +290,19 @@ router.get('/qr-codes', requirePermission(PERM_MANAGE), async (req: Request, res
 
 const qrSchema = z.object({
   name: z.string().trim().min(1).max(120),
-  offer: z.string().trim().min(1).max(120).default('Free dish'),
+  itemId: z.string().min(1, 'Choose the free item'),
+  quantity: z.number().int().min(1).max(20).default(1),
   branchId: z.string().min(1),
   sectionId: z.string().min(1),
   voucherValidDays: z.number().int().min(1).max(365).nullable().optional(),
   isActive: z.boolean().optional(),
 })
+
+async function checkItem(req: Request, itemId: string) {
+  const item = await prisma.freeDishItem.findFirst({ where: { id: itemId, organizationId: req.user.organizationId } })
+  if (!item) throw new AppError('Choose the free item', 400, 'VALIDATION_ERROR')
+  return item
+}
 
 async function checkSection(req: Request, branchId: string, sectionId: string) {
   await assertBranchAccess(req, branchId)
@@ -244,9 +313,12 @@ async function checkSection(req: Request, branchId: string, sectionId: string) {
 router.post('/qr-codes', requirePermission(PERM_MANAGE), async (req: Request, res: Response) => {
   const body = qrSchema.parse(req.body)
   await checkSection(req, body.branchId, body.sectionId)
+  const item = await checkItem(req, body.itemId)
+  if (!item.isActive) throw new AppError(`"${item.name}" is switched off — switch it on under Free items first`, 400, 'ITEM_INACTIVE')
   const qr = await prisma.freeDishQr.create({
     data: {
-      organizationId: req.user.organizationId, branchId: body.branchId, sectionId: body.sectionId, name: body.name, offer: body.offer,
+      organizationId: req.user.organizationId, branchId: body.branchId, sectionId: body.sectionId, name: body.name,
+      itemId: item.id, quantity: body.quantity, offer: offerLabel({ offer: '', quantity: body.quantity, item }),
       voucherValidDays: body.voucherValidDays ?? null, isActive: body.isActive ?? true, token: newQrToken(), createdBy: req.user.id,
     },
   })
@@ -260,13 +332,18 @@ router.put('/qr-codes/:id', requirePermission(PERM_MANAGE), async (req: Request,
   await assertBranchAccess(req, qr.branchId)
   const body = qrSchema.parse(req.body)
   await checkSection(req, body.branchId, body.sectionId)
+  const item = await checkItem(req, body.itemId)
   const used = await prisma.freeDishSubmission.count({ where: { qrId: qr.id } })
   if (used > 0 && (body.branchId !== qr.branchId || body.sectionId !== qr.sectionId)) {
     throw new AppError('Guests already have vouchers for this section — create a new QR code for a different section', 400, 'QR_IN_USE')
   }
+  // Issued vouchers promise this item; a QR from before free items existed may pick its first one
+  if (used > 0 && qr.itemId && (body.itemId !== qr.itemId || body.quantity !== qr.quantity)) {
+    throw new AppError('Guests already have vouchers for this item — create a new QR code to offer a different item', 400, 'QR_IN_USE')
+  }
   await prisma.freeDishQr.update({
     where: { id: qr.id },
-    data: { name: body.name, offer: body.offer, branchId: body.branchId, sectionId: body.sectionId, voucherValidDays: body.voucherValidDays ?? null, isActive: body.isActive ?? qr.isActive },
+    data: { name: body.name, itemId: item.id, quantity: body.quantity, offer: offerLabel({ offer: '', quantity: body.quantity, item }), branchId: body.branchId, sectionId: body.sectionId, voucherValidDays: body.voucherValidDays ?? null, isActive: body.isActive ?? qr.isActive },
   })
   await logAudit(prisma, { req, action: 'free_dish.qr_updated', module: 'free_dish', resourceType: 'FreeDishQr', resourceId: qr.id, resourceRef: body.name, branchId: body.branchId })
   res.json({ success: true })
@@ -320,11 +397,11 @@ router.get('/submissions', requirePermission(PERM_MANAGE), async (req: Request, 
     }),
   }
 
-  const include = { qr: { select: { name: true, offer: true, branch: { select: { name: true } }, section: { select: { name: true } } } } } as const
+  const include = { qr: { select: { name: true, offer: true, quantity: true, item: { select: { name: true } }, branch: { select: { name: true } }, section: { select: { name: true } } } } } as const
   const shape = (s: Prisma.FreeDishSubmissionGetPayload<{ include: typeof include }>) => ({
     id: s.id, name: s.name, whatsapp: s.whatsapp, country: s.country, dateOfBirth: s.dateOfBirth, email: s.email,
     voucherCode: s.voucherCode, state: s.status === 'redeemed' ? 'redeemed' : isExpired(s) ? 'expired' : 'issued',
-    qrName: s.qr.name, offer: s.qr.offer, branchName: s.qr.branch.name, sectionName: s.qr.section.name,
+    qrName: s.qr.name, offer: offerLabel(s.qr), branchName: s.qr.branch.name, sectionName: s.qr.section.name,
     createdAt: s.createdAt, redeemedAt: s.redeemedAt, expiresAt: s.expiresAt,
   })
 
@@ -356,6 +433,7 @@ router.get('/submissions', requirePermission(PERM_MANAGE), async (req: Request, 
           { key: 'dateOfBirth', label: 'Date of birth', format: 'date', width: 1 },
           { key: 'email', label: 'Email', width: 1.9 },
           { key: 'where', label: 'Branch / Section', width: 1.6 },
+          { key: 'offer', label: 'Free item', width: 1.3 },
           { key: 'status', label: 'Status', width: 0.8 },
           { key: 'redeemedAt', label: 'Given on', format: 'datetime', width: 1.25 },
         ],
@@ -411,7 +489,8 @@ async function staffView(req: Request, v: VoucherWithQr) {
     email: v.email,
     country: v.country,
     dateOfBirth: v.dateOfBirth,
-    offer: v.qr.offer,
+    offer: offerLabel(v.qr),
+    ...itemOf(v.qr),
     qrName: v.qr.name,
     branchId: v.branchId,
     branchName: v.qr.branch.name,
