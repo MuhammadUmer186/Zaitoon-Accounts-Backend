@@ -4,6 +4,7 @@ import { config, prisma } from './config'
 import { bootstrapSuperAdmin } from './utils/bootstrapSuperAdmin'
 import { startRecurringJournalRunner } from './routes/recurringJournals'
 import { normalizeAccounts } from './utils/normalizeAccounts'
+import { ensurePermissions } from './utils/ensurePermissions'
 
 async function main() {
   try {
@@ -12,6 +13,7 @@ async function main() {
 
     await bootstrapSuperAdmin(prisma)
     await normalizeAccounts(prisma)
+    await ensurePermissions(prisma)
     // Posts due recurring journal entries (on start, then hourly)
     startRecurringJournalRunner()
 

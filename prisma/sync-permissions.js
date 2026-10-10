@@ -69,6 +69,9 @@ const permissionsData = [
   { key: 'manual_journals_create', module: 'accounts', description: 'Create manual journal entries' },
   { key: 'manual_journals_post', module: 'accounts', description: 'Post manual journal entries' },
   { key: 'journals_reverse', module: 'accounts', description: 'Reverse posted journal entries' },
+  // Free Dish
+  { key: 'free_dish_manage', module: 'free_dish', description: 'Free Dish: create section QR codes and view guest registrations' },
+  { key: 'free_dish_redeem', module: 'free_dish', description: 'Free Dish: scan guest vouchers and give the free dish' },
 ]
 
 const accountantPerms = [
@@ -94,6 +97,7 @@ const managerPerms = [
   'can_view_approvals', 'can_view_alerts',
   'can_view_reports',
   'accounts_view', 'accounts_view_ledger',
+  'free_dish_manage', 'free_dish_redeem',
 ]
 
 const cashierPerms = [
@@ -102,6 +106,7 @@ const cashierPerms = [
   'can_create_expense',
   'can_create_purchase_order', 'can_create_purchasing_entry',
   'accounts_view',
+  'free_dish_redeem',
 ]
 
 // Store Keeper: Purchasing + Inventory (incl. branch-to-branch transfers),

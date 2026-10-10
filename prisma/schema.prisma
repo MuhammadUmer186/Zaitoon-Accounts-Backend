@@ -85,6 +85,8 @@ model Branch {
   stockOutsFrom  StockOut[]         @relation("StockOutFrom")
   stockOutsTo    StockOut[]         @relation("StockOutTo")
 
+  freeDishQrs FreeDishQr[]
+
   @@unique([organizationId, code])
 }
 
@@ -766,16 +768,17 @@ model StockMovement {
 // A consumption point inside a branch (e.g. Juices, Broast, Kitchen) that
 // store stock is issued to via Stock Out.
 model BranchSection {
-  id             String     @id @default(cuid())
+  id             String       @id @default(cuid())
   organizationId String
   branchId       String
   name           String
   description    String?
-  isActive       Boolean    @default(true)
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
-  branch         Branch     @relation(fields: [branchId], references: [id])
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  branch         Branch       @relation(fields: [branchId], references: [id])
   stockOuts      StockOut[]
+  freeDishQrs    FreeDishQr[]
 
   @@unique([branchId, name])
 }
@@ -1005,4 +1008,54 @@ model RecurringJournal {
   updatedAt      DateTime  @updatedAt
 
   @@index([organizationId, isActive, nextRunDate])
+}
+
+// Free Dish: a QR code placed in a restaurant section. Guests scan it, fill a
+// bio-data form (public page) and receive a personal voucher QR, which staff
+// scan at that section to hand over the free dish — once per voucher.
+model FreeDishQr {
+  id               String               @id @default(cuid())
+  organizationId   String
+  branchId         String
+  sectionId        String
+  name             String
+  offer            String               @default("Free dish")
+  token            String               @unique // in the public form URL
+  isActive         Boolean              @default(true)
+  voucherValidDays Int? // null = vouchers never expire
+  createdBy        String
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+  branch           Branch               @relation(fields: [branchId], references: [id])
+  section          BranchSection        @relation(fields: [sectionId], references: [id])
+  submissions      FreeDishSubmission[]
+
+  @@index([organizationId])
+}
+
+model FreeDishSubmission {
+  id             String     @id @default(cuid())
+  organizationId String
+  qrId           String
+  branchId       String
+  sectionId      String
+  name           String
+  whatsapp       String // E.164, e.g. +966501234567
+  country        String // ISO 3166-1 alpha-2
+  dateOfBirth    DateTime
+  email          String // lower-case
+  voucherCode    String     @unique // encoded in the guest's voucher QR
+  status         String     @default("issued") // issued | redeemed
+  expiresAt      DateTime?
+  redeemedAt     DateTime?
+  redeemedBy     String?
+  ipAddress      String?
+  createdAt      DateTime   @default(now())
+  qr             FreeDishQr @relation(fields: [qrId], references: [id])
+
+  // one voucher per WhatsApp number and per email address for each QR code
+  @@unique([qrId, whatsapp])
+  @@unique([qrId, email])
+  @@index([organizationId, createdAt])
+  @@index([branchId, status])
 }

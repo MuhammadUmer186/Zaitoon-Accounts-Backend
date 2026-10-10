@@ -28,6 +28,7 @@ import backupRouter from './backup'
 import bankReconciliationRouter from './bankReconciliation'
 import fixedAssetsRouter from './fixedAssets'
 import recurringJournalsRouter from './recurringJournals'
+import freeDishRouter, { publicFreeDishRouter } from './freeDish'
 
 const router = Router()
 
@@ -64,5 +65,8 @@ router.use('/backup', backupRouter)
 router.use('/bank-reconciliation', bankReconciliationRouter)
 router.use('/fixed-assets', fixedAssetsRouter)
 router.use('/recurring-journals', recurringJournalsRouter)
+router.use('/free-dish', freeDishRouter)
+// Guest-facing Free Dish form and voucher — no login
+router.use('/public/free-dish', publicFreeDishRouter)
 
 export default router

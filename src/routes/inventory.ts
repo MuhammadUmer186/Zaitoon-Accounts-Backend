@@ -338,10 +338,13 @@ router.delete('/sections/:id', requireAnyPermission('can_manage_inventory'), asy
   const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
   if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, section.branchId)
-  const inUse = await prisma.stockOut.count({ where: { sectionId: section.id } })
-  if (inUse > 0) {
+  const [inUse, freeDishQrs] = await Promise.all([
+    prisma.stockOut.count({ where: { sectionId: section.id } }),
+    prisma.freeDishQr.count({ where: { sectionId: section.id } }),
+  ])
+  if (inUse > 0 || freeDishQrs > 0) {
     await prisma.branchSection.update({ where: { id: section.id }, data: { isActive: false } })
-    return res.json({ message: 'Section deactivated (has stock out history)' })
+    return res.json({ message: `Section deactivated (${inUse > 0 ? 'has stock out history' : 'used by Free Dish QR codes'})` })
   }
   await prisma.branchSection.delete({ where: { id: section.id } })
   res.json({ message: 'Section deleted' })

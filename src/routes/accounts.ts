@@ -14,7 +14,7 @@ import { fiscalYearStartFor } from '../utils/fiscalYear'
 import {
   normalBalanceForClass, assertUniqueCode, assertValidParent, assertNoControlManualPostingConflict,
 } from '../services/accounts'
-import { tryExportRows, sendRowsCsv, sendRowsExcel, sendRowsPdf } from '../utils/genericExport'
+import { ProReport, ReportRow, sendProReport, reportScope, asAtLine, fmtDateShort, round2 } from '../utils/proReport'
 import { parseImportFile, sendImportTemplate, assertRecognizedColumns } from '../utils/importFile'
 
 const router = Router()
@@ -59,35 +59,83 @@ async function fetchAllForExport(organizationId: string, filters: Record<string,
   })
 }
 
+// Chart of Accounts report in the shared Xero-style template (PDF / Excel /
+// CSV): accounts grouped by class with tax rate, current balance and YTD.
 router.get('/export/:format', requirePermission('accounts_export'), async (req: Request, res: Response) => {
   const { format } = req.params
   const { accountClass, status } = req.query as Record<string, string>
   const orgId = req.user.organizationId
+  if (!['csv', 'xlsx', 'pdf'].includes(format)) throw new AppError('Unsupported export format', 400, 'VALIDATION_ERROR')
 
   const filters: Record<string, unknown> = {}
   if (accountClass) filters.accountClass = accountClass
   if (status) filters.status = status
 
-  const accounts = await fetchAllForExport(orgId, filters)
+  const now = new Date()
+  const [accounts, org, scope] = await Promise.all([
+    fetchAllForExport(orgId, filters),
+    prisma.organization.findUnique({ where: { id: orgId }, select: { fiscalYearStart: true } }),
+    reportScope(prisma, orgId),
+  ])
+  const fyStart = fiscalYearStartFor(now, org?.fiscalYearStart ?? '01-01')
   const accountIds = accounts.map((a) => a.id)
-  const balances = await computeAccountBalances(prisma, orgId, accountIds)
+  const [balances, ytd] = await Promise.all([
+    computeAccountBalances(prisma, orgId, accountIds),
+    computeAccountBalances(prisma, orgId, accountIds, { fromDate: fyStart, toDate: now }),
+  ])
 
-  const rows = accounts.map((a) => ({
-    code: a.code,
-    name: a.name,
-    accountClass: a.accountClass,
-    reportingGroup: a.reportingGroup ?? '',
-    taxRate: a.taxRate ? `${a.taxRate.name} (${a.taxRate.rate}%)` : '',
-    balance: (balances.get(a.id)?.balance ?? 0).toFixed(2),
-    status: a.status,
-  }))
+  const archived = status === 'ARCHIVED'
+  const rows: ReportRow[] = []
+  for (const [cls, heading] of [['ASSET', 'Assets'], ['LIABILITY', 'Liabilities'], ['EQUITY', 'Equity'], ['REVENUE', 'Revenue'], ['EXPENSE', 'Expenses']] as const) {
+    const list = accounts.filter((a) => a.accountClass === cls)
+    if (list.length === 0) continue
+    rows.push({ name: heading, _style: 'heading' })
+    for (const a of list) {
+      rows.push({
+        code: a.code,
+        name: a.name,
+        group: a.isControlAccount ? 'Header account' : a.reportingGroup ?? '',
+        taxRate: a.taxRate ? `${a.taxRate.name} (${a.taxRate.rate}%)` : '',
+        balance: round2(balances.get(a.id)?.balance ?? 0),
+        ytd: round2(ytd.get(a.id)?.balance ?? 0),
+        ...(archived && { status: 'Archived' }),
+      })
+    }
+  }
 
-  await logAudit(prisma, { req, action: 'accounts.exported', module: 'accounts', resourceType: 'account_export', newData: { format, count: rows.length } })
+  const classLabel: Record<string, string> = { ASSET: 'Assets', LIABILITY: 'Liabilities', EQUITY: 'Equity', REVENUE: 'Revenue', EXPENSE: 'Expenses' }
+  const report: ProReport = {
+    key: 'chart-of-accounts',
+    title: 'Chart of Accounts',
+    eyebrow: 'Chart of Accounts',
+    headline: 'Chart of accounts',
+    summaryLine: '',
+    ...scope,
+    periodLabel: `As at ${fmtDateShort(now)}`,
+    dateLine: `${asAtLine(now)}${accountClass ? ` · ${classLabel[accountClass] ?? accountClass}` : ''}${archived ? ' · Archived accounts' : ''}`,
+    generatedAt: now.toISOString(),
+    kpis: [],
+    sections: [{
+      type: 'table', id: 'accounts', title: 'Chart of Accounts', hideTitle: true, primary: true,
+      columns: [
+        { key: 'code', label: 'Code', format: 'code', width: 0.7 },
+        { key: 'name', label: 'Account', width: 2.4 },
+        { key: 'group', label: 'Reporting Group', width: 1.8 },
+        { key: 'taxRate', label: 'Default Tax', width: 1 },
+        { key: 'balance', label: 'Current Balance', format: 'money', width: 1.2 },
+        { key: 'ytd', label: 'YTD', format: 'money', width: 1.1 },
+        ...(archived ? [{ key: 'status', label: 'Status', width: 0.8 }] : []),
+      ],
+      rows,
+      emptyMessage: 'No accounts',
+    }, {
+      type: 'note', id: 'basis', title: 'Notes',
+      text: `${accounts.length} account${accounts.length === 1 ? '' : 's'}. Balances are from posted journal entries; YTD is since the fiscal year start (${fmtDateShort(fyStart)}). Header accounts group the accounts below them and do not take postings.`,
+    }],
+  }
 
-  if (format === 'csv') { sendRowsCsv(res, rows, 'chart-of-accounts'); return }
-  if (format === 'xlsx') { await sendRowsExcel(res, rows, 'chart-of-accounts', 'Chart of Accounts'); return }
-  if (format === 'pdf') { sendRowsPdf(res, rows, 'chart-of-accounts', 'Chart of Accounts'); return }
-  throw new AppError('Unsupported export format', 400, 'VALIDATION_ERROR')
+  await logAudit(prisma, { req, action: 'accounts.exported', module: 'accounts', resourceType: 'account_export', newData: { format, count: accounts.length } })
+  await sendProReport(res, format === 'xlsx' ? 'excel' : format, report)
 })
 
 // ── Import (must come before /:id) ─────────────────────────────────────────
