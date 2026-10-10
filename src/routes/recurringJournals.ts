@@ -25,6 +25,8 @@ const FREQUENCIES = ['weekly', 'monthly', 'quarterly', 'yearly'] as const
 type Frequency = (typeof FREQUENCIES)[number]
 const MAX_CATCH_UP = 36 // occurrences posted per template per run
 const ymd = (d: Date) => d.toISOString().slice(0, 10)
+// The end date is inclusive: an occurrence on that day still posts (dates carry a time of day)
+const pastEnd = (date: Date, endDate: Date | null) => !!endDate && ymd(date) > ymd(endDate)
 const round2 = (n: number) => Math.round(n * 100) / 100
 
 interface TemplateLine { accountId: string; description?: string; debitAmount: number; creditAmount: number }
@@ -59,7 +61,7 @@ async function postOccurrence(db: PrismaClient, t: RecurringJournal, userId: str
     })
     const runCount = t.runCount + 1
     const next = occurrenceDate(t.startDate, t.frequency as Frequency, runCount)
-    const finished = !!t.endDate && next > t.endDate
+    const finished = pastEnd(next, t.endDate)
     await tx.recurringJournal.update({
       where: { id: t.id },
       data: { runCount, nextRunDate: next, lastRunAt: new Date(), lastError: null, ...(finished && { isActive: false }) },
@@ -81,7 +83,7 @@ export async function runDueRecurringJournals(db: PrismaClient = prisma, organiz
   const failed: { id: string; name: string; message: string }[] = []
   for (let t of due) {
     for (let i = 0; i < MAX_CATCH_UP && t.isActive && t.nextRunDate <= now; i++) {
-      if (t.endDate && t.nextRunDate > t.endDate) {
+      if (pastEnd(t.nextRunDate, t.endDate)) {
         await db.recurringJournal.update({ where: { id: t.id }, data: { isActive: false } })
         break
       }
@@ -254,7 +256,7 @@ router.put('/:id', WRITE, async (req: Request, res: Response) => {
 router.patch('/:id/active', WRITE, async (req: Request, res: Response) => {
   const t = await loadTemplate(req, req.params.id)
   const { isActive } = z.object({ isActive: z.boolean() }).parse(req.body)
-  if (isActive && t.endDate && t.nextRunDate > t.endDate) throw new AppError('This entry has passed its end date — extend the end date first', 400, 'VALIDATION_ERROR')
+  if (isActive && pastEnd(t.nextRunDate, t.endDate)) throw new AppError('This entry has passed its end date — extend the end date first', 400, 'VALIDATION_ERROR')
   await prisma.recurringJournal.update({ where: { id: t.id }, data: { isActive, ...(isActive && { lastError: null }) } })
   await logAudit(prisma, { req, action: isActive ? 'recurring_journal.resumed' : 'recurring_journal.paused', module: 'accounting', resourceType: 'RecurringJournal', resourceId: t.id, resourceRef: t.name })
   res.json({ success: true })
@@ -265,7 +267,7 @@ router.patch('/:id/active', WRITE, async (req: Request, res: Response) => {
 router.post('/:id/post-now', WRITE, async (req: Request, res: Response) => {
   const t = await loadTemplate(req, req.params.id)
   if (!t.isActive) throw new AppError('Resume this recurring entry first', 400, 'INVALID_STATUS')
-  if (t.endDate && t.nextRunDate > t.endDate) throw new AppError('This entry has passed its end date', 400, 'INVALID_STATUS')
+  if (pastEnd(t.nextRunDate, t.endDate)) throw new AppError('This entry has passed its end date', 400, 'INVALID_STATUS')
   const now = new Date()
   try {
     const result = await postOccurrence(prisma, t, req.user.id, t.nextRunDate > now ? now : undefined)

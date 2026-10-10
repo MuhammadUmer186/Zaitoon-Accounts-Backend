@@ -3,8 +3,9 @@ import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { scopeReportBranch } from '../utils/branchScope'
 import { requireAnyPermission, requireExportPermission } from '../middleware/authorize'
-import { sendGeneralLedgerCsv, sendGeneralLedgerExcel, sendGeneralLedgerPdf, GLReportData, GLReportAccount, GLReportLine } from '../utils/glReport'
+import { ProReport, ReportRow, ReportColumn, sendProReport, reportScope, dateLineFor, asAtLine, periodLabelFor, round2 } from '../utils/proReport'
 import { getEverStockedKeys, isNeverStocked } from '../utils/stock'
+import { fiscalYearStartFor } from '../utils/fiscalYear'
 
 const router = Router()
 
@@ -14,7 +15,7 @@ router.use(requireExportPermission)
 
 // GET /reports/dashboard
 router.get('/dashboard', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
-  const { branchId } = req.query as { branchId?: string }
+  const { branchId, format } = req.query as { branchId?: string; format?: string }
   const orgId = req.user.organizationId
 
   const now = new Date()
@@ -177,7 +178,7 @@ router.get('/dashboard', requireAnyPermission('can_view_reports'), async (req: R
     })
   )
 
-  res.json({
+  const legacy = {
     totalSalesToday: todaySales._sum.netAmount ?? 0,
     totalSalesMonth: monthSales._sum.netAmount ?? 0,
     totalExpensesToday: todayExpenses._sum.totalAmount ?? 0,
@@ -188,7 +189,46 @@ router.get('/dashboard', requireAnyPermission('can_view_reports'), async (req: R
     lowStockItems: lowStockCount,
     branchSales,
     recentActivity,
-  })
+  }
+
+  const branchRows: ReportRow[] = branchSales.map((b) => ({ branch: b.branchName, today: round2(b.today), week: round2(b.thisWeek), month: round2(b.thisMonth) }))
+  const sumKey = (k: string) => round2(branchRows.reduce((acc, r) => acc + (Number(r[k]) || 0), 0))
+  const report: ProReport = {
+    key: 'dashboard',
+    title: 'Dashboard Summary',
+    eyebrow: 'Dashboard Summary',
+    headline: 'Dashboard summary',
+    summaryLine: '',
+    ...(await reportScope(prisma, orgId, branchId || undefined)),
+    periodLabel: 'Today',
+    dateLine: asAtLine(now),
+    generatedAt: now.toISOString(),
+    kpis: [
+      { label: 'Sales today', value: round2(legacy.totalSalesToday), hint: 'Net sales' },
+      { label: 'Sales this month', value: round2(legacy.totalSalesMonth), hint: 'Net sales, month to date' },
+      { label: 'Expenses today', value: round2(legacy.totalExpensesToday) },
+      { label: 'Expenses this month', value: round2(legacy.totalExpensesMonth), hint: 'Month to date' },
+      { label: 'Cash position', value: round2(cashPosition), hint: 'Cash kept back at the latest approved closings' },
+      { label: 'Pending approvals', value: totalPendingApprovals, format: 'integer', hint: 'Sales, expenses and cash closings' },
+      { label: 'Overdue supplier bills', value: overdueBills, format: 'integer' },
+      { label: 'Low stock items', value: lowStockCount, format: 'integer' },
+    ],
+    sections: [
+      {
+        type: 'table', id: 'branches', title: 'Sales by Branch', primary: true,
+        columns: [{ key: 'branch', label: 'Branch', width: 2.4 }, { key: 'today', label: 'Today', format: 'money' }, { key: 'week', label: 'This Week', format: 'money' }, { key: 'month', label: 'This Month', format: 'money' }],
+        rows: branchRows,
+        totals: { branch: 'Total', today: sumKey('today'), week: sumKey('week'), month: sumKey('month') },
+      },
+      {
+        type: 'table', id: 'activity', title: 'Recent Activity',
+        columns: [{ key: 'date', label: 'Date', format: 'datetime', width: 1.3 }, { key: 'description', label: 'Activity', width: 2.6 }, { key: 'module', label: 'Module', width: 1 }, { key: 'user', label: 'User', width: 1.6 }],
+        rows: recentActivity.map((a) => ({ date: a.createdAt, description: a.description, module: a.module, user: a.userEmail })),
+        emptyMessage: 'No recent activity',
+      },
+    ],
+  }
+  await sendProReport(res, format, report, legacy)
 })
 
 // GET /reports/financial
@@ -869,98 +909,134 @@ router.get('/sales', requireAnyPermission('can_view_reports'), async (req: Reque
   })
 })
 
-// GET /reports/general-ledger — the full posted ledger (Assets, Liabilities,
-// Revenue, Expenses — Equity is excluded from GL reporting), viewable on
-// screen (format omitted/json) or exported as csv / excel / pdf for
-// printing and record-keeping.
+// GET /reports/general-ledger — Xero-style General Ledger: per account an
+// opening balance (when a start date is set), every posted line with a
+// running balance, and a total line; ?format=pdf|excel|csv exports it.
+// Running balances are signed by account class (assets/expenses debit-positive,
+// everything else credit-positive).
 router.get('/general-ledger', requireAnyPermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, accountId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
+  const toEnd = toDate ? new Date(toDate) : undefined
+  if (toEnd && /^\d{4}-\d{2}-\d{2}$/.test(toDate)) toEnd.setUTCHours(23, 59, 59, 999)
 
-  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
-  if (branchId) entryWhere.branchId = branchId
-  if (fromDate || toDate) {
-    entryWhere.entryDate = {
-      ...(fromDate && { gte: new Date(fromDate) }),
-      ...(toDate && { lte: new Date(toDate) }),
-    }
-  }
+  const base: Record<string, unknown> = { organizationId: orgId, status: 'posted', ...(branchId && { branchId }) }
+  const entryWhere = { ...base, ...((fromDate || toEnd) && { entryDate: { ...(fromDate && { gte: new Date(fromDate) }), ...(toEnd && { lte: toEnd }) } }) }
 
-  const [accounts, branch] = await Promise.all([
-    prisma.account.findMany({
-      where: {
-        organizationId: orgId,
-        status: 'ACTIVE',
-        ...(accountId ? { id: accountId } : {}),
-      },
-      orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
-    }),
-    branchId ? prisma.branch.findUnique({ where: { id: branchId }, select: { name: true } }) : Promise.resolve(null),
-  ])
-
-  const lines = await prisma.journalLine.findMany({
-    where: { accountId: { in: accounts.map((a) => a.id) }, journalEntry: entryWhere },
-    include: {
-      journalEntry: {
-        select: { entryNo: true, entryDate: true, description: true, branch: { select: { name: true } } },
-      },
-    },
-    orderBy: [{ journalEntry: { entryDate: 'asc' } }, { journalEntry: { createdAt: 'asc' } }],
+  const accounts = await prisma.account.findMany({
+    where: { organizationId: orgId, status: 'ACTIVE', ...(accountId ? { id: accountId } : {}) },
+    orderBy: { code: 'asc' },
   })
+  const ids = accounts.map((a) => a.id)
 
+  // Opening balance: balance sheet accounts carry everything before the start
+  // date; income and expense accounts restart at the fiscal year start
+  const org = await prisma.organization.findUnique({ where: { id: orgId }, select: { fiscalYearStart: true } })
+  const fyStart = fromDate ? fiscalYearStartFor(new Date(fromDate), org?.fiscalYearStart ?? '01-01') : null
+  const pnlIds = accounts.filter((a) => a.accountClass === 'REVENUE' || a.accountClass === 'EXPENSE').map((a) => a.id)
+  const bsIds = ids.filter((id) => !pnlIds.includes(id))
+
+  const [lines, bsOpening, pnlOpening] = await Promise.all([
+    prisma.journalLine.findMany({
+      where: { accountId: { in: ids }, journalEntry: entryWhere },
+      include: { journalEntry: { select: { entryNo: true, entryDate: true, description: true, branch: { select: { name: true } } } } },
+      orderBy: [{ journalEntry: { entryDate: 'asc' } }, { journalEntry: { createdAt: 'asc' } }],
+    }),
+    fromDate
+      ? prisma.journalLine.groupBy({
+          by: ['accountId'],
+          where: { accountId: { in: bsIds }, journalEntry: { ...base, entryDate: { lt: new Date(fromDate) } } },
+          _sum: { debitAmount: true, creditAmount: true },
+        })
+      : Promise.resolve([]),
+    fromDate && fyStart
+      ? prisma.journalLine.groupBy({
+          by: ['accountId'],
+          where: { accountId: { in: pnlIds }, journalEntry: { ...base, entryDate: { gte: fyStart, lt: new Date(fromDate) } } },
+          _sum: { debitAmount: true, creditAmount: true },
+        })
+      : Promise.resolve([]),
+  ])
+  const openingGroups = [...bsOpening, ...pnlOpening]
+
+  const debitNatural = (cls: string) => cls === 'ASSET' || cls === 'EXPENSE'
+  const opening = new Map(openingGroups.map((g) => [g.accountId, { debit: Number(g._sum.debitAmount ?? 0), credit: Number(g._sum.creditAmount ?? 0) }]))
   const byAccount = new Map<string, typeof lines>()
   for (const l of lines) {
     if (!byAccount.has(l.accountId)) byAccount.set(l.accountId, [])
     byAccount.get(l.accountId)!.push(l)
   }
 
+  const showBranch = !branchId
+  const rows: ReportRow[] = []
+  const legacyAccounts: unknown[] = []
   let grandDebit = 0
   let grandCredit = 0
+  for (const acc of accounts) {
+    const accLines = byAccount.get(acc.id) ?? []
+    const o = opening.get(acc.id)
+    const sign = debitNatural(acc.accountClass) ? 1 : -1
+    const openingBalance = o ? round2(sign * (o.debit - o.credit)) : 0
+    if (accLines.length === 0 && Math.abs(openingBalance) < 0.005 && !accountId) continue
 
-  const accountSections: GLReportAccount[] = accounts
-    .map((acc) => {
-      const accLines = byAccount.get(acc.id) ?? []
-      let running = 0
-      const rows: GLReportLine[] = accLines.map((l) => {
-        const debit = Number(l.debitAmount)
-        const credit = Number(l.creditAmount)
-        running += acc.normalBalance === 'DEBIT' ? debit - credit : credit - debit
-        grandDebit += debit
-        grandCredit += credit
-        return {
-          date: l.journalEntry.entryDate,
-          entryNo: l.journalEntry.entryNo,
-          description: l.description || l.journalEntry.description,
-          branch: l.journalEntry.branch?.name ?? null,
-          debit,
-          credit,
-          balance: running,
-        }
+    const label = `${acc.name} (${acc.code})`
+    rows.push({ description: label, _style: 'heading' })
+    if (fromDate) rows.push({ description: 'Opening Balance', balance: openingBalance, _style: 'indent' })
+    let running = openingBalance
+    let debitSum = 0
+    let creditSum = 0
+    const legacyLines = accLines.map((l) => {
+      const debit = Number(l.debitAmount)
+      const credit = Number(l.creditAmount)
+      running = round2(running + sign * (debit - credit))
+      debitSum += debit
+      creditSum += credit
+      rows.push({
+        date: l.journalEntry.entryDate.toISOString(), entryNo: l.journalEntry.entryNo, description: l.description || l.journalEntry.description,
+        branch: l.journalEntry.branch?.name ?? '', debit: debit || null, credit: credit || null, balance: running,
       })
-      return {
-        accountId: acc.id,
-        code: acc.code,
-        name: acc.name,
-        accountType: acc.accountClass,
-        lines: rows,
-        closingBalance: running,
-      }
+      return { date: l.journalEntry.entryDate, entryNo: l.journalEntry.entryNo, description: l.description || l.journalEntry.description, branch: l.journalEntry.branch?.name ?? null, debit, credit, balance: running }
     })
-    .filter((s) => !!accountId || s.lines.length > 0)
-
-  const report: GLReportData = {
-    generatedAt: new Date().toISOString(),
-    branchName: branch?.name ?? null,
-    fromDate: fromDate || null,
-    toDate: toDate || null,
-    accounts: accountSections,
-    totals: { debit: grandDebit, credit: grandCredit },
+    rows.push({ description: `Total ${label}`, debit: round2(debitSum), credit: round2(creditSum), balance: running, _style: 'subtotal' })
+    grandDebit += debitSum
+    grandCredit += creditSum
+    legacyAccounts.push({ accountId: acc.id, code: acc.code, name: acc.name, accountType: acc.accountClass, openingBalance, lines: legacyLines, closingBalance: running })
   }
 
-  if (format === 'csv') { sendGeneralLedgerCsv(res, report); return }
-  if (format === 'excel') { await sendGeneralLedgerExcel(res, report); return }
-  if (format === 'pdf') { sendGeneralLedgerPdf(res, report); return }
-  res.json(report)
+  const columns: ReportColumn[] = [
+    { key: 'date', label: 'Date', format: 'date', width: 0.95 },
+    { key: 'entryNo', label: 'Entry', format: 'code', width: 1.05 },
+    { key: 'description', label: 'Description', width: 2.8 },
+    ...(showBranch ? [{ key: 'branch', label: 'Branch', width: 1.1 } as ReportColumn] : []),
+    { key: 'debit', label: 'Debit', format: 'money' },
+    { key: 'credit', label: 'Credit', format: 'money' },
+    { key: 'balance', label: 'Running Balance', format: 'money' },
+  ]
+
+  const scope = await reportScope(prisma, orgId, branchId || undefined)
+  const report: ProReport = {
+    key: 'general-ledger',
+    title: 'General Ledger',
+    eyebrow: 'General Ledger',
+    headline: 'General ledger',
+    summaryLine: '',
+    ...scope,
+    periodLabel: periodLabelFor(fromDate, toDate, lines.map((l) => l.journalEntry.entryDate)),
+    dateLine: fromDate || toDate ? dateLineFor(fromDate, toDate) : asAtLine(),
+    generatedAt: new Date().toISOString(),
+    kpis: [],
+    sections: [{
+      type: 'table', id: 'ledger', title: 'General Ledger', hideTitle: true, primary: true,
+      columns,
+      rows,
+      totals: { description: 'Total', debit: round2(grandDebit), credit: round2(grandCredit) },
+      emptyMessage: 'No posted activity for the selected filters',
+    }],
+  }
+  await sendProReport(res, format, report, {
+    generatedAt: report.generatedAt, branchName: branchId ? scope.scopeLabel : null, fromDate: fromDate || null, toDate: toDate || null,
+    accounts: legacyAccounts, totals: { debit: round2(grandDebit), credit: round2(grandCredit) },
+  })
 })
 
 export default router
