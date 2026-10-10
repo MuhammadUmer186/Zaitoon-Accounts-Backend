@@ -1,11 +1,14 @@
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { scopeReportBranch } from '../utils/branchScope'
+import { requireAnyPermission } from '../middleware/authorize'
 import { getEverStockedKeys, isNeverStocked } from '../utils/stock'
 
 const router = Router()
 
 router.use(authenticate)
+router.use(scopeReportBranch)
 
 type AlertLevel = 'critical' | 'warning' | 'good' | 'info'
 
@@ -21,7 +24,7 @@ interface Alert {
 }
 
 // GET /alerts — real, computed-on-the-fly alerts (nothing fabricated/stored)
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', requireAnyPermission('can_view_alerts'), async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const now = new Date()

@@ -73,3 +73,29 @@ export async function branchFilter(req: Request, requested?: string): Promise<st
   }
   return { in: scope.branchIds }
 }
+
+// Express middleware for read-only report/alert routes, which take an
+// optional ?branchId=. A branch-limited user is pinned to their branch:
+// another branch is refused; no branch means their only branch (or, with
+// several branches, a request to pick one).
+export async function scopeReportBranch(req: Request, res: import('express').Response, next: import('express').NextFunction) {
+  try {
+    const scope = await getBranchScope(req)
+    if (!scope.restricted) return next()
+    const requested = typeof req.query.branchId === 'string' ? req.query.branchId : ''
+    if (requested) {
+      if (!scope.branchIds.includes(requested)) {
+        res.status(403).json({ message: 'You can only access your own branch', code: 'BRANCH_FORBIDDEN' })
+        return
+      }
+      return next()
+    }
+    if (scope.branchIds.length === 1) {
+      req.query.branchId = scope.branchIds[0]
+      return next()
+    }
+    res.status(400).json({ message: 'Choose one of your branches to view this report', code: 'BRANCH_REQUIRED' })
+  } catch (err) {
+    next(err)
+  }
+}

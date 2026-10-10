@@ -1,6 +1,8 @@
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { scopeReportBranch } from '../utils/branchScope'
+import { requireAnyPermission, requireExportPermission } from '../middleware/authorize'
 import { fiscalYearStartFor } from '../utils/fiscalYear'
 import {
   ProReport, ReportRow, ReportSection, ReportColumn, sendProReport, reportScope, periodLabelFor,
@@ -20,6 +22,8 @@ import {
 
 const router = Router()
 router.use(authenticate)
+router.use(scopeReportBranch)
+router.use(requireExportPermission)
 
 function dateRangeFilter(fromDate?: string, toDate?: string) {
   if (!fromDate && !toDate) return undefined
@@ -71,7 +75,7 @@ function totalsOf(rows: ReportRow[], label: string, keys: string[], firstKey: st
 
 // ── Daily Sales ─────────────────────────────────────────────────────────────
 
-router.get('/daily-sales', async (req: Request, res: Response) => {
+router.get('/daily-sales', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const saleDate = dateRangeFilter(fromDate, toDate)
@@ -179,7 +183,7 @@ router.get('/daily-sales', async (req: Request, res: Response) => {
 
 // ── Branch Sales Comparison ─────────────────────────────────────────────────
 
-router.get('/branch-sales', async (req: Request, res: Response) => {
+router.get('/branch-sales', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const saleDate = dateRangeFilter(fromDate, toDate)
@@ -240,7 +244,7 @@ router.get('/branch-sales', async (req: Request, res: Response) => {
 
 // ── Branch Profit ───────────────────────────────────────────────────────────
 
-router.get('/branch-profit', async (req: Request, res: Response) => {
+router.get('/branch-profit', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const saleDate = dateRangeFilter(fromDate, toDate)
@@ -321,7 +325,7 @@ router.get('/branch-profit', async (req: Request, res: Response) => {
 
 // ── Cash Closing ────────────────────────────────────────────────────────────
 
-router.get('/cash-closing', async (req: Request, res: Response) => {
+router.get('/cash-closing', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const closingDate = dateRangeFilter(fromDate, toDate)
@@ -386,7 +390,7 @@ router.get('/cash-closing', async (req: Request, res: Response) => {
 
 // ── Expenses ────────────────────────────────────────────────────────────────
 
-router.get('/expenses', async (req: Request, res: Response) => {
+router.get('/expenses', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const expenseDate = dateRangeFilter(fromDate, toDate)
@@ -488,7 +492,7 @@ router.get('/expenses', async (req: Request, res: Response) => {
 
 // Every supplier bill in the period (Purchasing entries, Purchase Order
 // receipts, and manually created bills alike).
-router.get('/purchases', async (req: Request, res: Response) => {
+router.get('/purchases', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const billDate = dateRangeFilter(fromDate, toDate)
@@ -635,7 +639,7 @@ router.get('/purchases', async (req: Request, res: Response) => {
 const AGING = ['Current', '1–30 days', '31–60 days', '61–90 days', '90+ days'] as const
 const agingBucket = (days: number) => (days === 0 ? AGING[0] : days <= 30 ? AGING[1] : days <= 60 ? AGING[2] : days <= 90 ? AGING[3] : AGING[4])
 
-router.get('/supplier-payable', async (req: Request, res: Response) => {
+router.get('/supplier-payable', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const now = new Date()
@@ -727,7 +731,7 @@ router.get('/supplier-payable', async (req: Request, res: Response) => {
 
 // ── Inventory Stock ─────────────────────────────────────────────────────────
 
-router.get('/inventory-stock', async (req: Request, res: Response) => {
+router.get('/inventory-stock', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 
@@ -811,7 +815,7 @@ router.get('/inventory-stock', async (req: Request, res: Response) => {
 
 // ── Wastage ─────────────────────────────────────────────────────────────────
 
-router.get('/wastage', async (req: Request, res: Response) => {
+router.get('/wastage', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const reportDate = dateRangeFilter(fromDate, toDate)
@@ -884,7 +888,7 @@ router.get('/wastage', async (req: Request, res: Response) => {
 
 // ── Audit Log ───────────────────────────────────────────────────────────────
 
-router.get('/audit-log', async (req: Request, res: Response) => {
+router.get('/audit-log', requireAnyPermission('can_view_audit_logs'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const createdAt = dateRangeFilter(fromDate, toDate)
@@ -941,7 +945,7 @@ const COST_OF_SALES_GROUPS = new Set(['Cost of Sales', 'Wastage', 'Direct Costs'
 // Built entirely from posted JournalLine data (never combined with
 // operational-table totals, which could double-count or diverge from what's
 // actually posted to the ledger).
-router.get('/profit-loss', async (req: Request, res: Response) => {
+router.get('/profit-loss', requireAnyPermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 
@@ -1038,7 +1042,7 @@ router.get('/profit-loss', async (req: Request, res: Response) => {
 
 // ── Trial Balance ───────────────────────────────────────────────────────────
 
-router.get('/trial-balance', async (req: Request, res: Response) => {
+router.get('/trial-balance', requireAnyPermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 
@@ -1105,7 +1109,7 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
 // than stored, since there is no year-end closing-entry workflow yet; it is
 // reported here but excluded from the real Equity account list to avoid
 // double-counting if that account exists.
-router.get('/balance-sheet', async (req: Request, res: Response) => {
+router.get('/balance-sheet', requireAnyPermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const asOf = toDate ? new Date(toDate) : new Date()
@@ -1226,7 +1230,7 @@ router.get('/balance-sheet', async (req: Request, res: Response) => {
 
 // ── VAT Summary ─────────────────────────────────────────────────────────────
 
-router.get('/vat-summary', async (req: Request, res: Response) => {
+router.get('/vat-summary', requireAnyPermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 

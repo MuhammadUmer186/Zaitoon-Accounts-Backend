@@ -3,6 +3,7 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requireAnyPermission } from '../middleware/authorize'
 import { upload } from '../middleware/upload'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { applyStockIn, applyStockOut } from '../utils/stock'
@@ -71,7 +72,7 @@ const wastageSchema = z.object({
 
 // GET /inventory/categories — the item catalog's categories, each carrying
 // a default unit of measurement (kg, litre, gallon, ...) for items in it
-router.get('/categories', async (req: Request, res: Response) => {
+router.get('/categories', requireAnyPermission('can_manage_inventory', 'can_transfer_stock', 'can_approve_wastage', 'can_create_purchasing_entry', 'can_create_purchase_order', 'can_approve_purchase_order', 'can_view_reports'), async (req: Request, res: Response) => {
   const categories = await prisma.itemCategory.findMany({
     where: { organizationId: req.user.organizationId, isActive: true },
     orderBy: { name: 'asc' },
@@ -81,7 +82,7 @@ router.get('/categories', async (req: Request, res: Response) => {
 })
 
 // POST /inventory/categories
-router.post('/categories', async (req: Request, res: Response) => {
+router.post('/categories', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const body = categorySchema.parse(req.body)
   const category = await prisma.itemCategory.create({
     data: { ...body, organizationId: req.user.organizationId },
@@ -90,7 +91,7 @@ router.post('/categories', async (req: Request, res: Response) => {
 })
 
 // PUT /inventory/categories/:id
-router.put('/categories/:id', async (req: Request, res: Response) => {
+router.put('/categories/:id', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const category = await prisma.itemCategory.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -102,7 +103,7 @@ router.put('/categories/:id', async (req: Request, res: Response) => {
 })
 
 // DELETE /inventory/categories/:id
-router.delete('/categories/:id', async (req: Request, res: Response) => {
+router.delete('/categories/:id', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const category = await prisma.itemCategory.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -119,7 +120,7 @@ router.delete('/categories/:id', async (req: Request, res: Response) => {
 })
 
 // GET /inventory/stock
-router.get('/stock', async (req: Request, res: Response) => {
+router.get('/stock', requireAnyPermission('can_manage_inventory', 'can_transfer_stock', 'can_approve_wastage', 'can_create_purchasing_entry', 'can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, search, lowStock } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, quantityOnHand: { gt: 0 } }
@@ -176,7 +177,7 @@ router.get('/stock', async (req: Request, res: Response) => {
 })
 
 // GET /inventory/items
-router.get('/items', async (req: Request, res: Response) => {
+router.get('/items', requireAnyPermission('can_manage_inventory', 'can_transfer_stock', 'can_approve_wastage', 'can_create_purchasing_entry', 'can_create_purchase_order', 'can_approve_purchase_order', 'can_view_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { search, categoryId } = req.query as Record<string, string>
 
@@ -207,7 +208,7 @@ router.get('/items', async (req: Request, res: Response) => {
 })
 
 // POST /inventory/items — add a new product to the catalog
-router.post('/items', async (req: Request, res: Response) => {
+router.post('/items', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const body = itemSchema.parse(req.body)
 
   let unit = body.unit
@@ -227,7 +228,7 @@ router.post('/items', async (req: Request, res: Response) => {
 })
 
 // PUT /inventory/items/:id
-router.put('/items/:id', async (req: Request, res: Response) => {
+router.put('/items/:id', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const item = await prisma.item.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -252,7 +253,7 @@ router.put('/items/:id', async (req: Request, res: Response) => {
 // DELETE /inventory/items/:id — items always have a BranchStock row per
 // branch (created up front) and often purchase/movement history, so this
 // always deactivates rather than hard-deleting.
-router.delete('/items/:id', async (req: Request, res: Response) => {
+router.delete('/items/:id', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const item = await prisma.item.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -265,7 +266,7 @@ router.delete('/items/:id', async (req: Request, res: Response) => {
 // ── Branch sections (Juices, Broast, Kitchen, ...) ──────────────────────────
 
 // GET /inventory/sections?branchId=&includeInactive=
-router.get('/sections', async (req: Request, res: Response) => {
+router.get('/sections', requireAnyPermission('can_manage_inventory', 'can_transfer_stock', 'can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, includeInactive } = req.query as Record<string, string>
   const bf = await branchFilter(req, branchId)
   const sections = await prisma.branchSection.findMany({
@@ -283,7 +284,7 @@ router.get('/sections', async (req: Request, res: Response) => {
 // POST /inventory/sections — create a section in one branch, or (with
 // allBranches: true) the same-named section in every active branch that
 // doesn't already have it.
-router.post('/sections', async (req: Request, res: Response) => {
+router.post('/sections', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const body = sectionSchema.extend({
     branchId: z.string().optional(),
     allBranches: z.boolean().optional(),
@@ -322,7 +323,7 @@ router.post('/sections', async (req: Request, res: Response) => {
 })
 
 // PUT /inventory/sections/:id
-router.put('/sections/:id', async (req: Request, res: Response) => {
+router.put('/sections/:id', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
   if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, section.branchId)
@@ -333,7 +334,7 @@ router.put('/sections/:id', async (req: Request, res: Response) => {
 
 // DELETE /inventory/sections/:id — deactivates when the section has stock-out
 // history (so past issues keep their section), otherwise deletes.
-router.delete('/sections/:id', async (req: Request, res: Response) => {
+router.delete('/sections/:id', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
   if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, section.branchId)
@@ -349,7 +350,7 @@ router.delete('/sections/:id', async (req: Request, res: Response) => {
 // GET /inventory/sections/summary?branchId=&fromDate=&toDate= — what each
 // section has received from its branch store: total value, number of issues,
 // and per-item quantities.
-router.get('/sections/summary', async (req: Request, res: Response) => {
+router.get('/sections/summary', requireAnyPermission('can_manage_inventory', 'can_transfer_stock', 'can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
   const bf = await branchFilter(req, branchId)
   const movements = await prisma.stockMovement.findMany({
@@ -410,7 +411,7 @@ router.get('/sections/summary', async (req: Request, res: Response) => {
 //    the destination branch store. Inventory stays inventory, so no GL entry.
 //  - section: issues stock from the branch store to one of its sections —
 //    that's consumption, posted as Food Cost / Inventory.
-router.post('/stock-out', async (req: Request, res: Response) => {
+router.post('/stock-out', requireAnyPermission('can_manage_inventory', 'can_transfer_stock'), async (req: Request, res: Response) => {
   const body = stockOutSchema.parse(req.body)
   const orgId = req.user.organizationId
 
@@ -522,7 +523,7 @@ router.post('/stock-out', async (req: Request, res: Response) => {
 // GET /inventory/stock-outs?branchId=&type=&sectionId=&toBranchId=&fromDate=&toDate=
 // branchId matches either side of a transfer, so a branch sees what it
 // sent and what it received.
-router.get('/stock-outs', async (req: Request, res: Response) => {
+router.get('/stock-outs', requireAnyPermission('can_manage_inventory', 'can_transfer_stock', 'can_view_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { branchId, type, sectionId, toBranchId, fromDate, toDate } = req.query as Record<string, string>
 
@@ -576,7 +577,7 @@ router.get('/stock-outs', async (req: Request, res: Response) => {
 })
 
 // GET /inventory/stock-outs/:id — header plus its item lines
-router.get('/stock-outs/:id', async (req: Request, res: Response) => {
+router.get('/stock-outs/:id', requireAnyPermission('can_manage_inventory', 'can_transfer_stock', 'can_view_reports'), async (req: Request, res: Response) => {
   const stockOut = await prisma.stockOut.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: {
@@ -638,7 +639,7 @@ const addPurchaseSchema = z.object({
 // POST /inventory/purchases — receive an approved PO into branch stock, with
 // real costing/supplier/payment/invoice captured at the moment of receiving,
 // auto-creating the matching Supplier Bill (and Payment, if partly/fully paid).
-router.post('/purchases', upload.single('file'), async (req: Request, res: Response) => {
+router.post('/purchases', requireAnyPermission('can_approve_purchase_order'), upload.single('file'), async (req: Request, res: Response) => {
   const body = addPurchaseSchema.parse(req.body)
   let itemInputs: { purchaseOrderItemId: string; unitCost: number }[]
   try {
@@ -828,7 +829,7 @@ router.post('/purchases', upload.single('file'), async (req: Request, res: Respo
 })
 
 // GET /inventory/wastage/pending-approval
-router.get('/wastage/pending-approval', async (req: Request, res: Response) => {
+router.get('/wastage/pending-approval', requireAnyPermission('can_approve_wastage', 'can_view_approvals'), async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'draft' }
   const bf = await branchFilter(req, branchId)
@@ -843,7 +844,7 @@ router.get('/wastage/pending-approval', async (req: Request, res: Response) => {
 })
 
 // GET /inventory/wastage
-router.get('/wastage', async (req: Request, res: Response) => {
+router.get('/wastage', requireAnyPermission('can_manage_inventory', 'can_approve_wastage', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { branchId } = req.query as Record<string, string>
 
@@ -868,7 +869,7 @@ router.get('/wastage', async (req: Request, res: Response) => {
 })
 
 // POST /inventory/wastage
-router.post('/wastage', async (req: Request, res: Response) => {
+router.post('/wastage', requireAnyPermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const body = wastageSchema.parse(req.body)
 
   const branch = await prisma.branch.findFirst({
@@ -896,7 +897,7 @@ router.post('/wastage', async (req: Request, res: Response) => {
 })
 
 // POST /inventory/wastage/:id/approve
-router.post('/wastage/:id/approve', async (req: Request, res: Response) => {
+router.post('/wastage/:id/approve', requireAnyPermission('can_approve_wastage'), async (req: Request, res: Response) => {
   const report = await prisma.wastageReport.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { items: true },

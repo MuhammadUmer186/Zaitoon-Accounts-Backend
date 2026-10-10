@@ -1,15 +1,19 @@
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { scopeReportBranch } from '../utils/branchScope'
+import { requireAnyPermission, requireExportPermission } from '../middleware/authorize'
 import { sendGeneralLedgerCsv, sendGeneralLedgerExcel, sendGeneralLedgerPdf, GLReportData, GLReportAccount, GLReportLine } from '../utils/glReport'
 import { getEverStockedKeys, isNeverStocked } from '../utils/stock'
 
 const router = Router()
 
 router.use(authenticate)
+router.use(scopeReportBranch)
+router.use(requireExportPermission)
 
 // GET /reports/dashboard
-router.get('/dashboard', async (req: Request, res: Response) => {
+router.get('/dashboard', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId } = req.query as { branchId?: string }
   const orgId = req.user.organizationId
 
@@ -188,7 +192,7 @@ router.get('/dashboard', async (req: Request, res: Response) => {
 })
 
 // GET /reports/financial
-router.get('/financial', async (req: Request, res: Response) => {
+router.get('/financial', requireAnyPermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 
@@ -336,7 +340,7 @@ function getPreviousRangeBounds(range: DashboardRange, today: Date): { start: Da
 }
 
 // GET /reports/dashboard-v2 — comprehensive data for premium dashboard
-router.get('/dashboard-v2', async (req: Request, res: Response) => {
+router.get('/dashboard-v2', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, range = 'this_month', compare = 'branch' } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const selectedRange = range as DashboardRange
@@ -691,7 +695,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
 })
 
 // GET /reports/inventory-health — real stock value, low/critical stock, movement velocity, wastage
-router.get('/inventory-health', async (req: Request, res: Response) => {
+router.get('/inventory-health', requireAnyPermission('can_view_reports', 'can_manage_inventory'), async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const now = new Date()
@@ -779,7 +783,7 @@ router.get('/inventory-health', async (req: Request, res: Response) => {
 })
 
 // GET /reports/sales
-router.get('/sales', async (req: Request, res: Response) => {
+router.get('/sales', requireAnyPermission('can_view_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 
@@ -869,7 +873,7 @@ router.get('/sales', async (req: Request, res: Response) => {
 // Revenue, Expenses — Equity is excluded from GL reporting), viewable on
 // screen (format omitted/json) or exported as csv / excel / pdf for
 // printing and record-keeping.
-router.get('/general-ledger', async (req: Request, res: Response) => {
+router.get('/general-ledger', requireAnyPermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, accountId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 

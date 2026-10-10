@@ -19,6 +19,7 @@ const orgSettingsSchema = z.object({
   city: z.string().optional(),
   lowStockThreshold: z.number().min(0).nullable().optional(),
   purchaseOrderEnabled: z.boolean().optional(),
+  requireAdminMfa: z.boolean().optional(),
   country: z.string().length(2).optional(),
 })
 
@@ -99,6 +100,7 @@ router.get('/:orgId/users', requirePermission('can_manage_users'), async (req: R
         lastName: true,
         phone: true,
         isActive: true,
+        mfaEnabled: true,
         lastLoginAt: true,
         createdAt: true,
         roles: { include: { role: true } },

@@ -2,6 +2,8 @@ import { Router, Request, Response, NextFunction } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { assertBranchAccess, branchFilter } from '../utils/branchScope'
+import { requireAnyPermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
@@ -41,12 +43,13 @@ const includeRelations = {
 }
 
 // GET /purchase-orders
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', requireAnyPermission('can_create_purchase_order', 'can_approve_purchase_order', 'can_view_approvals'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { branchId, status, fromDate, toDate } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
   if (status) where.status = status
   if (fromDate || toDate) {
     where.orderDate = {
@@ -69,10 +72,11 @@ router.get('/', async (req: Request, res: Response) => {
 })
 
 // GET /purchase-orders/pending-approval
-router.get('/pending-approval', async (req: Request, res: Response) => {
+router.get('/pending-approval', requireAnyPermission('can_approve_purchase_order', 'can_view_approvals'), async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'submitted' }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
 
   const orders = await prisma.purchaseOrder.findMany({
     where,
@@ -83,13 +87,14 @@ router.get('/pending-approval', async (req: Request, res: Response) => {
 })
 
 // POST /purchase-orders
-router.post('/', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
+router.post('/', requireAnyPermission('can_create_purchase_order'), requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const body = poSchema.parse(req.body)
 
   const branch = await prisma.branch.findFirst({
     where: { id: body.branchId, organizationId: req.user.organizationId },
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, branch.id)
 
   const poNo = await nextNumber(prisma, 'purchaseOrder', 'poNo', 'PO', req.user.organizationId)
   const { items, ...poData } = body
@@ -111,21 +116,23 @@ router.post('/', requirePurchaseOrdersEnabled, async (req: Request, res: Respons
 })
 
 // GET /purchase-orders/:id
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', requireAnyPermission('can_create_purchase_order', 'can_approve_purchase_order', 'can_view_approvals'), async (req: Request, res: Response) => {
   const order = await prisma.purchaseOrder.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: includeRelations,
   })
   if (!order) throw new AppError('Purchase order not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, order.branchId)
   res.json(order)
 })
 
 // PUT /purchase-orders/:id
-router.put('/:id', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
+router.put('/:id', requireAnyPermission('can_create_purchase_order'), requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const order = await prisma.purchaseOrder.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!order) throw new AppError('Purchase order not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, order.branchId)
   if (order.status !== 'draft') throw new AppError('Only draft purchase orders can be edited', 400, 'INVALID_STATUS')
 
   const body = poSchema.partial().parse(req.body)
@@ -154,11 +161,12 @@ router.put('/:id', requirePurchaseOrdersEnabled, async (req: Request, res: Respo
 })
 
 // POST /purchase-orders/:id/submit
-router.post('/:id/submit', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
+router.post('/:id/submit', requireAnyPermission('can_create_purchase_order'), requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const order = await prisma.purchaseOrder.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!order) throw new AppError('Purchase order not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, order.branchId)
   if (order.status !== 'draft') throw new AppError('Only draft purchase orders can be submitted', 400, 'INVALID_STATUS')
 
   const updated = await prisma.purchaseOrder.update({
@@ -169,11 +177,12 @@ router.post('/:id/submit', requirePurchaseOrdersEnabled, async (req: Request, re
 })
 
 // POST /purchase-orders/:id/approve
-router.post('/:id/approve', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
+router.post('/:id/approve', requireAnyPermission('can_approve_purchase_order'), requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const order = await prisma.purchaseOrder.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!order) throw new AppError('Purchase order not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, order.branchId)
   if (order.status !== 'submitted') throw new AppError('Only submitted purchase orders can be approved', 400, 'INVALID_STATUS')
 
   const updated = await prisma.purchaseOrder.update({
@@ -184,7 +193,7 @@ router.post('/:id/approve', requirePurchaseOrdersEnabled, async (req: Request, r
 })
 
 // POST /purchase-orders/:id/reject
-router.post('/:id/reject', requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
+router.post('/:id/reject', requireAnyPermission('can_approve_purchase_order'), requirePurchaseOrdersEnabled, async (req: Request, res: Response) => {
   const { rejectionReason } = req.body as Record<string, string>
   if (!rejectionReason) throw new AppError('Rejection reason is required', 400, 'VALIDATION_ERROR')
 
@@ -192,6 +201,7 @@ router.post('/:id/reject', requirePurchaseOrdersEnabled, async (req: Request, re
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!order) throw new AppError('Purchase order not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, order.branchId)
   if (order.status !== 'submitted') throw new AppError('Only submitted purchase orders can be rejected', 400, 'INVALID_STATUS')
 
   const updated = await prisma.purchaseOrder.update({
@@ -202,7 +212,7 @@ router.post('/:id/reject', requirePurchaseOrdersEnabled, async (req: Request, re
 })
 
 // POST /purchase-orders/:id/void
-router.post('/:id/void', async (req: Request, res: Response) => {
+router.post('/:id/void', requireAnyPermission('can_approve_purchase_order'), async (req: Request, res: Response) => {
   const { voidReason } = req.body as Record<string, string>
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
@@ -210,6 +220,7 @@ router.post('/:id/void', async (req: Request, res: Response) => {
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!order) throw new AppError('Purchase order not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, order.branchId)
   if (order.status === 'received') throw new AppError('A received purchase order cannot be voided', 400, 'INVALID_STATUS')
   if (order.status === 'void') throw new AppError('Purchase order is already voided', 400, 'INVALID_STATUS')
 

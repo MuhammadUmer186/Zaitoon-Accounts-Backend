@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { assertBranchAccess, branchFilter } from '../utils/branchScope'
+import { requireAnyPermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
@@ -48,10 +50,11 @@ function getDifferenceType(diff: number): string {
 }
 
 // GET /cash-closing/pending-approval
-router.get('/pending-approval', async (req: Request, res: Response) => {
+router.get('/pending-approval', requireAnyPermission('can_approve_cash_closing', 'can_view_approvals'), async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'submitted' }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
 
   const closings = await prisma.cashClosing.findMany({
     where,
@@ -62,12 +65,13 @@ router.get('/pending-approval', async (req: Request, res: Response) => {
 })
 
 // GET /cash-closing
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', requireAnyPermission('can_create_cash_closing', 'can_approve_cash_closing', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { branchId, fromDate, toDate, status } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
   if (status) where.status = status
   if (fromDate || toDate) {
     where.closingDate = {
@@ -90,13 +94,14 @@ router.get('/', async (req: Request, res: Response) => {
 })
 
 // POST /cash-closing
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', requireAnyPermission('can_create_cash_closing'), async (req: Request, res: Response) => {
   const body = closingSchema.parse(req.body)
 
   const branch = await prisma.branch.findFirst({
     where: { id: body.branchId, organizationId: req.user.organizationId },
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, branch.id)
 
   const closingNo = await nextNumber(prisma, 'cashClosing', 'closingNo', 'CC', req.user.organizationId)
   const expectedCash = computeExpected(body)
@@ -121,21 +126,23 @@ router.post('/', async (req: Request, res: Response) => {
 })
 
 // GET /cash-closing/:id
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', requireAnyPermission('can_create_cash_closing', 'can_approve_cash_closing', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const closing = await prisma.cashClosing.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { branch: true },
   })
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, closing.branchId)
   res.json(closing)
 })
 
 // PUT /cash-closing/:id
-router.put('/:id', async (req: Request, res: Response) => {
+router.put('/:id', requireAnyPermission('can_create_cash_closing'), async (req: Request, res: Response) => {
   const closing = await prisma.cashClosing.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, closing.branchId)
   if (closing.status !== 'draft') throw new AppError('Only draft closings can be edited', 400, 'INVALID_STATUS')
 
   const body = closingSchema.partial().parse(req.body)
@@ -167,11 +174,12 @@ router.put('/:id', async (req: Request, res: Response) => {
 })
 
 // POST /cash-closing/:id/submit
-router.post('/:id/submit', async (req: Request, res: Response) => {
+router.post('/:id/submit', requireAnyPermission('can_create_cash_closing'), async (req: Request, res: Response) => {
   const closing = await prisma.cashClosing.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, closing.branchId)
   if (closing.status !== 'draft') throw new AppError('Only draft closings can be submitted', 400, 'INVALID_STATUS')
 
   const updated = await prisma.cashClosing.update({
@@ -183,11 +191,12 @@ router.post('/:id/submit', async (req: Request, res: Response) => {
 
 // POST /cash-closing/:id/approve — posts the cash over/short entry, if any.
 // A perfectly balanced closing has nothing to post.
-router.post('/:id/approve', async (req: Request, res: Response) => {
+router.post('/:id/approve', requireAnyPermission('can_approve_cash_closing'), async (req: Request, res: Response) => {
   const closing = await prisma.cashClosing.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, closing.branchId)
   if (closing.status !== 'submitted') throw new AppError('Only submitted closings can be approved', 400, 'INVALID_STATUS')
 
   let journalEntryId: string | undefined
@@ -230,7 +239,7 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
 })
 
 // POST /cash-closing/:id/void
-router.post('/:id/void', async (req: Request, res: Response) => {
+router.post('/:id/void', requireAnyPermission('can_approve_cash_closing'), async (req: Request, res: Response) => {
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
@@ -238,6 +247,7 @@ router.post('/:id/void', async (req: Request, res: Response) => {
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, closing.branchId)
   if (closing.status === 'void') throw new AppError('Cash closing is already voided', 400, 'INVALID_STATUS')
 
   if (closing.journalEntryId) {

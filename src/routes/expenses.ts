@@ -3,6 +3,8 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { assertBranchAccess, branchFilter } from '../utils/branchScope'
+import { requireAnyPermission } from '../middleware/authorize'
 import { upload } from '../middleware/upload'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
@@ -34,7 +36,7 @@ const categorySchema = z.object({
 })
 
 // GET /expenses/categories
-router.get('/categories', async (req: Request, res: Response) => {
+router.get('/categories', requireAnyPermission('can_create_expense', 'can_approve_expense', 'can_void_expense', 'can_view_approvals', 'can_view_reports', 'can_create_purchasing_entry', 'can_manage_accounting'), async (req: Request, res: Response) => {
   const categories = await prisma.expenseCategory.findMany({
     where: { organizationId: req.user.organizationId, isActive: true },
     orderBy: { name: 'asc' },
@@ -43,7 +45,7 @@ router.get('/categories', async (req: Request, res: Response) => {
 })
 
 // POST /expenses/categories
-router.post('/categories', async (req: Request, res: Response) => {
+router.post('/categories', requireAnyPermission('can_approve_expense', 'can_manage_accounting'), async (req: Request, res: Response) => {
   const body = categorySchema.parse(req.body)
   const category = await prisma.expenseCategory.create({
     data: { ...body, organizationId: req.user.organizationId },
@@ -52,7 +54,7 @@ router.post('/categories', async (req: Request, res: Response) => {
 })
 
 // DELETE /expenses/categories/:id
-router.delete('/categories/:id', async (req: Request, res: Response) => {
+router.delete('/categories/:id', requireAnyPermission('can_approve_expense', 'can_manage_accounting'), async (req: Request, res: Response) => {
   const inUse = await prisma.expense.count({
     where: { categoryId: req.params.id, organizationId: req.user.organizationId },
   })
@@ -63,10 +65,11 @@ router.delete('/categories/:id', async (req: Request, res: Response) => {
 })
 
 // GET /expenses/pending-approval
-router.get('/pending-approval', async (req: Request, res: Response) => {
+router.get('/pending-approval', requireAnyPermission('can_approve_expense', 'can_view_approvals'), async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'submitted' }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
 
   const expenses = await prisma.expense.findMany({
     where,
@@ -77,12 +80,13 @@ router.get('/pending-approval', async (req: Request, res: Response) => {
 })
 
 // GET /expenses
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', requireAnyPermission('can_create_expense', 'can_approve_expense', 'can_void_expense', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { branchId, fromDate, toDate, status, categoryId } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
   if (status) where.status = status
   if (categoryId) where.categoryId = categoryId
   if (fromDate || toDate) {
@@ -129,7 +133,7 @@ const purchasingPaymentSchema = z.object({
 // visible in the Expenses module. The Expense reuses the payment's journal
 // entry rather than posting its own — the purchase cost was already booked
 // when the bill was created, so a second posting would double count it.
-router.post('/purchasing-payment', upload.single('paymentSlip'), async (req: Request, res: Response) => {
+router.post('/purchasing-payment', requireAnyPermission('can_create_expense'), upload.single('paymentSlip'), async (req: Request, res: Response) => {
   const slip = req.file
   const cleanup = () => { if (slip) { try { fs.unlinkSync(slip.path) } catch { /* best-effort cleanup */ } } }
 
@@ -257,13 +261,14 @@ router.post('/purchasing-payment', upload.single('paymentSlip'), async (req: Req
 })
 
 // POST /expenses
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', requireAnyPermission('can_create_expense'), async (req: Request, res: Response) => {
   const body = expenseSchema.parse(req.body)
 
   const branch = await prisma.branch.findFirst({
     where: { id: body.branchId, organizationId: req.user.organizationId },
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, branch.id)
 
   const expenseNo = await nextNumber(
     prisma,
@@ -288,12 +293,13 @@ router.post('/', async (req: Request, res: Response) => {
 })
 
 // GET /expenses/:id
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', requireAnyPermission('can_create_expense', 'can_approve_expense', 'can_void_expense', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const expense = await prisma.expense.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { branch: true, category: true },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, expense.branchId)
 
   // Purchasing-mode expenses carry the paid bill (with its attachment) and
   // the payment's transfer slip, so the detail page can show both.
@@ -324,11 +330,12 @@ router.get('/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /expenses/:id
-router.put('/:id', async (req: Request, res: Response) => {
+router.put('/:id', requireAnyPermission('can_create_expense'), async (req: Request, res: Response) => {
   const expense = await prisma.expense.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, expense.branchId)
   if (expense.status !== 'draft') throw new AppError('Only draft expenses can be edited', 400, 'INVALID_STATUS')
   if (expense.source === 'purchasing') throw new AppError('Purchasing payments cannot be edited — void and re-enter instead', 400, 'INVALID_STATUS')
 
@@ -347,11 +354,12 @@ router.put('/:id', async (req: Request, res: Response) => {
 })
 
 // POST /expenses/:id/submit
-router.post('/:id/submit', async (req: Request, res: Response) => {
+router.post('/:id/submit', requireAnyPermission('can_create_expense'), async (req: Request, res: Response) => {
   const expense = await prisma.expense.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, expense.branchId)
   if (expense.status !== 'draft') throw new AppError('Only draft expenses can be submitted', 400, 'INVALID_STATUS')
 
   const updated = await prisma.expense.update({
@@ -362,12 +370,13 @@ router.post('/:id/submit', async (req: Request, res: Response) => {
 })
 
 // POST /expenses/:id/approve
-router.post('/:id/approve', async (req: Request, res: Response) => {
+router.post('/:id/approve', requireAnyPermission('can_approve_expense'), async (req: Request, res: Response) => {
   const expense = await prisma.expense.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { category: true },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, expense.branchId)
   if (expense.status !== 'submitted') throw new AppError('Only submitted expenses can be approved', 400, 'INVALID_STATUS')
 
   const [expenseAccount, inputVat, creditAccount] = await Promise.all([
@@ -403,11 +412,12 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
 })
 
 // DELETE /expenses/:id (draft only)
-router.delete('/:id', async (req: Request, res: Response) => {
+router.delete('/:id', requireAnyPermission('can_create_expense'), async (req: Request, res: Response) => {
   const expense = await prisma.expense.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, expense.branchId)
   if (expense.status !== 'draft') throw new AppError('Only draft expenses can be deleted', 400, 'INVALID_STATUS')
 
   await prisma.expense.delete({ where: { id: req.params.id } })
@@ -415,7 +425,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
 })
 
 // POST /expenses/:id/void
-router.post('/:id/void', async (req: Request, res: Response) => {
+router.post('/:id/void', requireAnyPermission('can_void_expense'), async (req: Request, res: Response) => {
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
@@ -423,6 +433,7 @@ router.post('/:id/void', async (req: Request, res: Response) => {
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, expense.branchId)
   if (expense.status === 'void') throw new AppError('Expense is already voided', 400, 'INVALID_STATUS')
 
   const updated = await prisma.$transaction(async (tx) => {

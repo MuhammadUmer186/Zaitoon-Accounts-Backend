@@ -24,6 +24,10 @@ import documentsRouter from './documents'
 import purchaseOrdersRouter from './purchaseOrders'
 import purchasingRouter from './purchasing'
 import alertsRouter from './alerts'
+import backupRouter from './backup'
+import bankReconciliationRouter from './bankReconciliation'
+import fixedAssetsRouter from './fixedAssets'
+import recurringJournalsRouter from './recurringJournals'
 
 const router = Router()
 
@@ -56,5 +60,9 @@ router.use('/documents', documentsRouter)
 router.use('/purchase-orders', purchaseOrdersRouter)
 router.use('/purchasing', purchasingRouter)
 router.use('/alerts', alertsRouter)
+router.use('/backup', backupRouter)
+router.use('/bank-reconciliation', bankReconciliationRouter)
+router.use('/fixed-assets', fixedAssetsRouter)
+router.use('/recurring-journals', recurringJournalsRouter)
 
 export default router

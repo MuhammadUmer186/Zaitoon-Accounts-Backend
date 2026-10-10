@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { assertBranchAccess, branchFilter } from '../utils/branchScope'
+import { requireAnyPermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
@@ -44,12 +46,13 @@ const saleSchema = z.object({
 })
 
 // GET /sales
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', requireAnyPermission('can_create_sales', 'can_approve_sales', 'can_void_sales', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { branchId, fromDate, toDate, status } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.branchId = branchId
+  const bf = await branchFilter(req, branchId)
+  if (bf) where.branchId = bf
   if (status) where.status = status
   if (fromDate || toDate) {
     where.saleDate = {
@@ -75,7 +78,7 @@ router.get('/', async (req: Request, res: Response) => {
 })
 
 // GET /sales/pending-approval
-router.get('/pending-approval', async (req: Request, res: Response) => {
+router.get('/pending-approval', requireAnyPermission('can_approve_sales', 'can_view_approvals'), async (req: Request, res: Response) => {
   const sales = await prisma.dailySale.findMany({
     where: { organizationId: req.user.organizationId, status: 'submitted' },
     orderBy: { createdAt: 'desc' },
@@ -85,7 +88,7 @@ router.get('/pending-approval', async (req: Request, res: Response) => {
 })
 
 // GET /sales/summary
-router.get('/summary', async (req: Request, res: Response) => {
+router.get('/summary', requireAnyPermission('can_create_sales', 'can_approve_sales', 'can_void_sales', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const { branchId } = req.query as { branchId?: string }
   const orgId = req.user.organizationId
 
@@ -130,7 +133,7 @@ router.get('/summary', async (req: Request, res: Response) => {
 })
 
 // POST /sales
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', requireAnyPermission('can_create_sales'), async (req: Request, res: Response) => {
   const body = saleSchema.parse(req.body)
 
   // Verify branch belongs to org
@@ -138,6 +141,7 @@ router.post('/', async (req: Request, res: Response) => {
     where: { id: body.branchId, organizationId: req.user.organizationId },
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, branch.id)
 
   const saleNo = await nextNumber(prisma, 'dailySale', 'saleNo', branch.salePrefix || 'SL', req.user.organizationId)
 
@@ -161,7 +165,7 @@ router.post('/', async (req: Request, res: Response) => {
 })
 
 // GET /sales/:id
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', requireAnyPermission('can_create_sales', 'can_approve_sales', 'can_void_sales', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const sale = await prisma.dailySale.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: {
@@ -170,15 +174,17 @@ router.get('/:id', async (req: Request, res: Response) => {
     },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, sale.branchId)
   res.json(withBranchName(sale))
 })
 
 // PUT /sales/:id
-router.put('/:id', async (req: Request, res: Response) => {
+router.put('/:id', requireAnyPermission('can_create_sales'), async (req: Request, res: Response) => {
   const sale = await prisma.dailySale.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, sale.branchId)
   if (sale.status !== 'draft') throw new AppError('Only draft sales can be edited', 400, 'INVALID_STATUS')
 
   const body = saleSchema.partial().parse(req.body)
@@ -253,11 +259,12 @@ async function postSaleJournalEntry(sale: {
 // POST /sales/:id/submit — daily sales need no separate approval step
 // (unlike purchases): submitting a draft finalizes it immediately, posting
 // the journal entry straight away.
-router.post('/:id/submit', async (req: Request, res: Response) => {
+router.post('/:id/submit', requireAnyPermission('can_create_sales'), async (req: Request, res: Response) => {
   const sale = await prisma.dailySale.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, sale.branchId)
   if (sale.status !== 'draft') throw new AppError('Only draft sales can be submitted', 400, 'INVALID_STATUS')
 
   const je = await postSaleJournalEntry(sale, req.user.organizationId, req.user.id)
@@ -280,11 +287,12 @@ router.post('/:id/submit', async (req: Request, res: Response) => {
 // POST /sales/:id/approve — kept only to resolve any sale that was already
 // sitting in 'submitted' status before daily sales stopped requiring
 // approval; new sales never reach this via /submit anymore.
-router.post('/:id/approve', async (req: Request, res: Response) => {
+router.post('/:id/approve', requireAnyPermission('can_approve_sales'), async (req: Request, res: Response) => {
   const sale = await prisma.dailySale.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, sale.branchId)
   if (sale.status !== 'submitted') throw new AppError('Only submitted sales can be approved', 400, 'INVALID_STATUS')
 
   const je = await postSaleJournalEntry(sale, req.user.organizationId, req.user.id)
@@ -303,7 +311,7 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
 })
 
 // POST /sales/:id/void
-router.post('/:id/void', async (req: Request, res: Response) => {
+router.post('/:id/void', requireAnyPermission('can_void_sales'), async (req: Request, res: Response) => {
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
@@ -311,6 +319,7 @@ router.post('/:id/void', async (req: Request, res: Response) => {
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, sale.branchId)
   if (sale.status === 'void') throw new AppError('Sale is already voided', 400, 'INVALID_STATUS')
 
   if (sale.journalEntryId) {

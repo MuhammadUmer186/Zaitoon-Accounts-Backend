@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requireAnyPermission } from '../middleware/authorize'
 import { assertBranchAccess, branchFilter } from '../utils/branchScope'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
@@ -56,7 +57,7 @@ const paymentSchema = z.object({
 })
 
 // GET /suppliers
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', requireAnyPermission('can_manage_suppliers', 'can_create_bill', 'can_approve_bill', 'can_make_payment', 'can_create_purchasing_entry', 'can_create_purchase_order', 'can_approve_purchase_order', 'can_create_expense', 'can_approve_expense', 'can_view_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const search = req.query.search as string | undefined
 
@@ -84,7 +85,7 @@ router.get('/', async (req: Request, res: Response) => {
 })
 
 // POST /suppliers
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', requireAnyPermission('can_manage_suppliers', 'can_create_purchasing_entry'), async (req: Request, res: Response) => {
   const body = supplierSchema.parse(req.body)
   const supplier = await prisma.supplier.create({
     data: { ...body, organizationId: req.user.organizationId },
@@ -97,7 +98,7 @@ router.post('/', async (req: Request, res: Response) => {
 // `:id` first (e.g. "/bills" would look up a supplier with id "bills").
 
 // GET /bills/pending-approval
-router.get('/bills/pending-approval', async (req: Request, res: Response) => {
+router.get('/bills/pending-approval', requireAnyPermission('can_approve_bill', 'can_view_approvals'), async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const where: Record<string, unknown> = { organizationId: req.user.organizationId, status: 'draft' }
   const bf = await branchFilter(req, branchId)
@@ -115,7 +116,7 @@ router.get('/bills/pending-approval', async (req: Request, res: Response) => {
 })
 
 // GET /bills
-router.get('/bills', async (req: Request, res: Response) => {
+router.get('/bills', requireAnyPermission('can_manage_suppliers', 'can_create_bill', 'can_approve_bill', 'can_make_payment', 'can_create_purchasing_entry', 'can_create_expense', 'can_approve_expense', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { branchId, supplierId, status, source, categoryId, search, billNo, fromDate, toDate } = req.query as Record<string, string>
 
@@ -162,7 +163,7 @@ router.get('/bills', async (req: Request, res: Response) => {
 })
 
 // POST /bills
-router.post('/bills', async (req: Request, res: Response) => {
+router.post('/bills', requireAnyPermission('can_create_bill', 'can_manage_suppliers'), async (req: Request, res: Response) => {
   const body = billSchema.parse(req.body)
 
   const branch = await prisma.branch.findFirst({
@@ -195,7 +196,7 @@ router.post('/bills', async (req: Request, res: Response) => {
 })
 
 // GET /bills/:id
-router.get('/bills/:id', async (req: Request, res: Response) => {
+router.get('/bills/:id', requireAnyPermission('can_manage_suppliers', 'can_create_bill', 'can_approve_bill', 'can_make_payment', 'can_create_purchasing_entry', 'can_create_expense', 'can_approve_expense', 'can_view_approvals', 'can_view_reports'), async (req: Request, res: Response) => {
   const bill = await prisma.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { items: true, payments: { orderBy: { paymentDate: 'asc' } }, supplier: true, branch: true, category: true },
@@ -215,7 +216,7 @@ router.get('/bills/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /bills/:id
-router.put('/bills/:id', async (req: Request, res: Response) => {
+router.put('/bills/:id', requireAnyPermission('can_create_bill', 'can_manage_suppliers'), async (req: Request, res: Response) => {
   const bill = await prisma.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -250,7 +251,7 @@ router.put('/bills/:id', async (req: Request, res: Response) => {
 // POST /bills/:id/approve — the authoritative financial posting point for a
 // manually-created bill (PO-received bills post at receiving time instead —
 // see inventory.ts /purchases — since that path has no separate draft phase).
-router.post('/bills/:id/approve', async (req: Request, res: Response) => {
+router.post('/bills/:id/approve', requireAnyPermission('can_approve_bill'), async (req: Request, res: Response) => {
   const bill = await prisma.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { items: true },
@@ -300,7 +301,7 @@ router.post('/bills/:id/approve', async (req: Request, res: Response) => {
 })
 
 // POST /bills/:id/void
-router.post('/bills/:id/void', async (req: Request, res: Response) => {
+router.post('/bills/:id/void', requireAnyPermission('can_approve_bill', 'can_manage_suppliers'), async (req: Request, res: Response) => {
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
@@ -322,7 +323,7 @@ router.post('/bills/:id/void', async (req: Request, res: Response) => {
 })
 
 // POST /bills/:id/payments
-router.post('/bills/:id/payments', async (req: Request, res: Response) => {
+router.post('/bills/:id/payments', requireAnyPermission('can_make_payment'), async (req: Request, res: Response) => {
   const body = paymentSchema.parse(req.body)
 
   const bill = await prisma.bill.findFirst({
@@ -386,7 +387,7 @@ router.post('/bills/:id/payments', async (req: Request, res: Response) => {
 })
 
 // GET /suppliers/:id
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', requireAnyPermission('can_manage_suppliers', 'can_create_bill', 'can_approve_bill', 'can_make_payment', 'can_create_purchasing_entry', 'can_create_purchase_order', 'can_approve_purchase_order', 'can_create_expense', 'can_approve_expense', 'can_view_reports'), async (req: Request, res: Response) => {
   const supplier = await prisma.supplier.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -422,7 +423,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /suppliers/:id
-router.put('/:id', async (req: Request, res: Response) => {
+router.put('/:id', requireAnyPermission('can_manage_suppliers'), async (req: Request, res: Response) => {
   const supplier = await prisma.supplier.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -434,7 +435,7 @@ router.put('/:id', async (req: Request, res: Response) => {
 })
 
 // DELETE /suppliers/:id
-router.delete('/:id', async (req: Request, res: Response) => {
+router.delete('/:id', requireAnyPermission('can_manage_suppliers'), async (req: Request, res: Response) => {
   const supplier = await prisma.supplier.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })

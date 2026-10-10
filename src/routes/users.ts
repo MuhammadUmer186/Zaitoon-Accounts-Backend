@@ -6,6 +6,7 @@ import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
+import { publicUser } from '../utils/totp'
 import { isStoreKeeperRole } from '../utils/branchScope'
 
 // A branch-scoped role (store keeper) works in exactly one branch — enforce
@@ -78,6 +79,7 @@ router.get('/', async (req: Request, res: Response) => {
         phone: true,
         avatarUrl: true,
         isActive: true,
+        mfaEnabled: true,
         lastLoginAt: true,
         createdAt: true,
         roles: { include: { role: true } },
@@ -125,8 +127,7 @@ router.post('/', async (req: Request, res: Response) => {
     })
   }
 
-  const { passwordHash: _ph, ...userWithoutPassword } = user
-  res.status(201).json(userWithoutPassword)
+  res.status(201).json(publicUser(user))
 })
 
 // GET /users/:id
@@ -142,6 +143,7 @@ router.get('/:id', async (req: Request, res: Response) => {
       phone: true,
       avatarUrl: true,
       isActive: true,
+      mfaEnabled: true,
       lastLoginAt: true,
       createdAt: true,
       roles: { include: { role: true } },
@@ -216,6 +218,7 @@ router.put('/:id', async (req: Request, res: Response) => {
       lastName: true,
       phone: true,
       isActive: true,
+      mfaEnabled: true,
       roles: { include: { role: true } },
       branchAccess: { include: { branch: true } },
     },
@@ -240,6 +243,16 @@ router.delete('/:id', async (req: Request, res: Response) => {
   await prisma.user.delete({ where: { id } })
 
   res.json({ message: 'User deleted' })
+})
+
+// POST /users/:id/mfa/reset — clear a user's two-factor (lost phone)
+router.post('/:id/mfa/reset', async (req: Request, res: Response) => {
+  const id = req.params['id'] as string
+  const user = await prisma.user.findFirst({ where: { id, organizationId: req.user.organizationId } })
+  if (!user) throw new AppError('User not found', 404, 'NOT_FOUND')
+  await prisma.user.update({ where: { id }, data: { mfaEnabled: false, mfaSecret: null, mfaPendingSecret: null, mfaRecoveryCodes: [], mfaLastStep: null } })
+  await prisma.refreshToken.deleteMany({ where: { userId: id } })
+  res.json({ message: 'Two-factor reset — the user can sign in with their password and set it up again' })
 })
 
 export default router

@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requireAnyPermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
 
@@ -39,7 +40,7 @@ const journalEntrySchema = z.object({
 })
 
 // GET /accounting/accounts
-router.get('/accounts', async (req: Request, res: Response) => {
+router.get('/accounts', requireAnyPermission('can_manage_accounting', 'accounts_view', 'can_post_journal', 'can_view_financial_reports'), async (req: Request, res: Response) => {
   const { accountType, branchId } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = {
@@ -59,7 +60,7 @@ router.get('/accounts', async (req: Request, res: Response) => {
 })
 
 // POST /accounting/accounts
-router.post('/accounts', async (req: Request, res: Response) => {
+router.post('/accounts', requireAnyPermission('can_manage_accounting'), async (req: Request, res: Response) => {
   const body = accountSchema.parse(req.body)
   const account = await prisma.account.create({
     data: { ...body, organizationId: req.user.organizationId },
@@ -68,7 +69,7 @@ router.post('/accounts', async (req: Request, res: Response) => {
 })
 
 // GET /accounting/accounts/:id
-router.get('/accounts/:id', async (req: Request, res: Response) => {
+router.get('/accounts/:id', requireAnyPermission('can_manage_accounting', 'accounts_view', 'can_post_journal', 'can_view_financial_reports'), async (req: Request, res: Response) => {
   const account = await prisma.account.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: {
@@ -81,7 +82,7 @@ router.get('/accounts/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /accounting/accounts/:id
-router.put('/accounts/:id', async (req: Request, res: Response) => {
+router.put('/accounts/:id', requireAnyPermission('can_manage_accounting'), async (req: Request, res: Response) => {
   const account = await prisma.account.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -93,7 +94,7 @@ router.put('/accounts/:id', async (req: Request, res: Response) => {
 })
 
 // DELETE /accounting/accounts/:id
-router.delete('/accounts/:id', async (req: Request, res: Response) => {
+router.delete('/accounts/:id', requireAnyPermission('can_manage_accounting'), async (req: Request, res: Response) => {
   const account = await prisma.account.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -113,7 +114,7 @@ router.delete('/accounts/:id', async (req: Request, res: Response) => {
 })
 
 // GET /accounting/journals
-router.get('/journals', async (req: Request, res: Response) => {
+router.get('/journals', requireAnyPermission('can_manage_accounting', 'accounts_view', 'can_post_journal', 'can_view_financial_reports'), async (req: Request, res: Response) => {
   const { page, limit } = parsePageParams(req.query as Record<string, unknown>)
   const { branchId, fromDate, toDate, status } = req.query as Record<string, string>
 
@@ -144,7 +145,7 @@ router.get('/journals', async (req: Request, res: Response) => {
 })
 
 // POST /accounting/journals
-router.post('/journals', async (req: Request, res: Response) => {
+router.post('/journals', requireAnyPermission('can_manage_accounting', 'manual_journals_create'), async (req: Request, res: Response) => {
   const body = journalEntrySchema.parse(req.body)
 
   const branch = await prisma.branch.findFirst({
@@ -183,7 +184,7 @@ router.post('/journals', async (req: Request, res: Response) => {
 })
 
 // GET /accounting/journals/:id
-router.get('/journals/:id', async (req: Request, res: Response) => {
+router.get('/journals/:id', requireAnyPermission('can_manage_accounting', 'accounts_view', 'can_post_journal', 'can_view_financial_reports'), async (req: Request, res: Response) => {
   const entry = await prisma.journalEntry.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: {
@@ -199,7 +200,7 @@ router.get('/journals/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /accounting/journals/:id
-router.put('/journals/:id', async (req: Request, res: Response) => {
+router.put('/journals/:id', requireAnyPermission('can_manage_accounting', 'manual_journals_create'), async (req: Request, res: Response) => {
   const entry = await prisma.journalEntry.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -240,7 +241,7 @@ router.put('/journals/:id', async (req: Request, res: Response) => {
 })
 
 // POST /accounting/journals/:id/post
-router.post('/journals/:id/post', async (req: Request, res: Response) => {
+router.post('/journals/:id/post', requireAnyPermission('can_post_journal', 'manual_journals_post'), async (req: Request, res: Response) => {
   const entry = await prisma.journalEntry.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -258,7 +259,7 @@ router.post('/journals/:id/post', async (req: Request, res: Response) => {
 // GET /accounting/trial-balance — General Ledger summary grouped by
 // Assets / Liabilities / Equity / Revenue / Expenses, built from posted
 // journal lines only (draft/void entries never affect the ledger).
-router.get('/trial-balance', async (req: Request, res: Response) => {
+router.get('/trial-balance', requireAnyPermission('can_manage_accounting', 'accounts_view', 'can_post_journal', 'can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 
@@ -332,7 +333,7 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
 
 // GET /accounting/ledger — posted journal lines for one account with a
 // running balance, newest activity last (classic ledger card view).
-router.get('/ledger', async (req: Request, res: Response) => {
+router.get('/ledger', requireAnyPermission('can_manage_accounting', 'accounts_view', 'can_post_journal', 'can_view_financial_reports'), async (req: Request, res: Response) => {
   const { accountId, branchId, fromDate, toDate } = req.query as Record<string, string>
   if (!accountId) throw new AppError('accountId is required', 400, 'VALIDATION_ERROR')
   const orgId = req.user.organizationId
@@ -381,7 +382,7 @@ router.get('/ledger', async (req: Request, res: Response) => {
 })
 
 // POST /accounting/journals/:id/void
-router.post('/journals/:id/void', async (req: Request, res: Response) => {
+router.post('/journals/:id/void', requireAnyPermission('can_void_journal', 'journals_reverse'), async (req: Request, res: Response) => {
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
