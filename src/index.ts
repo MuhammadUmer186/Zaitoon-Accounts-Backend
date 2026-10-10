@@ -3,6 +3,7 @@ import app from './app'
 import { config, prisma } from './config'
 import { bootstrapSuperAdmin } from './utils/bootstrapSuperAdmin'
 import { startRecurringJournalRunner } from './routes/recurringJournals'
+import { normalizeAccounts } from './utils/normalizeAccounts'
 
 async function main() {
   try {
@@ -10,6 +11,7 @@ async function main() {
     console.log('Database connected successfully')
 
     await bootstrapSuperAdmin(prisma)
+    await normalizeAccounts(prisma)
     // Posts due recurring journal entries (on start, then hourly)
     startRecurringJournalRunner()
 
