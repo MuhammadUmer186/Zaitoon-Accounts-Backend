@@ -6,6 +6,7 @@ import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { requireAnyPermission } from '../middleware/authorize'
 import { AppError } from '../middleware/error'
+import { assertBranchAccess } from '../utils/branchScope'
 import { parseImportFile } from '../utils/importFile'
 import { postJournalEntry } from '../utils/ledger'
 import { logAudit } from '../utils/audit'
@@ -32,15 +33,15 @@ async function loadBankAccount(req: Request, id: string) {
     include: { account: { select: { id: true, code: true, name: true } } },
   })
   if (!bank) throw new AppError('Bank account not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, bank.branchId)
   return bank
 }
 
-// Journal lines on the bank's ledger account that count for reconciliation:
-// posted entries, excluding reversal pairs (an entry and its reversal cancel
-// out and never appear on a bank statement).
+// A payment and a subsequent refund can both appear on the bank statement.
+// Keep original and reversal lines available for matching independently.
 const reconcilableLineWhere = (accountId: string, organizationId: string): Prisma.JournalLineWhereInput => ({
   accountId,
-  journalEntry: { organizationId, status: 'posted', reversedById: null, reversalOfId: null },
+  journalEntry: { organizationId, status: 'posted' },
 })
 
 function ledgerLineView(l: {
@@ -62,21 +63,28 @@ router.get('/:bankAccountId', async (req: Request, res: Response) => {
   const bank = await loadBankAccount(req, req.params.bankAccountId)
   const orgId = req.user.organizationId
 
+  const requestedDate = typeof req.query.asOfDate === 'string' ? new Date(req.query.asOfDate) : null
+  if (requestedDate && !Number.isFinite(requestedDate.getTime())) throw new AppError('Invalid reconciliation date', 400, 'VALIDATION_ERROR')
+  if (requestedDate) requestedDate.setUTCHours(23, 59, 59, 999)
+  const newestBalance = await prisma.bankStatementLine.findFirst({
+    where: { bankAccountId: bank.id, balance: { not: null }, ...(requestedDate && { date: { lte: requestedDate } }) },
+    orderBy: [{ date: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+  })
+  const cutoff = requestedDate ?? (newestBalance ? new Date(newestBalance.date) : new Date())
+  if (!requestedDate) cutoff.setUTCHours(23, 59, 59, 999)
   const [statementLines, unreconciled, totals] = await Promise.all([
     prisma.bankStatementLine.findMany({
-      where: { bankAccountId: bank.id },
-      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
-      take: 1000,
+      where: { bankAccountId: bank.id, date: { lte: cutoff } },
+      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
       include: { journalLines: { include: { journalEntry: { select: { entryNo: true, entryDate: true, description: true } } } } },
     }),
     prisma.journalLine.findMany({
-      where: { ...reconcilableLineWhere(bank.accountId, orgId), statementLineId: null },
+      where: { accountId: bank.accountId, statementLineId: null, journalEntry: { organizationId: orgId, status: 'posted', entryDate: { lte: cutoff } } },
       include: { journalEntry: { select: { entryNo: true, entryDate: true, description: true } } },
       orderBy: { journalEntry: { entryDate: 'desc' } },
-      take: 1000,
     }),
     prisma.journalLine.aggregate({
-      where: { accountId: bank.accountId, journalEntry: { organizationId: orgId, status: 'posted' } },
+      where: { accountId: bank.accountId, journalEntry: { organizationId: orgId, status: 'posted', entryDate: { lte: cutoff } } },
       _sum: { debitAmount: true, creditAmount: true },
     }),
   ])
@@ -99,6 +107,7 @@ router.get('/:bankAccountId', async (req: Request, res: Response) => {
   res.json({
     bankAccount: { id: bank.id, bankName: bank.bankName, accountTitle: bank.accountTitle, accountNumberLast4: bank.accountNumberLast4, currency: bank.currency, ledgerAccount: bank.account },
     summary: {
+      asOfDate: cutoff.toISOString(),
       bookBalance,
       statementBalance,
       statementBalanceDate: withBalance ? withBalance.date.toISOString() : null,

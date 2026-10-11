@@ -5,6 +5,11 @@ import { authenticate } from '../middleware/auth'
 import { requireAnyPermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
+import { assertPeriodOpen, validateJournalLines, validatePostingAccounts, reverseJournalEntry } from '../utils/ledger'
+import { financeTransaction, financeLock } from '../utils/financeTransaction'
+import { nextNumber } from '../utils/numbering'
+import { assertBranchAccess, branchFilter } from '../utils/branchScope'
+import { logAudit } from '../utils/audit'
 
 const router = Router()
 
@@ -25,8 +30,8 @@ const accountSchema = z.object({
 const journalLineSchema = z.object({
   accountId: z.string(),
   description: z.string().optional(),
-  debitAmount: z.number().default(0),
-  creditAmount: z.number().default(0),
+  debitAmount: z.number().finite().nonnegative().default(0),
+  creditAmount: z.number().finite().nonnegative().default(0),
   lineOrder: z.number().default(0),
 })
 
@@ -119,7 +124,8 @@ router.get('/journals', requireAnyPermission('can_manage_accounting', 'accounts_
   const { branchId, fromDate, toDate, status } = req.query as Record<string, string>
 
   const where: Record<string, unknown> = { organizationId: req.user.organizationId }
-  if (branchId) where.branchId = branchId
+  const scopedBranch = await branchFilter(req, branchId)
+  if (scopedBranch) where.branchId = scopedBranch
   if (status) where.status = status
   if (fromDate || toDate) {
     where.entryDate = {
@@ -152,16 +158,11 @@ router.post('/journals', requireAnyPermission('can_manage_accounting', 'manual_j
     where: { id: body.branchId, organizationId: req.user.organizationId },
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, branch.id)
 
-  const totalDebit = body.lines.reduce((s, l) => s + l.debitAmount, 0)
-  const totalCredit = body.lines.reduce((s, l) => s + l.creditAmount, 0)
-  const isBalanced = Math.abs(totalDebit - totalCredit) < 0.01
-
-  const year = new Date().getFullYear()
-  const jeCount = await prisma.journalEntry.count({
-    where: { organizationId: req.user.organizationId, entryNo: { startsWith: `JE-${year}-` } },
-  })
-  const entryNo = `JE-${year}-${(jeCount + 1).toString().padStart(4, '0')}`
+  const { totalDebit, totalCredit, isBalanced, resolvedLines } = validateJournalLines(body.lines, false)
+  await validatePostingAccounts(prisma, req.user.organizationId, body.lines)
+  const entryNo = await nextNumber(prisma, 'journalEntry', 'entryNo', 'JE', req.user.organizationId)
 
   const { lines, ...entryData } = body
 
@@ -175,11 +176,12 @@ router.post('/journals', requireAnyPermission('can_manage_accounting', 'manual_j
       totalCredit,
       isBalanced,
       createdBy: req.user.id,
-      lines: { create: lines },
+      lines: { create: resolvedLines },
     },
     include: { lines: { include: { account: true } }, branch: true },
   })
 
+  await logAudit(prisma, { req, action: 'journal.created', module: 'accounting', resourceType: 'journal_entry', resourceId: entry.id })
   res.status(201).json(entry)
 })
 
@@ -196,62 +198,68 @@ router.get('/journals/:id', requireAnyPermission('can_manage_accounting', 'accou
     },
   })
   if (!entry) throw new AppError('Journal entry not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, entry.branchId)
   res.json(entry)
 })
 
 // PUT /accounting/journals/:id
 router.put('/journals/:id', requireAnyPermission('can_manage_accounting', 'manual_journals_create'), async (req: Request, res: Response) => {
-  const entry = await prisma.journalEntry.findFirst({
+  const body = journalEntrySchema.partial().parse(req.body)
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `manual-journal:${req.user.organizationId}:${req.params.id}`)
+  const entry = await tx.journalEntry.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!entry) throw new AppError('Journal entry not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, entry.branchId)
   if (entry.status !== 'draft') throw new AppError('Only draft entries can be edited', 400, 'INVALID_STATUS')
 
-  const body = journalEntrySchema.partial().parse(req.body)
   const { lines, ...entryData } = body
-
-  if (lines !== undefined) {
-    await prisma.journalLine.deleteMany({ where: { journalEntryId: req.params.id } })
-    if (lines.length > 0) {
-      const totalDebit = lines.reduce((s, l) => s + l.debitAmount, 0)
-      const totalCredit = lines.reduce((s, l) => s + l.creditAmount, 0)
-
-      await prisma.journalEntry.update({
-        where: { id: req.params.id },
-        data: {
-          totalDebit,
-          totalCredit,
-          isBalanced: Math.abs(totalDebit - totalCredit) < 0.01,
-          lines: { create: lines },
-        },
-      })
-    }
+  if (entryData.branchId) {
+    const branch = await tx.branch.findFirst({ where: { id: entryData.branchId, organizationId: req.user.organizationId } })
+    if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+    await assertBranchAccess(req, branch.id)
   }
+  const totals = lines ? validateJournalLines(lines, false) : undefined
+  if (lines) await validatePostingAccounts(tx, req.user.organizationId, lines)
 
-  const updated = await prisma.journalEntry.update({
+  const updated = await tx.journalEntry.update({
     where: { id: req.params.id },
     data: {
       ...entryData,
+      ...(totals && { totalDebit: totals.totalDebit, totalCredit: totals.totalCredit, isBalanced: totals.isBalanced, lines: { deleteMany: {}, create: totals.resolvedLines } }),
       ...(entryData.entryDate && { entryDate: new Date(entryData.entryDate) }),
     },
     include: { lines: { include: { account: true } }, branch: true },
   })
-
+  await logAudit(tx, { req, action: 'journal.updated', module: 'accounting', resourceType: 'journal_entry', resourceId: entry.id })
+  return updated
+  })
   res.json(updated)
 })
 
 // POST /accounting/journals/:id/post
 router.post('/journals/:id/post', requireAnyPermission('can_post_journal', 'manual_journals_post'), async (req: Request, res: Response) => {
-  const entry = await prisma.journalEntry.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `manual-journal:${req.user.organizationId}:${req.params.id}`)
+  const entry = await tx.journalEntry.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: { lines: true },
   })
   if (!entry) throw new AppError('Journal entry not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, entry.branchId)
   if (entry.status !== 'draft') throw new AppError('Only draft entries can be posted', 400, 'INVALID_STATUS')
-  if (!entry.isBalanced) throw new AppError('Journal entry is not balanced (debit ≠ credit)', 400, 'UNBALANCED_ENTRY')
+  await assertPeriodOpen(tx, req.user.organizationId, entry.entryDate)
+  const lines = entry.lines.map((line) => ({ accountId: line.accountId, debitAmount: Number(line.debitAmount), creditAmount: Number(line.creditAmount) }))
+  await validatePostingAccounts(tx, req.user.organizationId, lines)
+  const totals = validateJournalLines(lines)
 
-  const updated = await prisma.journalEntry.update({
+  const updated = await tx.journalEntry.update({
     where: { id: req.params.id },
-    data: { status: 'posted', postedBy: req.user.id, postedAt: new Date() },
+    data: { status: 'posted', postedBy: req.user.id, postedAt: new Date(), totalDebit: totals.totalDebit, totalCredit: totals.totalCredit, isBalanced: true },
+  })
+  await logAudit(tx, { req, action: 'journal.posted', module: 'accounting', resourceType: 'journal_entry', resourceId: entry.id })
+  return updated
   })
   res.json(updated)
 })
@@ -264,7 +272,8 @@ router.get('/trial-balance', requireAnyPermission('can_manage_accounting', 'acco
   const orgId = req.user.organizationId
 
   const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
-  if (branchId) entryWhere.branchId = branchId
+  const scopedBranch = await branchFilter(req, branchId)
+  if (scopedBranch) entryWhere.branchId = scopedBranch
   if (fromDate || toDate) {
     entryWhere.entryDate = {
       ...(fromDate && { gte: new Date(fromDate) }),
@@ -273,7 +282,7 @@ router.get('/trial-balance', requireAnyPermission('can_manage_accounting', 'acco
   }
 
   const accounts = await prisma.account.findMany({
-    where: { organizationId: orgId, status: 'ACTIVE' },
+    where: { organizationId: orgId },
     orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
   })
 
@@ -342,7 +351,8 @@ router.get('/ledger', requireAnyPermission('can_manage_accounting', 'accounts_vi
   if (!account) throw new AppError('Account not found', 404, 'NOT_FOUND')
 
   const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
-  if (branchId) entryWhere.branchId = branchId
+  const scopedBranch = await branchFilter(req, branchId)
+  if (scopedBranch) entryWhere.branchId = scopedBranch
   if (fromDate || toDate) {
     entryWhere.entryDate = {
       ...(fromDate && { gte: new Date(fromDate) }),
@@ -386,15 +396,27 @@ router.post('/journals/:id/void', requireAnyPermission('can_void_journal', 'jour
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
-  const entry = await prisma.journalEntry.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `manual-journal:${req.user.organizationId}:${req.params.id}`)
+  const entry = await tx.journalEntry.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!entry) throw new AppError('Journal entry not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, entry.branchId)
   if (entry.status === 'void') throw new AppError('Entry is already voided', 400, 'INVALID_STATUS')
 
-  const updated = await prisma.journalEntry.update({
+  if (entry.status === 'posted') {
+    if (entry.sourceType) throw new AppError('Cancel this entry through its source transaction', 400, 'SOURCE_REVERSAL_REQUIRED')
+    const reversal = await reverseJournalEntry(tx, entry.id, req.user.id, voidReason, req.user.organizationId)
+    await logAudit(tx, { req, action: 'journal.reversed', module: 'accounting', resourceType: 'journal_entry', resourceId: entry.id, newData: { reversalId: reversal.id, reason: voidReason } })
+    return tx.journalEntry.findUnique({ where: { id: entry.id } })
+  }
+  const cancelled = await tx.journalEntry.update({
     where: { id: req.params.id },
     data: { status: 'void', voidReason },
+  })
+  await logAudit(tx, { req, action: 'journal.cancelled', module: 'accounting', resourceType: 'journal_entry', resourceId: entry.id, newData: { reason: voidReason } })
+  return cancelled
   })
   res.json(updated)
 })

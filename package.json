@@ -12,6 +12,7 @@
     "db:sync-permissions": "node prisma/sync-permissions.js",
     "db:reset-logins": "node prisma/reset-logins.js",
     "db:upgrade-chart-of-accounts": "node prisma/upgrade-chart-of-accounts.js",
+    "db:upgrade-finance-controls": "prisma db execute --schema prisma/schema.prisma --file prisma/sql/finance-document-sequence.sql",
     "db:studio": "prisma studio"
   },
   "dependencies": {

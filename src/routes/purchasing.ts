@@ -11,6 +11,7 @@ import { createPurchaseBill, PurchaseItemInput } from '../services/purchasing'
 import { extractBill, isBillExtractionEnabled } from '../services/billExtraction'
 import { parseImportFile, sendImportTemplate, assertRecognizedColumns } from '../utils/importFile'
 import { logAudit } from '../utils/audit'
+import { financeLock } from '../utils/financeTransaction'
 import { assertBranchAccess, getBranchScope, BranchScope } from '../utils/branchScope'
 
 const router = Router()
@@ -30,12 +31,14 @@ const createPurchaseSchema = z
   .object({
     branchId: z.string(),
     supplierId: z.string().optional(),
+    supplierBillNo: z.string().trim().max(100).optional(),
     vendorName: z.string().optional(),
     vendorCity: z.string().optional(),
     vendorVatNumber: z.string().optional(),
     categoryId: z.string().min(1, 'Category is required'),
     supplyDate: z.string(),
     vatPercent: z.coerce.number().min(0).max(100),
+    discountAmount: z.coerce.number().finite().min(0).default(0),
     items: z.string(), // JSON-stringified purchaseItemSchema[]
   })
   .refine((b) => b.supplierId || b.vendorName, {
@@ -100,7 +103,9 @@ router.post(
           })
           if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
         } else {
-          supplier = await tx.supplier.create({
+          await financeLock(tx as unknown as typeof prisma, `supplier:${req.user.organizationId}:${body.vendorVatNumber?.trim() || body.vendorName!.trim().toLowerCase()}`)
+          supplier = await tx.supplier.findFirst({ where: { organizationId: req.user.organizationId, ...(body.vendorVatNumber?.trim() ? { vatNumber: body.vendorVatNumber.trim() } : { name: { equals: body.vendorName!.trim(), mode: 'insensitive' } }) } })
+          supplier ??= await tx.supplier.create({
             data: {
               organizationId: req.user.organizationId,
               name: body.vendorName!,
@@ -117,11 +122,13 @@ router.post(
           branchId: body.branchId,
           supplierId: supplier.id,
           supplierName: supplier.name,
+          supplierBillNo: body.supplierBillNo,
           categoryId: category.id,
           supplyDate,
           paymentDate: supplyDate,
           paymentType: 'cash',
           vatPercent: body.vatPercent,
+          discountAmount: body.discountAmount,
           amountPaid: 0,
           items: itemInputs,
           createdBy: req.user.id,

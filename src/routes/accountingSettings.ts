@@ -62,6 +62,14 @@ router.put('/mappings', requirePermission('account_mappings_manage'), async (req
   const before = await prisma.accountingMapping.findMany({ where: { organizationId: orgId } })
 
   await prisma.$transaction(async (tx) => {
+    for (const mapping of [...before, ...body.mappings]) {
+      if (!mapping.accountId) continue
+      await tx.accountingMappingAccount.upsert({
+        where: { organizationId_key_accountId: { organizationId: orgId, key: mapping.key, accountId: mapping.accountId } },
+        create: { organizationId: orgId, key: mapping.key, accountId: mapping.accountId },
+        update: {},
+      })
+    }
     for (const m of body.mappings) {
       if (!m.accountId) {
         await tx.accountingMapping.deleteMany({ where: { organizationId: orgId, key: m.key } })

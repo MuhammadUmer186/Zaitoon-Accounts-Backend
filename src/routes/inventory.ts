@@ -9,6 +9,7 @@ import { paginate, paginatedResponse, parsePageParams } from '../utils/paginatio
 import { applyStockIn, applyStockOut } from '../utils/stock'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { financeTransaction, financeLock } from '../utils/financeTransaction'
 import { postJournalEntry, resolveMappedAccount } from '../utils/ledger'
 import { assertBranchAccess, branchFilter, getBranchScope } from '../utils/branchScope'
 
@@ -901,7 +902,9 @@ router.post('/wastage', requireAnyPermission('can_manage_inventory'), async (req
 
 // POST /inventory/wastage/:id/approve
 router.post('/wastage/:id/approve', requireAnyPermission('can_approve_wastage'), async (req: Request, res: Response) => {
-  const report = await prisma.wastageReport.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `wastage:${req.user.organizationId}:${req.params.id}`)
+  const report = await tx.wastageReport.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { items: true },
   })
@@ -909,44 +912,24 @@ router.post('/wastage/:id/approve', requireAnyPermission('can_approve_wastage'),
   if (report.status !== 'draft') throw new AppError('Report already processed', 400, 'INVALID_STATUS')
   await assertBranchAccess(req, report.branchId)
 
-  // Reduce stock for each item
+  let totalValue = 0
   for (const wi of report.items) {
-    const stock = await prisma.branchStock.findUnique({
-      where: { branchId_itemId: { branchId: report.branchId, itemId: wi.itemId } },
+    const used = await applyStockOut(tx, {
+      organizationId: req.user.organizationId, branchId: report.branchId,
+      itemId: wi.itemId, quantity: wi.quantity, movementType: 'wastage',
+      referenceType: 'wastage_report', referenceId: report.id, createdBy: req.user.id,
     })
-
-    if (stock) {
-      const newQty = Math.max(0, stock.quantityOnHand - wi.quantity)
-      const newValue = newQty * stock.averageCost
-      await prisma.branchStock.update({
-        where: { branchId_itemId: { branchId: report.branchId, itemId: wi.itemId } },
-        data: { quantityOnHand: newQty, totalValue: newValue, lastUpdated: new Date() },
-      })
-    }
-
-    // Record movement
-    await prisma.stockMovement.create({
-      data: {
-        organizationId: req.user.organizationId,
-        branchId: report.branchId,
-        itemId: wi.itemId,
-        movementType: 'wastage',
-        quantity: -wi.quantity,
-        unitCost: wi.unitCost,
-        totalValue: wi.totalValue,
-        referenceType: 'wastage_report',
-        referenceId: report.id,
-        createdBy: req.user.id,
-      },
-    })
+    totalValue += used.totalValue
+    await tx.wastageItem.update({ where: { id: wi.id }, data: { unitCost: used.unitCost, totalValue: used.totalValue } })
   }
+  totalValue = Math.round(totalValue * 100) / 100
 
   const [wastageExpense, inventory] = await Promise.all([
-    resolveMappedAccount(prisma, req.user.organizationId, 'WASTAGE_EXPENSE'),
-    resolveMappedAccount(prisma, req.user.organizationId, 'INVENTORY'),
+    resolveMappedAccount(tx, req.user.organizationId, 'WASTAGE_EXPENSE'),
+    resolveMappedAccount(tx, req.user.organizationId, 'INVENTORY'),
   ])
 
-  const je = await postJournalEntry(prisma, {
+  const je = await postJournalEntry(tx, {
     organizationId: req.user.organizationId,
     branchId: report.branchId,
     entryDate: report.reportDate,
@@ -957,17 +940,19 @@ router.post('/wastage/:id/approve', requireAnyPermission('can_approve_wastage'),
     description: `Wastage Report - ${report.id}`,
     createdBy: req.user.id,
     lines: [
-      { accountId: wastageExpense.id, description: 'Stock written off as wastage', debitAmount: report.totalValue },
-      { accountId: inventory.id, description: 'Inventory reduction (wastage)', creditAmount: report.totalValue },
+      { accountId: wastageExpense.id, description: 'Stock written off as wastage', debitAmount: totalValue },
+      { accountId: inventory.id, description: 'Inventory reduction (wastage)', creditAmount: totalValue },
     ],
   })
 
-  const updated = await prisma.wastageReport.update({
+  const result = await tx.wastageReport.update({
     where: { id: req.params.id },
-    data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId: je?.id },
+    data: { totalValue, status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId: je?.id },
     include: { items: { include: { item: true } }, branch: true },
   })
 
+  return result
+  })
   res.json(updated)
 })
 

@@ -341,6 +341,15 @@ export async function extractBill(organizationId: string, file: Express.Multer.F
   ])
 
   const raw = await callModel(file, org?.name ?? 'Unknown', categories.map((c) => c.name))
+  return prepareBillExtraction(raw, suppliers, items, categories)
+}
+
+// Pure normalization and arithmetic checks, independently testable without
+// sending documents to the extraction provider.
+export function prepareBillExtraction(raw: RawExtraction,
+  suppliers: { id: string; name: string; tradeName: string | null; vatNumber: string | null }[],
+  items: { id: string; code: string; name: string }[],
+  categories: { id: string; name: string }[]): BillExtractionResult {
   const warnings = [...raw.warnings]
 
   // ── Vendor → existing supplier ──
@@ -456,16 +465,16 @@ export async function extractBill(organizationId: string, file: Express.Multer.F
   }
 
   // ── Arithmetic cross-checks against the printed totals ──
-  const computedSubtotal = round(lines.reduce((s, l) => s + l.quantity * l.unitCost, 0), 2)
-  const tolerance = (amount: number) => Math.max(0.05, Math.abs(amount) * 0.005)
+  const computedSubtotal = round(lines.reduce((s, l) => s + round(l.quantity * l.unitCost, 2), 0), 2)
+  const tolerance = (_amount: number) => Math.max(0.05, lines.length * 0.01)
   if (raw.subtotal != null && Math.abs(computedSubtotal - raw.subtotal) > tolerance(raw.subtotal)) {
     warnings.push(`Line items add up to ${computedSubtotal.toFixed(2)} but the bill's subtotal is ${raw.subtotal.toFixed(2)} — a line may be missing or misread`)
   }
   if (raw.discount) {
-    warnings.push(`The bill has an invoice-level discount of ${raw.discount.toFixed(2)} that is not included in the line items — adjust unit costs so the total matches the bill`)
+    warnings.push(`Invoice-level discount ${raw.discount.toFixed(2)} will be applied separately — confirm it is not already included in the unit costs`)
   }
-  const computedTotal = vatPercent != null ? round(computedSubtotal * (1 + vatPercent / 100), 2) : null
-  if (computedTotal != null && raw.total != null && !raw.discount && Math.abs(computedTotal - raw.total) > tolerance(raw.total)) {
+  const computedTotal = vatPercent != null ? round((computedSubtotal - (raw.discount ?? 0)) * (1 + vatPercent / 100), 2) : null
+  if (computedTotal != null && raw.total != null && Math.abs(computedTotal - raw.total) > tolerance(raw.total)) {
     warnings.push(`Calculated total ${computedTotal.toFixed(2)} differs from the bill's total ${raw.total.toFixed(2)} — check quantities, prices and VAT`)
   }
   if (raw.currency && !/^(sar|sr|ر\.?\s?س|riyal|ريال|﷼)/i.test(raw.currency.trim())) {

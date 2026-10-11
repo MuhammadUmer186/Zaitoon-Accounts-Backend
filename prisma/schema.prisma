@@ -7,6 +7,26 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model DocumentSequence {
+  organizationId String
+  model          String
+  field          String
+  prefix         String
+  year           Int
+  lastNumber     Int
+
+  @@id([organizationId, model, field, prefix, year])
+}
+
+// Preserve all accounts used by each posting role across mapping changes.
+model AccountingMappingAccount {
+  organizationId String
+  key            AccountingMappingKey
+  accountId      String
+
+  @@id([organizationId, key, accountId])
+}
+
 model Organization {
   id                   String              @id @default(cuid())
   name                 String

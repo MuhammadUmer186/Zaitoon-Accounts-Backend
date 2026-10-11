@@ -1,3 +1,5 @@
+import { ledgerProfit } from '../services/ledgerProfit'
+import { roleAccountIds } from '../services/financialSummary'
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
@@ -260,26 +262,12 @@ router.get('/branch-profit', requireAnyPermission('can_view_reports'), async (re
 
   const rows = await Promise.all(
     branches.map(async (b) => {
-      const [salesAgg, expAgg, billsAgg] = await Promise.all([
-        prisma.dailySale.aggregate({
-          where: { organizationId: orgId, branchId: b.id, status: { not: 'void' }, ...(saleDate && { saleDate }) },
-          _sum: { netAmount: true },
-        }),
-        prisma.expense.aggregate({
-          where: { source: { not: 'purchasing' }, organizationId: orgId, branchId: b.id, status: { not: 'void' }, ...(expenseDate && { expenseDate }) },
-          _sum: { totalAmount: true },
-        }),
-        // Supplier purchases count as expenses here too
-        prisma.bill.aggregate({
-          where: { organizationId: orgId, branchId: b.id, status: { not: 'void' }, ...(expenseDate && { billDate: expenseDate }) },
-          _sum: { totalAmount: true },
-        }),
-      ])
-      const totalSales = round2(salesAgg._sum.netAmount ?? 0)
-      const operatingExpenses = round2(expAgg._sum.totalAmount ?? 0)
-      const purchases = round2(billsAgg._sum.totalAmount ?? 0)
-      const totalExpenses = round2(operatingExpenses + purchases)
-      const profit = round2(totalSales - totalExpenses)
+      const figures = await ledgerProfit(prisma, orgId, b.id, dateRangeFilter(fromDate, toDate))
+      const totalSales = figures.revenue
+      const operatingExpenses = figures.operatingExpenses
+      const purchases = figures.costOfSales // compatibility key: displayed as Cost of Sales
+      const totalExpenses = figures.expenses
+      const profit = figures.netProfit
       return {
         branch: b.name,
         totalSales,
@@ -302,7 +290,7 @@ router.get('/branch-profit', requireAnyPermission('can_view_reports'), async (re
     summaryLine: '',
     kpis: [
       { label: 'Net sales', value: totSales, hint: `${plural(rows.length, 'branch', 'branches')}` },
-      { label: 'Total spend', value: totExp, hint: 'Purchases + operating expenses' },
+      { label: 'Total spend', value: totExp, hint: 'Posted cost of sales + operating expenses' },
       { label: 'Margin', value: totSales > 0 ? round2((totProfit / totSales) * 100) : 0, format: 'percent', hint: 'Profit ÷ net sales', tone: totProfit >= 0 ? 'positive' : 'negative' },
       { label: 'Profit', value: totProfit, hint: lossMaking ? `${plural(lossMaking, 'branch', 'branches')} at a loss` : 'All branches profitable', tone: 'dark' },
     ],
@@ -311,14 +299,14 @@ router.get('/branch-profit', requireAnyPermission('can_view_reports'), async (re
         type: 'table', id: 'branches', title: 'Branch profitability', subtitle: 'Ranked by profit, highest first', primary: true,
         columns: [
           { key: 'branch', label: 'Branch' }, { key: 'totalSales', label: 'Net sales', format: 'money' },
-          { key: 'purchases', label: 'Purchases', format: 'money' }, { key: 'operatingExpenses', label: 'Operating exp.', format: 'money' },
+          { key: 'purchases', label: 'Cost of Sales', format: 'money' }, { key: 'operatingExpenses', label: 'Operating exp.', format: 'money' },
           { key: 'totalExpenses', label: 'Total spend', format: 'money' }, { key: 'profit', label: 'Profit', format: 'money' },
           { key: 'profitMarginPct', label: 'Margin', format: 'percent' },
         ],
         rows,
         totals: { branch: 'Total', totalSales: totSales, purchases: sum(rows, (r) => r.purchases), operatingExpenses: sum(rows, (r) => r.operatingExpenses), totalExpenses: totExp, profit: totProfit, profitMarginPct: totSales > 0 ? round2((totProfit / totSales) * 100) : 0 },
       },
-      { type: 'note', id: 'basis', title: 'Basis of preparation', text: 'Operational view: net sales from approved daily sales, minus supplier purchases (bills, including VAT) and operating expenses. Payments made against purchases are not counted again. For the accounting view use the Profit & Loss statement, which is built from posted journal entries.' },
+      { type: 'note', id: 'basis', title: 'Basis of preparation', text: 'Prepared from posted journal entries. Inventory purchases affect profit when stock is consumed; recoverable VAT and supplier payments are excluded from expenses.' },
     ],
   }
   report.summaryLine = `Period: ${report.periodLabel}  |  ${plural(rows.length, 'branch', 'branches')}`
@@ -992,7 +980,7 @@ router.get('/profit-loss', requireAnyPermission('can_view_financial_reports'), a
   const orgId = req.user.organizationId
 
   const accounts = await prisma.account.findMany({
-    where: { organizationId: orgId, status: 'ACTIVE', accountClass: { in: ['REVENUE', 'EXPENSE'] } },
+    where: { organizationId: orgId, accountClass: { in: ['REVENUE', 'EXPENSE'] } },
     select: { id: true, code: true, name: true, accountClass: true, reportingGroup: true },
     orderBy: { code: 'asc' },
   })
@@ -1066,7 +1054,7 @@ router.get('/trial-balance', requireAnyPermission('can_view_financial_reports'),
 
   const [org, accounts] = await Promise.all([
     prisma.organization.findUnique({ where: { id: orgId }, select: { fiscalYearStart: true } }),
-    prisma.account.findMany({ where: { organizationId: orgId, status: 'ACTIVE' }, orderBy: { code: 'asc' } }),
+    prisma.account.findMany({ where: { organizationId: orgId }, orderBy: { code: 'asc' } }),
   ])
   const fyStart = fiscalYearStartFor(asOf, org?.fiscalYearStart ?? '01-01')
   const periodStart = fromDate ? new Date(fromDate) : fyStart
@@ -1153,7 +1141,7 @@ router.get('/balance-sheet', requireAnyPermission('can_view_financial_reports'),
 
   const [org, accounts] = await Promise.all([
     prisma.organization.findUnique({ where: { id: orgId }, select: { fiscalYearStart: true } }),
-    prisma.account.findMany({ where: { organizationId: orgId, status: 'ACTIVE' }, orderBy: { code: 'asc' } }),
+    prisma.account.findMany({ where: { organizationId: orgId }, orderBy: { code: 'asc' } }),
   ])
   const fyStart = fiscalYearStartFor(asOf, org?.fiscalYearStart ?? '01-01')
   const [cumulative, thisYear, beforeFy] = await Promise.all([
@@ -1273,13 +1261,18 @@ router.get('/vat-summary', requireAnyPermission('can_view_financial_reports'), a
     prisma.accountingMapping.findUnique({ where: { organizationId_key: { organizationId: orgId, key: 'INPUT_VAT' } } }),
   ])
 
+  const [outputIds, inputIds] = await Promise.all([
+    roleAccountIds(prisma, orgId, 'OUTPUT_VAT', 'Output VAT'),
+    roleAccountIds(prisma, orgId, 'INPUT_VAT', 'Input VAT'),
+  ])
+
   const [outputLines, inputLines] = await Promise.all([
-    outputMapping
-      ? prisma.journalLine.findMany({ where: { accountId: outputMapping.accountId, journalEntry: entryWhere }, select: { debitAmount: true, creditAmount: true } })
+    outputIds.length
+      ? prisma.journalLine.findMany({ where: { accountId: { in: outputIds }, journalEntry: entryWhere }, select: { debitAmount: true, creditAmount: true } })
       : Promise.resolve([]),
-    inputMapping
+    inputIds.length
       ? prisma.journalLine.findMany({
-          where: { accountId: inputMapping.accountId, journalEntry: entryWhere },
+          where: { accountId: { in: inputIds }, journalEntry: entryWhere },
           select: { debitAmount: true, creditAmount: true, journalEntry: { select: { sourceType: true } } },
         })
       : Promise.resolve([]),
@@ -1336,7 +1329,7 @@ router.get('/vat-summary', requireAnyPermission('can_view_financial_reports'), a
         rows,
       },
       ...(!outputMapping || !inputMapping ? [{ type: 'note' as const, id: 'config', title: 'Configuration warning', tone: 'warning' as const, text: `${!outputMapping ? 'Output VAT' : ''}${!outputMapping && !inputMapping ? ' and ' : ''}${!inputMapping ? 'Input VAT' : ''} account mapping is not configured — those figures show as zero. Set it under Chart of Accounts → Settings.` }] : []),
-      { type: 'note', id: 'basis', title: 'Notes', text: 'Figures come from posted activity on the mapped Output VAT and Input VAT accounts, so they match the general ledger exactly.' },
+      { type: 'note', id: 'basis', title: 'Notes', text: 'Figures include posted activity on current and historically mapped tax accounts and the Input VAT and Output VAT reporting groups.' },
     ],
   }
   await sendProReport(res, format, report, legacy)

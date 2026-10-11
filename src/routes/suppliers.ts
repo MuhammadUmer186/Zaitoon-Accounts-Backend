@@ -7,6 +7,10 @@ import { assertBranchAccess, branchFilter } from '../utils/branchScope'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { financeTransaction, financeLock } from '../utils/financeTransaction'
+import { logAudit } from '../utils/audit'
+import { validateBillAmounts } from '../services/billAmounts'
+import { applyStockIn } from '../utils/stock'
 import { postJournalEntry, resolveMappedAccount, mappingKeyForPaymentMethod, reverseJournalEntry } from '../utils/ledger'
 
 const router = Router()
@@ -51,7 +55,7 @@ const billSchema = z.object({
 const paymentSchema = z.object({
   paymentDate: z.string().or(z.date()),
   amount: z.number().positive(),
-  paymentMethod: z.string(),
+  paymentMethod: z.enum(['cash', 'bank_transfer', 'bank', 'cheque', 'card']),
   referenceNo: z.string().optional(),
   notes: z.string().optional(),
 })
@@ -165,20 +169,30 @@ router.get('/bills', requireAnyPermission('can_manage_suppliers', 'can_create_bi
 // POST /bills
 router.post('/bills', requireAnyPermission('can_create_bill', 'can_manage_suppliers'), async (req: Request, res: Response) => {
   const body = billSchema.parse(req.body)
+  const bill = await financeTransaction(prisma, async (tx) => {
+  validateBillAmounts(body)
 
-  const branch = await prisma.branch.findFirst({
+  const branch = await tx.branch.findFirst({
     where: { id: body.branchId, organizationId: req.user.organizationId },
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, branch.id)
+  const supplier = await tx.supplier.findFirst({ where: { id: body.supplierId, organizationId: req.user.organizationId } })
+  if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
 
-  const billNo = await nextNumber(prisma, 'bill', 'billNo', 'BILL', req.user.organizationId)
+  if (body.supplierBillNo?.trim()) {
+    await financeLock(tx, `vendor-invoice:${req.user.organizationId}:${body.supplierId}`)
+    const duplicate = await tx.bill.findFirst({ where: { organizationId: req.user.organizationId, supplierId: body.supplierId, supplierBillNo: { equals: body.supplierBillNo.trim(), mode: 'insensitive' }, status: { not: 'void' } } })
+    if (duplicate) throw new AppError('This supplier invoice has already been entered', 400, 'DUPLICATE_VENDOR_INVOICE')
+  }
+  const billNo = await nextNumber(tx, 'bill', 'billNo', 'BILL', req.user.organizationId)
   const balanceDue = body.totalAmount
 
   const { items, ...billData } = body
 
   // No journal posting here — a draft bill has no financial impact yet.
   // Posting happens at /bills/:id/approve, the authoritative posting point.
-  const bill = await prisma.bill.create({
+  const result = await tx.bill.create({
     data: {
       ...billData,
       billNo,
@@ -192,6 +206,9 @@ router.post('/bills', requireAnyPermission('can_create_bill', 'can_manage_suppli
     include: { items: true, supplier: true, branch: true },
   })
 
+  await logAudit(tx, { req, action: 'bill.created', module: 'purchasing', resourceType: 'bill', resourceId: result.id })
+  return result
+  })
   res.status(201).json(bill)
 })
 
@@ -217,34 +234,45 @@ router.get('/bills/:id', requireAnyPermission('can_manage_suppliers', 'can_creat
 
 // PUT /bills/:id
 router.put('/bills/:id', requireAnyPermission('can_create_bill', 'can_manage_suppliers'), async (req: Request, res: Response) => {
-  const bill = await prisma.bill.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `bill:${req.user.organizationId}:${req.params.id}`)
+  const bill = await tx.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: { items: true },
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, bill.branchId)
   if (bill.status !== 'draft') throw new AppError('Only draft bills can be edited', 400, 'INVALID_STATUS')
 
   const body = billSchema.partial().parse(req.body)
+  const merged = { ...bill, ...body }
+  validateBillAmounts(merged)
+  const branch = await tx.branch.findFirst({ where: { id: merged.branchId, organizationId: req.user.organizationId } })
+  const supplier = await tx.supplier.findFirst({ where: { id: merged.supplierId, organizationId: req.user.organizationId } })
+  if (!branch || !supplier) throw new AppError('Branch or supplier not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, branch.id)
+  if (merged.supplierBillNo?.trim()) {
+    await financeLock(tx, `vendor-invoice:${req.user.organizationId}:${merged.supplierId}`)
+    const duplicate = await tx.bill.findFirst({ where: { organizationId: req.user.organizationId, supplierId: merged.supplierId, supplierBillNo: { equals: merged.supplierBillNo.trim(), mode: 'insensitive' }, status: { not: 'void' }, id: { not: bill.id } } })
+    if (duplicate) throw new AppError('This supplier invoice has already been entered', 400, 'DUPLICATE_VENDOR_INVOICE')
+  }
   const { items, ...billData } = body
 
-  if (items !== undefined) {
-    await prisma.billItem.deleteMany({ where: { billId: req.params.id } })
-    if (items.length > 0) {
-      await prisma.billItem.createMany({
-        data: items.map((i) => ({ ...i, billId: req.params.id })),
-      })
-    }
-  }
-
-  const updated = await prisma.bill.update({
+  const result = await tx.bill.update({
     where: { id: req.params.id },
     data: {
       ...billData,
+      balanceDue: merged.totalAmount,
+      ...(items && { items: { deleteMany: {}, create: items } }),
       ...(billData.billDate && { billDate: new Date(billData.billDate) }),
       ...(billData.dueDate && { dueDate: new Date(billData.dueDate) }),
     },
     include: { items: true, payments: true, supplier: true, branch: true },
   })
 
+  await logAudit(tx, { req, action: 'bill.updated', module: 'purchasing', resourceType: 'bill', resourceId: bill.id })
+  return result
+  })
   res.json(updated)
 })
 
@@ -252,30 +280,30 @@ router.put('/bills/:id', requireAnyPermission('can_create_bill', 'can_manage_sup
 // manually-created bill (PO-received bills post at receiving time instead —
 // see inventory.ts /purchases — since that path has no separate draft phase).
 router.post('/bills/:id/approve', requireAnyPermission('can_approve_bill'), async (req: Request, res: Response) => {
-  const bill = await prisma.bill.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `bill:${req.user.organizationId}:${req.params.id}`)
+  const bill = await tx.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { items: true },
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, bill.branchId)
   if (bill.status !== 'draft') throw new AppError('Only draft bills can be approved', 400, 'INVALID_STATUS')
 
-  // Debit the line-items' accounts when they all agree on one, otherwise
-  // default to Inventory; VAT (if any) is split onto its own Input VAT line.
-  const uniformAccountId = bill.items.length > 0 && bill.items.every((i) => i.accountId && i.accountId === bill.items[0].accountId)
-    ? bill.items[0].accountId!
-    : undefined
-
+  const billLines = validateBillAmounts(bill)
   const netAmount = bill.totalAmount - bill.vatAmount
-
-  const [debitAccount, inputVat, payable] = await Promise.all([
-    uniformAccountId
-      ? prisma.account.findUniqueOrThrow({ where: { id: uniformAccountId } })
-      : resolveMappedAccount(prisma, req.user.organizationId, 'INVENTORY'),
-    bill.vatAmount > 0 ? resolveMappedAccount(prisma, req.user.organizationId, 'INPUT_VAT') : null,
-    resolveMappedAccount(prisma, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
+  const debitLines: { accountId: string; description: string; debitAmount: number }[] = []
+  for (const line of billLines) {
+    const accountId = line.accountId ?? (await resolveMappedAccount(tx, req.user.organizationId, line.itemId ? 'INVENTORY' : 'DEFAULT_EXPENSE')).id
+    debitLines.push({ accountId, description: line.description, debitAmount: line.netAmount })
+  }
+  if (!debitLines.length) debitLines.push({ accountId: (await resolveMappedAccount(tx, req.user.organizationId, 'DEFAULT_EXPENSE')).id, description: 'Bill items', debitAmount: netAmount })
+  const [inputVat, payable] = await Promise.all([
+    bill.vatAmount > 0 ? resolveMappedAccount(tx, req.user.organizationId, 'INPUT_VAT') : null,
+    resolveMappedAccount(tx, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
   ])
 
-  const je = await postJournalEntry(prisma, {
+  const je = await postJournalEntry(tx, {
     organizationId: req.user.organizationId,
     branchId: bill.branchId,
     entryDate: bill.billDate,
@@ -286,16 +314,24 @@ router.post('/bills/:id/approve', requireAnyPermission('can_approve_bill'), asyn
     description: `Supplier Bill ${bill.billNo}`,
     createdBy: req.user.id,
     lines: [
-      { accountId: debitAccount.id, description: 'Bill items', debitAmount: netAmount },
+      ...debitLines,
       ...(inputVat ? [{ accountId: inputVat.id, description: 'Input VAT', debitAmount: bill.vatAmount }] : []),
       { accountId: payable.id, description: 'Payable to supplier', creditAmount: bill.totalAmount },
     ],
   })
 
-  const updated = await prisma.bill.update({
+  for (const line of billLines) {
+    if (!line.itemId) continue
+    await applyStockIn(tx, { organizationId: req.user.organizationId, branchId: bill.branchId, itemId: line.itemId, quantity: line.quantity, unitCost: line.netAmount / line.quantity, referenceType: 'bill', referenceId: bill.id, createdBy: req.user.id })
+  }
+
+  const result = await tx.bill.update({
     where: { id: req.params.id },
     data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId: je?.id },
     include: { items: true, payments: true, supplier: true, branch: true },
+  })
+  await logAudit(tx, { req, action: 'bill.approved', module: 'purchasing', resourceType: 'bill', resourceId: bill.id })
+  return result
   })
   res.json(updated)
 })
@@ -305,19 +341,29 @@ router.post('/bills/:id/void', requireAnyPermission('can_approve_bill', 'can_man
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
-  const bill = await prisma.bill.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `bill:${req.user.organizationId}:${req.params.id}`)
+  const bill = await tx.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, bill.branchId)
   if (bill.status === 'void') throw new AppError('Bill is already voided', 400, 'INVALID_STATUS')
 
+  const payments = await tx.payment.count({ where: { billId: bill.id } })
+  const movements = await tx.stockMovement.count({ where: { organizationId: req.user.organizationId, referenceId: bill.id } })
+  if (bill.paidAmount > 0 || payments > 0 || movements > 0) throw new AppError('Paid or stocked purchases require a credit note, return or refund; they cannot be voided directly', 400, 'PURCHASE_RETURN_REQUIRED')
+
   if (bill.journalEntryId) {
-    await reverseJournalEntry(prisma, bill.journalEntryId, req.user.id, `Void — ${voidReason}`)
+    await reverseJournalEntry(tx, bill.journalEntryId, req.user.id, `Void — ${voidReason}`, req.user.organizationId)
   }
 
-  const updated = await prisma.bill.update({
+  const result = await tx.bill.update({
     where: { id: req.params.id },
     data: { status: 'void', voidReason },
+  })
+  await logAudit(tx, { req, action: 'bill.voided', module: 'purchasing', resourceType: 'bill', resourceId: bill.id })
+  return result
   })
   res.json(updated)
 })
@@ -326,11 +372,14 @@ router.post('/bills/:id/void', requireAnyPermission('can_approve_bill', 'can_man
 router.post('/bills/:id/payments', requireAnyPermission('can_make_payment'), async (req: Request, res: Response) => {
   const body = paymentSchema.parse(req.body)
 
-  const bill = await prisma.bill.findFirst({
+  const result = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `bill:${req.user.organizationId}:${req.params.id}`)
+  const bill = await tx.bill.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!bill) throw new AppError('Bill not found', 404, 'NOT_FOUND')
-  if (bill.status === 'void') throw new AppError('Cannot pay a voided bill', 400, 'INVALID_STATUS')
+  await assertBranchAccess(req, bill.branchId)
+  if (!['approved', 'partial'].includes(bill.status)) throw new AppError('Only approved bills with an outstanding balance can be paid', 400, 'INVALID_STATUS')
   // Purchasing entries are paid only from Expenses → New Expense → Purchasing
   // (which also records Paid By and the expense row) — never from here.
   if (bill.source === 'purchasing') {
@@ -341,7 +390,12 @@ router.post('/bills/:id/payments', requireAnyPermission('can_make_payment'), asy
     throw new AppError('Payment amount exceeds balance due', 400, 'OVERPAYMENT')
   }
 
-  const payment = await prisma.payment.create({
+  const [payable, paidFrom] = await Promise.all([
+    resolveMappedAccount(tx, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
+    resolveMappedAccount(tx, req.user.organizationId, mappingKeyForPaymentMethod(body.paymentMethod)),
+  ])
+
+  const payment = await tx.payment.create({
     data: {
       ...body,
       paymentDate: new Date(body.paymentDate),
@@ -352,12 +406,7 @@ router.post('/bills/:id/payments', requireAnyPermission('can_make_payment'), asy
     },
   })
 
-  const [payable, paidFrom] = await Promise.all([
-    resolveMappedAccount(prisma, req.user.organizationId, 'ACCOUNTS_PAYABLE'),
-    resolveMappedAccount(prisma, req.user.organizationId, mappingKeyForPaymentMethod(payment.paymentMethod)),
-  ])
-
-  const je = await postJournalEntry(prisma, {
+  const je = await postJournalEntry(tx, {
     organizationId: req.user.organizationId,
     branchId: bill.branchId,
     entryDate: payment.paymentDate,
@@ -372,18 +421,21 @@ router.post('/bills/:id/payments', requireAnyPermission('can_make_payment'), asy
       { accountId: paidFrom.id, description: 'Payment made', creditAmount: payment.amount },
     ],
   })
-  await prisma.payment.update({ where: { id: payment.id }, data: { journalEntryId: je?.id } })
+  await tx.payment.update({ where: { id: payment.id }, data: { journalEntryId: je?.id } })
 
   const newPaidAmount = bill.paidAmount + body.amount
   const newBalanceDue = bill.totalAmount - newPaidAmount
   const newStatus = newBalanceDue <= 0.01 ? 'paid' : bill.paidAmount === 0 ? 'partial' : 'partial'
 
-  await prisma.bill.update({
+  await tx.bill.update({
     where: { id: req.params.id },
     data: { paidAmount: newPaidAmount, balanceDue: newBalanceDue, status: newStatus },
   })
 
-  res.status(201).json({ ...payment, journalEntryId: je?.id })
+  await logAudit(tx, { req, action: 'bill.payment_posted', module: 'purchasing', resourceType: 'payment', resourceId: payment.id })
+  return { ...payment, journalEntryId: je?.id }
+  })
+  res.status(201).json(result)
 })
 
 // GET /suppliers/:id

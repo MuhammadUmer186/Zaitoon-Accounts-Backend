@@ -10,27 +10,24 @@ export async function nextNumber(
   const year = new Date().getFullYear()
   const yearPrefix = `${prefix}-${year}-`
 
-  // Find the latest record for this org with this prefix
-  // We use a raw approach by querying the specific model
-  let count = 0
-
-  try {
-    const modelDelegate = (prisma as unknown as Record<string, unknown>)[model] as {
-      count: (args: { where: Record<string, unknown> }) => Promise<number>
-    }
-    if (modelDelegate && typeof modelDelegate.count === 'function') {
-      count = await modelDelegate.count({
-        where: {
-          organizationId: orgId,
-          [field]: { startsWith: yearPrefix },
-        },
-      })
-    }
-  } catch {
-    count = 0
+  const delegate = (prisma as unknown as Record<string, unknown>)[model] as {
+    findMany: (args: object) => Promise<Record<string, unknown>[]>
   }
-
-  return `${yearPrefix}${(count + 1).toString().padStart(4, '0')}`
+  if (!delegate?.findMany) throw new Error(`Unsupported document numbering model: ${model}`)
+  // Bootstrap from the greatest suffix; atomic upsert reserves each number.
+  const key = { organizationId: orgId, model, field, prefix, year }
+  const existingSequence = await prisma.documentSequence.findUnique({ where: { organizationId_model_field_prefix_year: key } })
+  const existing = existingSequence ? [] : await delegate.findMany({ where: { organizationId: orgId, [field]: { startsWith: yearPrefix } }, select: { [field]: true } })
+  const maximum = existing.reduce((max, row) => {
+    const suffix = String(row[field]).slice(yearPrefix.length)
+    return /^\d+$/.test(suffix) ? Math.max(max, Number(suffix)) : max
+  }, 0)
+  const sequence = await prisma.documentSequence.upsert({
+    where: { organizationId_model_field_prefix_year: key },
+    create: { organizationId: orgId, model, field, prefix, year, lastNumber: maximum + 1 },
+    update: { lastNumber: { increment: 1 } },
+  })
+  return `${yearPrefix}${String(sequence.lastNumber).padStart(4, '0')}`
 }
 
 export function formatNumber(prefix: string, count: number): string {

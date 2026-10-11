@@ -7,6 +7,7 @@ import { requireAnyPermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { financeTransaction, financeLock } from '../utils/financeTransaction'
 import { postJournalEntry, resolveMappedAccount, reverseJournalEntry } from '../utils/ledger'
 
 const router = Router()
@@ -192,7 +193,9 @@ router.post('/:id/submit', requireAnyPermission('can_create_cash_closing'), asyn
 // POST /cash-closing/:id/approve — posts the cash over/short entry, if any.
 // A perfectly balanced closing has nothing to post.
 router.post('/:id/approve', requireAnyPermission('can_approve_cash_closing'), async (req: Request, res: Response) => {
-  const closing = await prisma.cashClosing.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `cash-closing:${req.user.organizationId}:${req.params.id}`)
+  const closing = await tx.cashClosing.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
@@ -204,11 +207,11 @@ router.post('/:id/approve', requireAnyPermission('can_approve_cash_closing'), as
 
   if (diff > 0.01) {
     const [cashOverShort, cash] = await Promise.all([
-      resolveMappedAccount(prisma, req.user.organizationId, 'CASH_OVER_SHORT'),
-      resolveMappedAccount(prisma, req.user.organizationId, 'CASH_ON_HAND'),
+      resolveMappedAccount(tx, req.user.organizationId, 'CASH_OVER_SHORT'),
+      resolveMappedAccount(tx, req.user.organizationId, 'CASH_ON_HAND'),
     ])
 
-    const je = await postJournalEntry(prisma, {
+    const je = await postJournalEntry(tx, {
       organizationId: req.user.organizationId,
       branchId: closing.branchId,
       entryDate: closing.closingDate,
@@ -231,9 +234,11 @@ router.post('/:id/approve', requireAnyPermission('can_approve_cash_closing'), as
     journalEntryId = je?.id
   }
 
-  const updated = await prisma.cashClosing.update({
+  const result = await tx.cashClosing.update({
     where: { id: req.params.id },
     data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId },
+  })
+  return result
   })
   res.json(updated)
 })
@@ -243,7 +248,9 @@ router.post('/:id/void', requireAnyPermission('can_approve_cash_closing'), async
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
-  const closing = await prisma.cashClosing.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `cash-closing:${req.user.organizationId}:${req.params.id}`)
+  const closing = await tx.cashClosing.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!closing) throw new AppError('Cash closing not found', 404, 'NOT_FOUND')
@@ -251,12 +258,14 @@ router.post('/:id/void', requireAnyPermission('can_approve_cash_closing'), async
   if (closing.status === 'void') throw new AppError('Cash closing is already voided', 400, 'INVALID_STATUS')
 
   if (closing.journalEntryId) {
-    await reverseJournalEntry(prisma, closing.journalEntryId, req.user.id, `Void — ${voidReason}`)
+    await reverseJournalEntry(tx, closing.journalEntryId, req.user.id, `Void — ${voidReason}`, req.user.organizationId)
   }
 
-  const updated = await prisma.cashClosing.update({
+  const result = await tx.cashClosing.update({
     where: { id: req.params.id },
     data: { status: 'void' },
+  })
+  return result
   })
   res.json(updated)
 })

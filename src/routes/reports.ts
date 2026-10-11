@@ -1,3 +1,4 @@
+import { ledgerProfit } from '../services/ledgerProfit'
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
@@ -6,6 +7,7 @@ import { requireAnyPermission, requireExportPermission } from '../middleware/aut
 import { ProReport, ReportRow, ReportColumn, sendProReport, reportScope, dateLineFor, asAtLine, periodLabelFor, round2 } from '../utils/proReport'
 import { getEverStockedKeys, isNeverStocked } from '../utils/stock'
 import { fiscalYearStartFor } from '../utils/fiscalYear'
+import { financialSummary } from '../services/financialSummary'
 
 const router = Router()
 
@@ -30,7 +32,7 @@ router.get('/dashboard', requireAnyPermission('can_view_reports'), async (req: R
 
   const branchFilter = branchId ? { branchId } : {}
   const orgFilter = { organizationId: orgId }
-  const notVoid = { status: { not: 'void' } }
+  const notVoid = { status: 'approved' }
 
   // Run all aggregations in parallel
   const [
@@ -234,71 +236,7 @@ router.get('/dashboard', requireAnyPermission('can_view_reports'), async (req: R
 // GET /reports/financial
 router.get('/financial', requireAnyPermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
-  const orgId = req.user.organizationId
-
-  const dateFilter: Record<string, Date> = {}
-  if (fromDate) dateFilter.gte = new Date(fromDate)
-  if (toDate) dateFilter.lte = new Date(toDate)
-  const hasDateFilter = Object.keys(dateFilter).length > 0
-
-  const [totalSales, totalExpenses, totalBills] = await Promise.all([
-    prisma.dailySale.aggregate({
-      where: {
-        organizationId: orgId,
-        ...(branchId && { branchId }),
-        status: { not: 'void' },
-        ...(hasDateFilter && { saleDate: dateFilter }),
-      },
-      _sum: { netAmount: true, vatAmount: true, totalAmount: true },
-      _count: true,
-    }),
-    prisma.expense.aggregate({
-      where: { source: { not: 'purchasing' },
-        organizationId: orgId,
-        ...(branchId && { branchId }),
-        status: { not: 'void' },
-        ...(hasDateFilter && { expenseDate: dateFilter }),
-      },
-      _sum: { totalAmount: true, vatAmount: true },
-      _count: true,
-    }),
-    prisma.bill.aggregate({
-      where: {
-        organizationId: orgId,
-        ...(branchId && { branchId }),
-        status: { not: 'void' },
-        ...(hasDateFilter && { billDate: dateFilter }),
-      },
-      _sum: { totalAmount: true, paidAmount: true, balanceDue: true },
-      _count: true,
-    }),
-  ])
-
-  // Supplier purchases (bills) count toward expenses alongside manually
-  // recorded Expense entries.
-  const combinedExpenses = (totalExpenses._sum.totalAmount ?? 0) + (totalBills._sum.totalAmount ?? 0)
-  const grossProfit = (totalSales._sum.netAmount ?? 0) - combinedExpenses
-
-  res.json({
-    revenue: {
-      totalSales: totalSales._sum.netAmount ?? 0,
-      totalVatCollected: totalSales._sum.vatAmount ?? 0,
-      saleCount: totalSales._count,
-    },
-    expenses: {
-      totalExpenses: combinedExpenses,
-      vatPaid: totalExpenses._sum.vatAmount ?? 0,
-      expenseCount: totalExpenses._count,
-    },
-    payables: {
-      totalBills: totalBills._sum.totalAmount ?? 0,
-      totalPaid: totalBills._sum.paidAmount ?? 0,
-      balanceDue: totalBills._sum.balanceDue ?? 0,
-      billCount: totalBills._count,
-    },
-    grossProfit,
-    netProfit: grossProfit,
-  })
+  res.json(await financialSummary(prisma, req.user.organizationId, { branchId, fromDate, toDate }))
 })
 
 type DashboardRange = 'today' | 'yesterday' | 'this_week' | 'this_month' | 'this_year' | 'overall'
@@ -394,7 +332,7 @@ router.get('/dashboard-v2', requireAnyPermission('can_view_reports'), async (req
   const dateFilter = { ...(rangeStart && { gte: rangeStart }), lte: rangeEnd }
   const previousRange = getPreviousRangeBounds(selectedRange, today)
 
-  const notVoid = { status: { not: 'void' } }
+  const notVoid = { status: 'approved' }
   const orgFilter = { organizationId: orgId }
   const branchFilter = branchId ? { branchId } : {}
 
@@ -484,7 +422,7 @@ router.get('/dashboard-v2', requireAnyPermission('can_view_reports'), async (req
         // Supplier purchases (bills) count toward expenses too — food cost /
         // net profit shouldn't ignore what was actually spent on stock.
         prisma.bill.aggregate({
-          where: { ...orgFilter, ...bf, status: { not: 'void' }, billDate: dateFilter },
+          where: { ...orgFilter, ...bf, status: { in: ['approved', 'partial', 'paid'] }, billDate: dateFilter },
           _sum: { totalAmount: true },
         }),
         // Previous equivalent period, for the growth comparison
@@ -496,12 +434,13 @@ router.get('/dashboard-v2', requireAnyPermission('can_view_reports'), async (req
           : Promise.resolve({ _sum: { netAmount: 0 } }),
       ])
 
-      const totalSales = salesAgg._sum.netAmount ?? 0
-      const totalExpenses = (expAgg._sum.totalAmount ?? 0) + (billsAgg._sum.totalAmount ?? 0)
-      const grossProfit = totalSales - totalExpenses
+      const figures = await ledgerProfit(prisma, orgId, branch.id, dateFilter)
+      const totalSales = figures.revenue
+      const totalExpenses = figures.expenses
+      const grossProfit = figures.grossProfit
       const prevSales = prevSalesAgg._sum.netAmount ?? 0
       const salesGrowth = prevSales > 0 ? ((totalSales - prevSales) / prevSales) * 100 : 0
-      const foodCostPct = totalSales > 0 ? (totalExpenses / totalSales) * 100 : 0
+      const foodCostPct = totalSales > 0 ? (figures.costOfSales / totalSales) * 100 : 0
 
       return {
         branchId: branch.id,
@@ -510,7 +449,7 @@ router.get('/dashboard-v2', requireAnyPermission('can_view_reports'), async (req
         totalSales,
         totalExpenses,
         grossProfit,
-        netProfit: grossProfit,
+        netProfit: figures.netProfit,
         prevPeriodSales: prevSales,
         salesGrowth: Math.round(salesGrowth * 10) / 10,
         foodCostPct: Math.round(foodCostPct * 10) / 10,
@@ -604,7 +543,7 @@ router.get('/dashboard-v2', requireAnyPermission('can_view_reports'), async (req
       _sum: { totalAmount: true },
     }),
     prisma.bill.aggregate({
-      where: { ...orgFilter, ...branchFilter, status: { not: 'void' }, billDate: dateFilter },
+      where: { ...orgFilter, ...branchFilter, status: { in: ['approved', 'partial', 'paid'] }, billDate: dateFilter },
       _sum: { totalAmount: true },
     }),
     previousRange
@@ -698,8 +637,9 @@ router.get('/dashboard-v2', requireAnyPermission('can_view_reports'), async (req
     comparison = { mode: compare, currentLabel, previousLabel, byBranch, trend }
   }
 
-  const periodSales = periodSalesAgg._sum.netAmount ?? 0
-  const periodExpenses = (periodExpensesAgg._sum.totalAmount ?? 0) + (periodBillsAgg._sum.totalAmount ?? 0)
+  const periodFigures = await ledgerProfit(prisma, orgId, branchId || undefined, dateFilter)
+  const periodSales = periodFigures.revenue
+  const periodExpenses = periodFigures.expenses
   const previousPeriodSales = previousPeriodSalesAgg._sum.netAmount ?? 0
   const periodSalesChangePct = previousPeriodSales > 0
     ? Math.round(((periodSales - previousPeriodSales) / previousPeriodSales) * 1000) / 10
@@ -710,7 +650,7 @@ router.get('/dashboard-v2', requireAnyPermission('can_view_reports'), async (req
     kpis: {
       periodSales,
       periodExpenses,
-      periodProfit: periodSales - periodExpenses,
+      periodProfit: periodFigures.netProfit,
       periodSalesChangePct,
       avgPerDaySale,
       pendingApprovals: pendingSales + pendingExp + pendingCC,

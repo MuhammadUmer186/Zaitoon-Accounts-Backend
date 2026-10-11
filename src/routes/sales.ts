@@ -7,6 +7,8 @@ import { requireAnyPermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
+import { financeTransaction, financeLock } from '../utils/financeTransaction'
+import { calculateSaleAmounts } from '../services/saleAmounts'
 import { postJournalEntry, resolveMappedAccount, reverseJournalEntry } from '../utils/ledger'
 
 const router = Router()
@@ -134,7 +136,8 @@ router.get('/summary', requireAnyPermission('can_create_sales', 'can_approve_sal
 
 // POST /sales
 router.post('/', requireAnyPermission('can_create_sales'), async (req: Request, res: Response) => {
-  const body = saleSchema.parse(req.body)
+  const parsed = saleSchema.parse(req.body)
+  const body = { ...parsed, ...calculateSaleAmounts(parsed) }
 
   // Verify branch belongs to org
   const branch = await prisma.branch.findFirst({
@@ -180,34 +183,38 @@ router.get('/:id', requireAnyPermission('can_create_sales', 'can_approve_sales',
 
 // PUT /sales/:id
 router.put('/:id', requireAnyPermission('can_create_sales'), async (req: Request, res: Response) => {
-  const sale = await prisma.dailySale.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `sale:${req.user.organizationId}:${req.params.id}`)
+  const sale = await tx.dailySale.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: { deliveryBreakdown: true },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, sale.branchId)
   if (sale.status !== 'draft') throw new AppError('Only draft sales can be edited', 400, 'INVALID_STATUS')
 
   const body = saleSchema.partial().parse(req.body)
-  const { deliveryBreakdown, ...saleData } = body
-
-  if (deliveryBreakdown !== undefined) {
-    await prisma.deliveryBreakdown.deleteMany({ where: { dailySaleId: req.params.id } })
-    if (deliveryBreakdown.length > 0) {
-      await prisma.deliveryBreakdown.createMany({
-        data: deliveryBreakdown.map((d) => ({ ...d, dailySaleId: req.params.id })),
-      })
-    }
+  const merged = { ...sale, ...body }
+  if (merged.branchId !== sale.branchId) {
+    const branch = await tx.branch.findFirst({ where: { id: merged.branchId, organizationId: req.user.organizationId } })
+    if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+    await assertBranchAccess(req, branch.id)
   }
+  const totals = calculateSaleAmounts(merged)
+  const { deliveryBreakdown, ...saleData } = { ...body, ...totals }
 
-  const updated = await prisma.dailySale.update({
+  const result = await tx.dailySale.update({
     where: { id: req.params.id },
     data: {
       ...saleData,
+      ...(deliveryBreakdown && { deliveryBreakdown: { deleteMany: {}, create: deliveryBreakdown } }),
       ...(saleData.saleDate && { saleDate: new Date(saleData.saleDate) }),
     },
     include: { deliveryBreakdown: true, branch: true },
   })
 
+  return result
+  })
   res.json(withBranchName(updated))
 })
 
@@ -222,20 +229,23 @@ async function postSaleJournalEntry(sale: {
   id: string; saleNo: string; branchId: string; saleDate: Date
   cashAmount: number; cardAmount: number; deliveryAmount: number; bankTransferAmount: number; otherAmount: number
   vatAmount: number
-}, organizationId: string, userId: string) {
+  deliveryBreakdown?: { commission: number }[]
+}, organizationId: string, userId: string, db: typeof prisma) {
   const totalReceived = sale.cashAmount + sale.cardAmount + sale.deliveryAmount + sale.bankTransferAmount + sale.otherAmount
+  const commission = sale.deliveryBreakdown?.reduce((sum, line) => sum + line.commission, 0) ?? 0
   const cashLeg = sale.cashAmount + sale.otherAmount
 
-  const [cash, card, receivable, bank, outputVat, revenue] = await Promise.all([
-    cashLeg > 0 ? resolveMappedAccount(prisma, organizationId, 'CASH_ON_HAND') : null,
-    sale.cardAmount > 0 ? resolveMappedAccount(prisma, organizationId, 'CARD_CLEARING') : null,
-    sale.deliveryAmount > 0 ? resolveMappedAccount(prisma, organizationId, 'ACCOUNTS_RECEIVABLE') : null,
-    sale.bankTransferAmount > 0 ? resolveMappedAccount(prisma, organizationId, 'DEFAULT_BANK') : null,
-    sale.vatAmount > 0 ? resolveMappedAccount(prisma, organizationId, 'OUTPUT_VAT') : null,
-    resolveMappedAccount(prisma, organizationId, 'SALES_REVENUE'),
+  const [cash, card, receivable, bank, outputVat, revenue, commissionExpense] = await Promise.all([
+    cashLeg > 0 ? resolveMappedAccount(db, organizationId, 'CASH_ON_HAND') : null,
+    sale.cardAmount > 0 ? resolveMappedAccount(db, organizationId, 'CARD_CLEARING') : null,
+    sale.deliveryAmount > 0 ? resolveMappedAccount(db, organizationId, 'ACCOUNTS_RECEIVABLE') : null,
+    sale.bankTransferAmount > 0 ? resolveMappedAccount(db, organizationId, 'DEFAULT_BANK') : null,
+    sale.vatAmount > 0 ? resolveMappedAccount(db, organizationId, 'OUTPUT_VAT') : null,
+    resolveMappedAccount(db, organizationId, 'SALES_REVENUE'),
+    commission > 0 ? resolveMappedAccount(db, organizationId, 'DEFAULT_EXPENSE') : null,
   ])
 
-  return postJournalEntry(prisma, {
+  return postJournalEntry(db, {
     organizationId,
     branchId: sale.branchId,
     entryDate: sale.saleDate,
@@ -248,9 +258,10 @@ async function postSaleJournalEntry(sale: {
     lines: [
       ...(cash ? [{ accountId: cash.id, description: 'Cash received', debitAmount: cashLeg }] : []),
       ...(card ? [{ accountId: card.id, description: 'Card receipts', debitAmount: sale.cardAmount }] : []),
-      ...(receivable ? [{ accountId: receivable.id, description: 'Delivery platform receipts', debitAmount: sale.deliveryAmount }] : []),
+      ...(receivable ? [{ accountId: receivable.id, description: 'Delivery platform receipts', debitAmount: sale.deliveryAmount - commission }] : []),
       ...(bank ? [{ accountId: bank.id, description: 'Bank transfer receipts', debitAmount: sale.bankTransferAmount }] : []),
       ...(outputVat ? [{ accountId: outputVat.id, description: 'Output VAT', creditAmount: sale.vatAmount }] : []),
+      ...(commissionExpense ? [{ accountId: commissionExpense.id, description: 'Delivery commissions', debitAmount: commission }] : []),
       { accountId: revenue.id, description: 'Sales revenue', creditAmount: totalReceived - sale.vatAmount },
     ],
   })
@@ -260,19 +271,25 @@ async function postSaleJournalEntry(sale: {
 // (unlike purchases): submitting a draft finalizes it immediately, posting
 // the journal entry straight away.
 router.post('/:id/submit', requireAnyPermission('can_create_sales'), async (req: Request, res: Response) => {
-  const sale = await prisma.dailySale.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `sale:${req.user.organizationId}:${req.params.id}`)
+  const sale = await tx.dailySale.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: { deliveryBreakdown: true },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, sale.branchId)
   if (sale.status !== 'draft') throw new AppError('Only draft sales can be submitted', 400, 'INVALID_STATUS')
 
-  const je = await postSaleJournalEntry(sale, req.user.organizationId, req.user.id)
+  const totals = calculateSaleAmounts(sale)
+  const je = await postSaleJournalEntry({ ...sale, ...totals }, req.user.organizationId, req.user.id, tx)
   const now = new Date()
 
-  const updated = await prisma.dailySale.update({
+  const result = await tx.dailySale.update({
     where: { id: req.params.id },
     data: {
+      ...totals,
+      deliveryBreakdown: undefined,
       status: 'approved',
       submittedBy: req.user.id,
       submittedAt: now,
@@ -281,6 +298,8 @@ router.post('/:id/submit', requireAnyPermission('can_create_sales'), async (req:
       journalEntryId: je?.id,
     },
   })
+  return result
+  })
   res.json(updated)
 })
 
@@ -288,18 +307,24 @@ router.post('/:id/submit', requireAnyPermission('can_create_sales'), async (req:
 // sitting in 'submitted' status before daily sales stopped requiring
 // approval; new sales never reach this via /submit anymore.
 router.post('/:id/approve', requireAnyPermission('can_approve_sales'), async (req: Request, res: Response) => {
-  const sale = await prisma.dailySale.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `sale:${req.user.organizationId}:${req.params.id}`)
+  const sale = await tx.dailySale.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: { deliveryBreakdown: true },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, sale.branchId)
   if (sale.status !== 'submitted') throw new AppError('Only submitted sales can be approved', 400, 'INVALID_STATUS')
 
-  const je = await postSaleJournalEntry(sale, req.user.organizationId, req.user.id)
+  const totals = calculateSaleAmounts(sale)
+  const je = await postSaleJournalEntry({ ...sale, ...totals }, req.user.organizationId, req.user.id, tx)
 
-  const updated = await prisma.dailySale.update({
+  const result = await tx.dailySale.update({
     where: { id: req.params.id },
     data: {
+      ...totals,
+      deliveryBreakdown: undefined,
       status: 'approved',
       approvedBy: req.user.id,
       approvedAt: new Date(),
@@ -307,6 +332,8 @@ router.post('/:id/approve', requireAnyPermission('can_approve_sales'), async (re
     },
   })
 
+  return result
+  })
   res.json(updated)
 })
 
@@ -315,20 +342,25 @@ router.post('/:id/void', requireAnyPermission('can_void_sales'), async (req: Req
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
-  const sale = await prisma.dailySale.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `sale:${req.user.organizationId}:${req.params.id}`)
+  const sale = await tx.dailySale.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
+    include: { deliveryBreakdown: true },
   })
   if (!sale) throw new AppError('Sale not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, sale.branchId)
   if (sale.status === 'void') throw new AppError('Sale is already voided', 400, 'INVALID_STATUS')
 
   if (sale.journalEntryId) {
-    await reverseJournalEntry(prisma, sale.journalEntryId, req.user.id, `Void — ${voidReason}`)
+    await reverseJournalEntry(tx, sale.journalEntryId, req.user.id, `Void — ${voidReason}`, req.user.organizationId)
   }
 
-  const updated = await prisma.dailySale.update({
+  const result = await tx.dailySale.update({
     where: { id: req.params.id },
     data: { status: 'void', voidReason },
+  })
+  return result
   })
   res.json(updated)
 })

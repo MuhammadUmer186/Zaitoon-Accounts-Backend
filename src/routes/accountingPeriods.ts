@@ -5,14 +5,15 @@ import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
 import { AppError } from '../middleware/error'
 import { logAudit } from '../utils/audit'
+import { financeTransaction, financeLock } from '../utils/financeTransaction'
 
 const router = Router()
 router.use(authenticate)
 
 const periodSchema = z.object({
   name: z.string().min(1),
-  startDate: z.string(),
-  endDate: z.string(),
+  startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 })
 
 router.get('/', requirePermission('accounts_view'), async (req: Request, res: Response) => {
@@ -28,10 +29,16 @@ router.post('/', requirePermission('accounting_periods_manage'), async (req: Req
   const orgId = req.user.organizationId
   const startDate = new Date(body.startDate)
   const endDate = new Date(body.endDate)
+  if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime())) throw new AppError('Invalid accounting period dates', 400, 'VALIDATION_ERROR')
+  if (startDate.toISOString().slice(0, 10) !== body.startDate || endDate.toISOString().slice(0, 10) !== body.endDate) throw new AppError('Invalid accounting period dates', 400, 'VALIDATION_ERROR')
+  if (/^\d{4}-\d{2}-\d{2}$/.test(body.endDate)) endDate.setUTCHours(23, 59, 59, 999)
   if (endDate < startDate) throw new AppError('End date must be on or after the start date', 400, 'VALIDATION_ERROR')
 
-  const period = await prisma.accountingPeriod.create({
-    data: { organizationId: orgId, name: body.name, startDate, endDate },
+  const period = await financeTransaction(prisma, async (tx) => {
+    await financeLock(tx, `period:${orgId}`)
+    const overlap = await tx.accountingPeriod.findFirst({ where: { organizationId: orgId, startDate: { lte: endDate }, endDate: { gte: startDate } } })
+    if (overlap) throw new AppError('Accounting period overlaps an existing period', 400, 'PERIOD_OVERLAP')
+    return tx.accountingPeriod.create({ data: { organizationId: orgId, name: body.name, startDate, endDate } })
   })
   await logAudit(prisma, { req, action: 'accounting_period.created', module: 'accounts', resourceType: 'accounting_period', resourceId: period.id, resourceRef: period.name, newData: period })
   res.status(201).json(period)
@@ -42,17 +49,21 @@ async function transition(req: Request, res: Response, opts: {
   data: (userId: string) => Record<string, unknown>
 }) {
   const orgId = req.user.organizationId
-  const period = await prisma.accountingPeriod.findFirst({ where: { id: req.params.id, organizationId: orgId } })
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `period:${orgId}`)
+  const period = await tx.accountingPeriod.findFirst({ where: { id: req.params.id, organizationId: orgId } })
   if (!period) throw new AppError('Accounting period not found', 404, 'NOT_FOUND')
   if (!opts.from.includes(period.status)) {
     throw new AppError(`Only a ${opts.from.join('/').toLowerCase()} period can be ${opts.to.toLowerCase()}ed`, 400, 'INVALID_STATUS')
   }
 
-  const updated = await prisma.accountingPeriod.update({
+  const updated = await tx.accountingPeriod.update({
     where: { id: period.id },
     data: { status: opts.to as never, ...opts.data(req.user.id) },
   })
-  await logAudit(prisma, { req, action: opts.action, module: 'accounts', resourceType: 'accounting_period', resourceId: period.id, resourceRef: period.name, oldData: { status: period.status }, newData: { status: updated.status } })
+  await logAudit(tx, { req, action: opts.action, module: 'accounts', resourceType: 'accounting_period', resourceId: period.id, resourceRef: period.name, oldData: { status: period.status }, newData: { status: updated.status } })
+  return updated
+  })
   res.json(updated)
 }
 

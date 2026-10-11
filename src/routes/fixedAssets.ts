@@ -282,7 +282,7 @@ router.delete('/:id', WRITE, async (req: Request, res: Response) => {
   if (asset.status === 'disposed') throw new AppError('A disposed asset cannot be deleted', 400, 'INVALID_STATUS')
   if (asset.acquisitionJournalEntryId) {
     const je = await prisma.journalEntry.findUnique({ where: { id: asset.acquisitionJournalEntryId } })
-    if (je && !je.reversedById) await reverseJournalEntry(prisma, je.id, req.user.id, `Fixed asset ${asset.assetNo} deleted`)
+    if (je && !je.reversedById) await reverseJournalEntry(prisma, je.id, req.user.id, `Fixed asset ${asset.assetNo} deleted`, req.user.organizationId)
   }
   await prisma.fixedAsset.delete({ where: { id: asset.id } })
   await logAudit(prisma, { req, action: 'fixed_asset.deleted', module: 'accounts', resourceType: 'FixedAsset', resourceId: asset.id, resourceRef: asset.assetNo })

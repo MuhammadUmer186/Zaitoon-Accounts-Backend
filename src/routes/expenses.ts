@@ -10,6 +10,7 @@ import { paginate, paginatedResponse, parsePageParams } from '../utils/paginatio
 import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
 import { postJournalEntry, resolveMappedAccount, mappingKeyForPaymentMethod, reverseJournalEntry } from '../utils/ledger'
+import { financeTransaction, financeLock } from '../utils/financeTransaction'
 
 const router = Router()
 
@@ -147,11 +148,13 @@ router.post('/purchasing-payment', requireAnyPermission('can_create_expense'), u
   try {
     const expense = await prisma.$transaction(async (tx) => {
       const db = tx as unknown as typeof prisma
+      await financeLock(db, `bill:${req.user.organizationId}:${body.billId}`)
       const bill = await tx.bill.findFirst({
         where: { id: body.billId, organizationId: req.user.organizationId, source: 'purchasing' },
         include: { supplier: true, branch: true },
       })
       if (!bill) throw new AppError('Purchase not found', 404, 'NOT_FOUND')
+      await assertBranchAccess(req, bill.branchId)
       if (!['approved', 'partial'].includes(bill.status)) {
         throw new AppError(`Purchase ${bill.billNo} is not pending payment (status: ${bill.status})`, 400, 'INVALID_STATUS')
       }
@@ -371,7 +374,9 @@ router.post('/:id/submit', requireAnyPermission('can_create_expense'), async (re
 
 // POST /expenses/:id/approve
 router.post('/:id/approve', requireAnyPermission('can_approve_expense'), async (req: Request, res: Response) => {
-  const expense = await prisma.expense.findFirst({
+  const updated = await financeTransaction(prisma, async (tx) => {
+  await financeLock(tx, `expense:${req.user.organizationId}:${req.params.id}`)
+  const expense = await tx.expense.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { category: true },
   })
@@ -381,13 +386,13 @@ router.post('/:id/approve', requireAnyPermission('can_approve_expense'), async (
 
   const [expenseAccount, inputVat, creditAccount] = await Promise.all([
     expense.category.accountId
-      ? prisma.account.findUniqueOrThrow({ where: { id: expense.category.accountId } })
-      : resolveMappedAccount(prisma, req.user.organizationId, 'DEFAULT_EXPENSE'),
-    expense.vatAmount > 0 ? resolveMappedAccount(prisma, req.user.organizationId, 'INPUT_VAT') : null,
-    resolveMappedAccount(prisma, req.user.organizationId, expense.supplierId ? 'ACCOUNTS_PAYABLE' : mappingKeyForPaymentMethod(expense.paymentMethod)),
+      ? tx.account.findUniqueOrThrow({ where: { id: expense.category.accountId } })
+      : resolveMappedAccount(tx, req.user.organizationId, 'DEFAULT_EXPENSE'),
+    expense.vatAmount > 0 ? resolveMappedAccount(tx, req.user.organizationId, 'INPUT_VAT') : null,
+    resolveMappedAccount(tx, req.user.organizationId, expense.supplierId ? 'ACCOUNTS_PAYABLE' : mappingKeyForPaymentMethod(expense.paymentMethod)),
   ])
 
-  const je = await postJournalEntry(prisma, {
+  const je = await postJournalEntry(tx, {
     organizationId: req.user.organizationId,
     branchId: expense.branchId,
     entryDate: expense.expenseDate,
@@ -404,9 +409,11 @@ router.post('/:id/approve', requireAnyPermission('can_approve_expense'), async (
     ],
   })
 
-  const updated = await prisma.expense.update({
+  const result = await tx.expense.update({
     where: { id: req.params.id },
     data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId: je?.id },
+  })
+  return result
   })
   res.json(updated)
 })
@@ -429,17 +436,19 @@ router.post('/:id/void', requireAnyPermission('can_void_expense'), async (req: R
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 
-  const expense = await prisma.expense.findFirst({
+  const updated = await prisma.$transaction(async (tx) => {
+    const db = tx as unknown as typeof prisma
+    await financeLock(db, `expense:${req.user.organizationId}:${req.params.id}`)
+  const expense = await tx.expense.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!expense) throw new AppError('Expense not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, expense.branchId)
   if (expense.status === 'void') throw new AppError('Expense is already voided', 400, 'INVALID_STATUS')
 
-  const updated = await prisma.$transaction(async (tx) => {
-    const db = tx as unknown as typeof prisma
+    if (expense.billId) await financeLock(db, `bill:${req.user.organizationId}:${expense.billId}`)
     if (expense.journalEntryId) {
-      await reverseJournalEntry(db, expense.journalEntryId, req.user.id, `Void — ${voidReason}`)
+      await reverseJournalEntry(db, expense.journalEntryId, req.user.id, `Void — ${voidReason}`, req.user.organizationId)
     }
 
     // A purchasing-mode expense is a bill payment: voiding it must also undo

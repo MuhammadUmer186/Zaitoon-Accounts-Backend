@@ -4,6 +4,7 @@ import multer from 'multer'
 import { prisma } from '../config'
 import { AccountClass } from '../types/accounting'
 import { authenticate } from '../middleware/auth'
+import { assertBranchAccess } from '../utils/branchScope'
 import { requirePermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
@@ -435,7 +436,7 @@ router.get('/summary', requirePermission('accounts_view'), async (req: Request, 
   const { branchId, asOfDate } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 
-  const accounts = await prisma.account.findMany({ where: { organizationId: orgId, status: 'ACTIVE' }, select: { id: true, accountClass: true } })
+  const accounts = await prisma.account.findMany({ where: { organizationId: orgId }, select: { id: true, accountClass: true } })
   const balances = await computeAccountBalances(prisma, orgId, accounts.map((a) => a.id), {
     branchId: branchId || undefined,
     toDate: asOfDate ? new Date(asOfDate) : undefined,
@@ -747,7 +748,11 @@ router.post('/:id/reverse-journal/:journalEntryId', requirePermission('journals_
   const { reason } = req.body as { reason?: string }
   if (!reason) throw new AppError('A reversal reason is required', 400, 'VALIDATION_ERROR')
 
-  const reversal = await reverseJournalEntry(prisma, req.params.journalEntryId, req.user.id, reason)
+  const entry = await prisma.journalEntry.findFirst({ where: { id: req.params.journalEntryId, organizationId: req.user.organizationId } })
+  if (!entry) throw new AppError('Journal entry not found', 404, 'NOT_FOUND')
+  await assertBranchAccess(req, entry.branchId)
+  if (entry.sourceType && !['RECURRING', 'OPENING_BALANCE'].includes(entry.sourceType)) throw new AppError('Cancel this entry through its source transaction', 400, 'SOURCE_REVERSAL_REQUIRED')
+  const reversal = await reverseJournalEntry(prisma, req.params.journalEntryId, req.user.id, reason, req.user.organizationId)
   await logAudit(prisma, { req, action: 'journal.reversed', module: 'accounts', resourceType: 'journal_entry', resourceId: req.params.journalEntryId, newData: { reversalId: reversal.id, reason } })
   res.status(201).json(reversal)
 })
