@@ -310,7 +310,7 @@ router.post('/:id/void', requirePermission('can_approve_cash_closing'), async (r
   if (closing.status === 'void') throw new AppError('Cash closing is already voided', 400, 'INVALID_STATUS')
 
   if (closing.journalEntryId) {
-    await reverseJournalEntry(prisma, closing.journalEntryId, req.user.id, `Void — ${voidReason}`)
+    await reverseJournalEntry(prisma, closing.journalEntryId, req.user.id, `Void — ${voidReason}`, req.user.organizationId)
   }
 
   const updated = await prisma.cashClosing.update({

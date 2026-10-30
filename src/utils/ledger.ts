@@ -1,7 +1,8 @@
-import { roundMoney, moneyTolerance } from './money'
+import { roundMoney, moneyTolerance, moneyFactor, currentCurrency } from './money'
 import { PrismaClient, Prisma, AccountingMappingKey } from '@prisma/client'
 import { nextNumber } from './numbering'
 import { AppError } from '../middleware/error'
+import { financeTransaction, financeLock } from './financeTransaction'
 
 // Human-readable names used in the "not configured" error message and in the
 // Account Mappings settings UI.
@@ -96,8 +97,12 @@ export interface PostJournalEntryInput {
 // period. An org with no period defined for that date is treated as open —
 // periods are an opt-in administrative control, not mandatory up front.
 export async function assertPeriodOpen(prisma: PrismaClient, organizationId: string, postingDate: Date) {
+  if (!Number.isFinite(postingDate.getTime())) throw new AppError('Invalid posting date', 400, 'VALIDATION_ERROR')
+  await financeLock(prisma, `period:${organizationId}`)
   const period = await prisma.accountingPeriod.findFirst({
-    where: { organizationId, startDate: { lte: postingDate }, endDate: { gte: postingDate } },
+    // Period boundaries are calendar dates. This also protects the final day
+    // of older periods saved with a midnight endDate.
+    where: { organizationId, status: { not: 'OPEN' }, startDate: { lte: postingDate }, endDate: { gte: new Date(Date.UTC(postingDate.getUTCFullYear(), postingDate.getUTCMonth(), postingDate.getUTCDate())) } },
   })
   if (period && period.status !== 'OPEN') {
     throw new AppError(
@@ -116,6 +121,44 @@ export async function assertPeriodOpen(prisma: PrismaClient, organizationId: str
 // sourceKey is supplied: retrying the same posting call returns the existing
 // entry instead of creating a duplicate.
 export async function postJournalEntry(prisma: PrismaClient, input: PostJournalEntryInput) {
+  return financeTransaction(prisma, (tx) => postJournalEntryInTransaction(tx, input))
+}
+
+// Amounts are compared in the currency's minor units (fils, cents, whole yen).
+export function validateJournalLines(lines: LedgerLineInput[], requireBalanced = true, currency = currentCurrency()) {
+  for (const line of lines) {
+    const debit = line.debitAmount ?? 0
+    const credit = line.creditAmount ?? 0
+    if (!Number.isFinite(debit) || !Number.isFinite(credit) || debit < 0 || credit < 0 || (debit > 0 && credit > 0)) {
+      throw new AppError('Journal lines require finite nonnegative amounts on only one side', 400, 'INVALID_JOURNAL_LINE')
+    }
+  }
+  const factor = moneyFactor(currency)
+  const resolvedLines = lines.map((line, i) => ({ ...line, debitAmount: roundMoney(line.debitAmount ?? 0, currency), creditAmount: roundMoney(line.creditAmount ?? 0, currency), lineOrder: i + 1 }))
+  const debitUnits = resolvedLines.reduce((sum, line) => sum + Math.round(line.debitAmount * factor), 0)
+  const creditUnits = resolvedLines.reduce((sum, line) => sum + Math.round(line.creditAmount * factor), 0)
+  const isBalanced = debitUnits === creditUnits && debitUnits > 0
+  if (requireBalanced && !isBalanced) throw new AppError('Journal entry does not balance or has no value', 400, 'UNBALANCED_ENTRY')
+  return { resolvedLines, totalDebit: debitUnits / factor, totalCredit: creditUnits / factor, isBalanced }
+}
+
+export async function validatePostingAccounts(prisma: PrismaClient, organizationId: string, lines: LedgerLineInput[]) {
+  const ids = [...new Set(lines.map((line) => line.accountId))]
+  const accounts = await prisma.account.findMany({ where: { id: { in: ids } } })
+  for (const id of ids) {
+    const account = accounts.find((a) => a.id === id)
+    if (!account || account.organizationId !== organizationId) throw new AppError('One or more accounts on this posting were not found', 400, 'ACCOUNT_NOT_FOUND')
+    if (account.status !== 'ACTIVE' || account.isHeader || account.isControlAccount || !account.allowManualPosting) {
+      throw new AppError('Account is archived, a header or does not allow direct postings', 400, 'ACCOUNT_NOT_POSTABLE')
+    }
+  }
+}
+
+async function postJournalEntryInTransaction(prisma: PrismaClient, input: PostJournalEntryInput) {
+  await financeLock(prisma, `period:${input.organizationId}`)
+  // Serialize retries before querying sourceKey, avoiding an aborted PostgreSQL
+  // transaction after a unique-key conflict.
+  if (input.sourceKey) await financeLock(prisma, `journal:${input.organizationId}:${input.sourceKey}`)
   if (input.sourceKey) {
     const existing = await prisma.journalEntry.findFirst({
       where: { organizationId: input.organizationId, sourceKey: input.sourceKey },
@@ -125,10 +168,13 @@ export async function postJournalEntry(prisma: PrismaClient, input: PostJournalE
 
   const org = await prisma.organization.findUniqueOrThrow({ where: { id: input.organizationId }, select: { currency: true } })
   const currency = org.currency
-  const filteredLines = input.lines.filter((l) => (l.debitAmount ?? 0) > moneyTolerance(currency) || (l.creditAmount ?? 0) > moneyTolerance(currency))
+  validateJournalLines(input.lines, false, currency)
+  const filteredLines = input.lines.filter((l) => Math.round((l.debitAmount ?? 0) * moneyFactor(currency)) > 0 || Math.round((l.creditAmount ?? 0) * moneyFactor(currency)) > 0)
   if (filteredLines.length === 0) return null
 
   await assertPeriodOpen(prisma, input.organizationId, input.entryDate)
+  const branch = await prisma.branch.findFirst({ where: { id: input.branchId, organizationId: input.organizationId } })
+  if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
 
   const accountIds = [...new Set(filteredLines.map((l) => l.accountId))]
   const accounts = await prisma.account.findMany({ where: { id: { in: accountIds } } })
@@ -142,30 +188,16 @@ export async function postJournalEntry(prisma: PrismaClient, input: PostJournalE
     if (account.status !== 'ACTIVE') {
       throw new AppError(`Account ${account.code} — ${account.name} is archived and cannot receive new postings`, 400, 'ACCOUNT_ARCHIVED')
     }
-    if (account.isControlAccount || !account.allowManualPosting) {
+    if (account.isHeader || account.isControlAccount || !account.allowManualPosting) {
       throw new AppError(`Account ${account.code} — ${account.name} is a control account and cannot receive direct postings`, 400, 'CONTROL_ACCOUNT_POSTING')
     }
   }
 
-  const resolvedLines = filteredLines.map((l, i) => ({
-    accountId: l.accountId,
-    description: l.description,
-    debitAmount: roundMoney(l.debitAmount ?? 0, currency),
-    creditAmount: roundMoney(l.creditAmount ?? 0, currency),
-    lineOrder: i + 1,
-  }))
-
-  const totalDebit = resolvedLines.reduce((s, l) => s + l.debitAmount, 0)
-  const totalCredit = resolvedLines.reduce((s, l) => s + l.creditAmount, 0)
-  const isBalanced = Math.abs(totalDebit - totalCredit) < moneyTolerance(currency)
-  if (!isBalanced) {
-    throw new AppError('Journal entry does not balance (total debit ≠ total credit)', 400, 'UNBALANCED_ENTRY')
-  }
+  const { resolvedLines, totalDebit, totalCredit, isBalanced } = validateJournalLines(filteredLines, true, currency)
 
   const entryNo = await nextNumber(prisma, 'journalEntry', 'entryNo', 'JE', input.organizationId)
 
-  try {
-    return await prisma.journalEntry.create({
+  return await prisma.journalEntry.create({
       data: {
         organizationId: input.organizationId,
         branchId: input.branchId,
@@ -186,19 +218,7 @@ export async function postJournalEntry(prisma: PrismaClient, input: PostJournalE
         lines: { create: resolvedLines },
       },
     })
-  } catch (err) {
-    // Two concurrent requests raced past the check above — the unique
-    // constraint on [organizationId, sourceKey] caught the duplicate, so
-    // fetch and return the entry the other request just created instead of
-    // erroring out.
-    if (input.sourceKey && err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-      const existing = await prisma.journalEntry.findFirst({
-        where: { organizationId: input.organizationId, sourceKey: input.sourceKey },
-      })
-      if (existing) return existing
-    }
-    throw err
-  }
+
 }
 
 // Corrections to a posted entry are made by reversing it, never by editing
@@ -206,11 +226,20 @@ export async function postJournalEntry(prisma: PrismaClient, input: PostJournalE
 // "posted" — together they net to zero for every account involved, which is
 // what keeps Trial Balance / Balance Sheet queries (which only look at
 // status "posted") correct without special-casing voided activity.
-export async function reverseJournalEntry(prisma: PrismaClient, journalEntryId: string, userId: string, reason: string) {
+export async function reverseJournalEntry(prisma: PrismaClient, journalEntryId: string, userId: string, reason: string, organizationId: string) {
+  return financeTransaction(prisma, (tx) => reverseInTransaction(tx, journalEntryId, userId, reason, organizationId))
+}
+
+async function reverseInTransaction(prisma: PrismaClient, journalEntryId: string, userId: string, reason: string, organizationId: string) {
+  await financeLock(prisma, `period:${organizationId}`)
+  await financeLock(prisma, `reverse:${organizationId}:${journalEntryId}`)
   const original = await prisma.journalEntry.findUnique({ where: { id: journalEntryId }, include: { lines: true } })
-  if (!original) throw new AppError('Journal entry not found', 404, 'NOT_FOUND')
+  if (!original || original.organizationId !== organizationId) throw new AppError('Journal entry not found', 404, 'NOT_FOUND')
   if (original.status !== 'posted') throw new AppError('Only posted entries can be reversed', 400, 'INVALID_STATUS')
   if (original.reversedById) throw new AppError('This journal entry has already been reversed', 400, 'ALREADY_REVERSED')
+
+  const reversalDate = new Date()
+  await assertPeriodOpen(prisma, organizationId, reversalDate)
 
   const entryNo = await nextNumber(prisma, 'journalEntry', 'entryNo', 'JE', original.organizationId)
 
@@ -219,11 +248,11 @@ export async function reverseJournalEntry(prisma: PrismaClient, journalEntryId: 
       organizationId: original.organizationId,
       branchId: original.branchId,
       entryNo,
-      entryDate: new Date(),
+      entryDate: reversalDate,
       referenceType: original.referenceType,
       referenceId: original.referenceId,
       sourceType: original.sourceType,
-      sourceKey: original.sourceKey ? `${original.sourceKey}:REVERSAL` : undefined,
+      sourceKey: `REVERSAL:${original.id}`,
       description: `Reversal of ${original.entryNo} — ${reason}`,
       status: 'posted',
       totalDebit: original.totalCredit,

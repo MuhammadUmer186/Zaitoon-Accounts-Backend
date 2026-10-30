@@ -35,6 +35,34 @@ function jdnToHijri(jdn: number): { day: number; month: number; year: number } {
   return { day, month, year }
 }
 
+function hijriToJDN(year: number, month: number, day: number): number {
+  return day + Math.ceil(29.5 * (month - 1)) + (year - 1) * 354 + Math.floor((3 + 11 * year) / 30) + ISLAMIC_CIVIL_EPOCH - 1
+}
+
+function jdnToGregorian(jdn: number): { year: number; month: number; day: number } {
+  const a = jdn + 32044
+  const b = Math.floor((4 * a + 3) / 146097)
+  const c = a - Math.floor((146097 * b) / 4)
+  const d = Math.floor((4 * c + 3) / 1461)
+  const e = c - Math.floor((1461 * d) / 4)
+  const m = Math.floor((5 * e + 2) / 153)
+  return {
+    day: e - Math.floor((153 * m + 2) / 5) + 1,
+    month: m + 3 - 12 * Math.floor(m / 10),
+    year: 100 * b + d - 4800 + Math.floor(m / 10),
+  }
+}
+
+// Hijri -> Gregorian on the same tabular calendar as toHijriDate (exact
+// inverse), used when a scanned bill prints only a Hijri date. Returns
+// YYYY-MM-DD, or null for an out-of-range day/month.
+export function hijriToGregorianISO(year: number, month: number, day: number): string | null {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null
+  if (month < 1 || month > 12 || day < 1 || day > 30) return null
+  const g = jdnToGregorian(hijriToJDN(year, month, day))
+  return `${g.year}-${String(g.month).padStart(2, '0')}-${String(g.day).padStart(2, '0')}`
+}
+
 export function toHijriDate(date: Date): string {
   const jdn = gregorianToJDN(date.getFullYear(), date.getMonth() + 1, date.getDate())
   const { day, month, year } = jdnToHijri(jdn)

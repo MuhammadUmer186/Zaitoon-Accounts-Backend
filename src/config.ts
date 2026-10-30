@@ -38,4 +38,8 @@ export const config = {
   bcryptRounds: 10,
   apiPrefix: '/api/v1',
   syncSecret: process.env.SYNC_SECRET || '',
+  // Purchasing → "scan bill" auto-fill (services/billExtraction.ts). The
+  // feature reports itself unavailable when no key is configured.
+  openaiApiKey: process.env.OPENAI_API_KEY || '',
+  billExtractionModel: process.env.BILL_EXTRACTION_MODEL || 'gpt-6-astra',
 }

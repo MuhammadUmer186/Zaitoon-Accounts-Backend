@@ -127,6 +127,7 @@ const managerPerms = [
   'can_manage_menu', 'can_manage_orders', 'can_manage_kitchen', 'can_view_reviews', 'can_use_pos', 'can_apply_discount',
     'can_manage_tills', 'can_void_items', 'can_refund', 'can_open_drawer',
     'can_take_call_center_orders', 'can_manage_delivery', 'can_manage_delivery_settings', 'can_settle_rider_cash', 'can_take_orders', 'can_manage_customers', 'can_manage_payments', 'can_manage_checkout_devices',
+  'free_dish_manage', 'free_dish_redeem',
 ]
 
 const cashierPerms = [
@@ -136,6 +137,7 @@ const cashierPerms = [
   'can_create_purchase_order', 'can_create_purchasing_entry',
   'accounts_view',
   'can_manage_orders', 'can_use_pos', 'can_take_orders',
+  'free_dish_redeem',
 ]
 
 // Store Keeper: Purchasing + Inventory (incl. branch-to-branch transfers),

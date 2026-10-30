@@ -7,11 +7,13 @@ import multer from 'multer'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { requireModule, requirePermission } from '../middleware/authorize'
-import { upload } from '../middleware/upload'
+import { upload, fileFilter } from '../middleware/upload'
 import { AppError } from '../middleware/error'
 import { createPurchaseBill, PurchaseItemInput } from '../services/purchasing'
+import { extractBill, isBillExtractionEnabled } from '../services/billExtraction'
 import { parseImportFile, sendImportTemplate, assertRecognizedColumns } from '../utils/importFile'
 import { logAudit } from '../utils/audit'
+import { financeLock } from '../utils/financeTransaction'
 import { assertBranchAccess, getBranchScope, BranchScope } from '../utils/branchScope'
 
 const router = Router()
@@ -32,6 +34,7 @@ const createPurchaseSchema = z
   .object({
     branchId: z.string(),
     supplierId: z.string().optional(),
+    supplierBillNo: z.string().trim().max(100).optional(),
     vendorName: z.string().trim().min(1).optional(),
     vendorCity: z.string().optional(),
     vendorVatNumber: z.string().optional(),
@@ -42,6 +45,7 @@ const createPurchaseSchema = z
     paymentDate: z.iso.date().optional(),
     paymentType: z.enum(['cash', 'bank_transfer']).default('cash'),
     paidBy: z.string().trim().optional(),
+    discountAmount: z.coerce.number().finite().min(0).default(0),
     items: z.string(), // JSON-stringified purchaseItemSchema[]
   })
   .refine((b) => b.supplierId || b.vendorName, {
@@ -105,7 +109,9 @@ router.post(
           })
           if (!supplier) throw new AppError('Supplier not found', 404, 'NOT_FOUND')
         } else {
-          supplier = await tx.supplier.create({
+          await financeLock(tx as unknown as typeof prisma, `supplier:${req.user.organizationId}:${body.vendorVatNumber?.trim() || body.vendorName!.trim().toLowerCase()}`)
+          supplier = await tx.supplier.findFirst({ where: { organizationId: req.user.organizationId, ...(body.vendorVatNumber?.trim() ? { vatNumber: body.vendorVatNumber.trim() } : { name: { equals: body.vendorName!.trim(), mode: 'insensitive' } }) } })
+          supplier ??= await tx.supplier.create({
             data: {
               organizationId: req.user.organizationId,
               name: body.vendorName!,
@@ -127,6 +133,7 @@ router.post(
           branchId: body.branchId,
           supplierId: supplier.id,
           supplierName: supplier.name,
+          supplierBillNo: body.supplierBillNo,
           categoryId: category.id,
           supplyDate,
           paymentDate: body.paymentDate ? new Date(body.paymentDate) : supplyDate,
@@ -134,6 +141,7 @@ router.post(
           paidBy: body.paidBy,
           paymentDocumentId: paymentDocument?.id,
           vatPercent: body.vatPercent,
+          discountAmount: body.discountAmount,
           amountPaid: body.amountPaid,
           items: itemInputs,
           createdBy: req.user.id,
@@ -173,6 +181,22 @@ router.post(
     }
   }
 )
+
+// ── Scan bill (auto-fill) ───────────────────────────────────────────────────
+// Reads an uploaded bill and returns a draft purchase for the New Purchase
+// form to pre-fill. Nothing is stored — the file is kept in memory only; the
+// form re-uploads it as the mandatory attachment when the user hits Apply.
+const extractUpload = multer({ storage: multer.memoryStorage(), fileFilter, limits: { fileSize: 10 * 1024 * 1024 } })
+
+router.get('/extract/status', requirePermission('can_create_purchasing_entry'), async (_req: Request, res: Response) => {
+  res.json({ enabled: isBillExtractionEnabled() })
+})
+
+router.post('/extract', requirePermission('can_create_purchasing_entry'), extractUpload.single('file'), async (req: Request, res: Response) => {
+  if (!req.file) throw new AppError('Upload the bill as a PDF, JPG or PNG', 400, 'VALIDATION_ERROR')
+  const result = await extractBill(req.user.organizationId, req.file)
+  res.json(result)
+})
 
 // ── Bulk import (CSV/Excel) ─────────────────────────────────────────────────
 // Each row is one purchase with a single line item — the common shape for a

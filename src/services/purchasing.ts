@@ -6,6 +6,7 @@ import { applyStockIn } from '../utils/stock'
 import { AppError } from '../middleware/error'
 import { lockPurchasing, recordPurchasePayment } from './purchasePayments'
 import { toHijriDate } from '../utils/hijriDate'
+import { financeLock } from '../utils/financeTransaction'
 
 export interface PurchaseItemInput {
   itemId?: string
@@ -19,11 +20,13 @@ export interface CreatePurchaseBillParams {
   branchId: string
   supplierId: string
   supplierName: string
+  supplierBillNo?: string
   categoryId?: string
   supplyDate: Date
   paymentDate: Date
   paymentType: 'cash' | 'bank_transfer'
   vatPercent: number
+  discountAmount?: number
   amountPaid: number
   items: PurchaseItemInput[]
   createdBy: string
@@ -48,14 +51,30 @@ async function createPurchaseBillInCurrency(prisma: PrismaClient, params: Create
   if (!Number.isFinite(params.supplyDate.getTime()) || !Number.isFinite(params.paymentDate.getTime())) throw new AppError('Invalid purchase date', 400, 'VALIDATION_ERROR')
   const linkedIds = [...new Set(params.items.map(i => i.itemId).filter((id): id is string => !!id))]
   if (linkedIds.length !== await prisma.item.count({ where: { id: { in: linkedIds }, organizationId: params.organizationId, isActive: true } })) throw new AppError('One or more stock items were not found', 400, 'VALIDATION_ERROR')
-  const lines = params.items.map(item => {
-    const base = roundMoney(item.quantity * item.unitCost)
+  if (!Number.isFinite(params.vatPercent) || params.vatPercent < 0 || params.vatPercent > 100) throw new AppError('Invalid tax rate', 400, 'VALIDATION_ERROR')
+  const supplierBillNo = params.supplierBillNo?.trim() || undefined
+  if (supplierBillNo) {
+    await financeLock(prisma, `vendor-invoice:${params.organizationId}:${params.supplierId}`)
+    const duplicate = await prisma.bill.findFirst({ where: { organizationId: params.organizationId, supplierId: params.supplierId, supplierBillNo: { equals: supplierBillNo, mode: 'insensitive' }, status: { not: 'void' } } })
+    if (duplicate) throw new AppError('This supplier invoice has already been entered', 400, 'DUPLICATE_VENDOR_INVOICE')
+  }
+  const gross = params.items.map(item => roundMoney(item.quantity * item.unitCost))
+  const subtotal = roundMoney(gross.reduce((sum, value) => sum + value, 0))
+  const discountAmount = roundMoney(params.discountAmount ?? 0)
+  if (!Number.isFinite(discountAmount) || discountAmount < 0 || discountAmount > subtotal) throw new AppError('Invalid purchase discount', 400, 'VALIDATION_ERROR')
+  // Spread the bill discount across lines by cumulative share so the line
+  // nets add up exactly to subtotal − discount; tax is charged on the net.
+  let cumulative = 0, allocated = 0
+  const lines = params.items.map((item, index) => {
+    cumulative = roundMoney(cumulative + gross[index])
+    const targetDiscount = roundMoney(subtotal > 0 ? discountAmount * cumulative / subtotal : 0)
+    const base = roundMoney(gross[index] - (targetDiscount - allocated))
+    allocated = targetDiscount
     const tax = roundMoney(base * params.vatPercent / 100)
     return { ...item, base, tax, total: roundMoney(base + tax) }
   })
-  const subtotal = roundMoney(lines.reduce((sum, item) => sum + item.base, 0))
   const vatAmount = roundMoney(lines.reduce((sum, item) => sum + item.tax, 0))
-  const totalAmount = roundMoney(subtotal + vatAmount)
+  const totalAmount = roundMoney(subtotal - discountAmount + vatAmount)
   if (totalAmount <= 0) throw new AppError('Purchase total must be positive', 400, 'VALIDATION_ERROR')
   if (!validMoneyPrecision(params.amountPaid) || params.amountPaid < 0 || params.amountPaid > totalAmount) throw new AppError('Invalid amount paid for this currency', 400, 'OVERPAYMENT')
   const paidAmount = params.amountPaid
@@ -69,10 +88,12 @@ async function createPurchaseBillInCurrency(prisma: PrismaClient, params: Create
       organizationId: params.organizationId,
       branchId: params.branchId,
       supplierId: params.supplierId,
+      supplierBillNo,
       billNo,
       billDate: params.supplyDate,
       dueDate: params.paymentDate,
       subtotal,
+      discountAmount,
       vatAmount,
       totalAmount,
       paidAmount: 0,
@@ -92,7 +113,7 @@ async function createPurchaseBillInCurrency(prisma: PrismaClient, params: Create
   })
 
   const stockTotal = roundMoney(lines.filter(i => i.itemId).reduce((sum, i) => sum + i.base, 0))
-  const otherTotal = roundMoney(subtotal - stockTotal)
+  const otherTotal = roundMoney(subtotal - discountAmount - stockTotal)
   const category = params.categoryId ? await prisma.expenseCategory.findFirst({ where: { id: params.categoryId, organizationId: params.organizationId, isActive: true } }) : null
   if (params.categoryId && !category) throw new AppError('Category not found', 404, 'NOT_FOUND')
   const [inventoryAccount, otherAccount, inputVat, payable] = await Promise.all([
@@ -131,14 +152,14 @@ async function createPurchaseBillInCurrency(prisma: PrismaClient, params: Create
     createdPayment = result.payment
   }
 
-  for (const item of params.items) {
+  for (const item of lines) {
     if (!item.itemId) continue // free-text lines aren't linked to a stock item
     await applyStockIn(prisma, {
       organizationId: params.organizationId,
       branchId: params.branchId,
       itemId: item.itemId,
       quantity: item.quantity,
-      unitCost: item.unitCost,
+      unitCost: item.base / item.quantity, // discounted cost
       referenceType: 'purchase',
       referenceId: createdBill.id,
       notes: `Purchased via Purchasing — ${billNo}`,

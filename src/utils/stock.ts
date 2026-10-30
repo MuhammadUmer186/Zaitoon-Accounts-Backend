@@ -1,5 +1,6 @@
 import { PrismaClient } from '@prisma/client'
 import { AppError } from '../middleware/error'
+import { financeTransaction, financeLock } from './financeTransaction'
 
 export interface StockInInput {
   organizationId: string
@@ -19,8 +20,22 @@ export interface StockInInput {
 // Shared by the manual stock-in endpoint (inventory.ts) and Purchase Order receiving
 // (purchaseOrders.ts) so both paths keep BranchStock/StockMovement consistent.
 export async function applyStockIn(prisma: PrismaClient, input: StockInInput) {
-  await prisma.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`branch-owner:${input.branchId}`}))`
-  await prisma.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`stock:${input.branchId}:${input.itemId}`}))`
+  return financeTransaction(prisma, async (tx) => {
+    // Branch-owner and stock locks share their keys with the branch sync paths
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`branch-owner:${input.branchId}`}))`
+    await financeLock(tx, `period:${input.organizationId}`)
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`stock:${input.branchId}:${input.itemId}`}))`
+    return stockInLocked(tx, input)
+  })
+}
+
+async function stockInLocked(prisma: PrismaClient, input: StockInInput) {
+  if (!Number.isFinite(input.quantity) || input.quantity <= 0 || !Number.isFinite(input.unitCost) || input.unitCost < 0) {
+    throw new AppError('Invalid stock quantity or cost', 400, 'VALIDATION_ERROR')
+  }
+  const item = await prisma.item.findFirst({ where: { id: input.itemId, organizationId: input.organizationId, isActive: true } })
+  const branch = await prisma.branch.findFirst({ where: { id: input.branchId, organizationId: input.organizationId } })
+  if (!item || !branch) throw new AppError('Stock item or branch not found', 404, 'NOT_FOUND')
   const totalValue = input.quantity * input.unitCost
 
   const movement = await prisma.stockMovement.create({
@@ -59,7 +74,6 @@ export async function applyStockIn(prisma: PrismaClient, input: StockInInput) {
       },
     })
   } else {
-    const item = await prisma.item.findUnique({ where: { id: input.itemId } })
     await prisma.branchStock.create({
       data: {
         organizationId: input.organizationId,
@@ -96,13 +110,22 @@ export interface StockOutInput {
 // "Stock Out" endpoint (general usage/consumption/adjustment for any branch,
 // applied immediately — no approval step, unlike wastage reports).
 export async function applyStockOut(prisma: PrismaClient, input: StockOutInput) {
-  await prisma.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`branch-owner:${input.branchId}`}))`
-  await prisma.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`stock:${input.branchId}:${input.itemId}`}))`
+  return financeTransaction(prisma, async (tx) => {
+    // Branch-owner and stock locks share their keys with the branch sync paths
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`branch-owner:${input.branchId}`}))`
+    await financeLock(tx, `period:${input.organizationId}`)
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`stock:${input.branchId}:${input.itemId}`}))`
+    return stockOutLocked(tx, input)
+  })
+}
+
+async function stockOutLocked(prisma: PrismaClient, input: StockOutInput) {
+  if (!Number.isFinite(input.quantity) || input.quantity <= 0) throw new AppError('Invalid stock quantity', 400, 'VALIDATION_ERROR')
   const existingStock = await prisma.branchStock.findUnique({
     where: { branchId_itemId: { branchId: input.branchId, itemId: input.itemId } },
   })
 
-  if (!existingStock || existingStock.quantityOnHand < input.quantity) {
+  if (!existingStock || existingStock.organizationId !== input.organizationId || existingStock.quantityOnHand < input.quantity) {
     const available = existingStock?.quantityOnHand ?? 0
     throw new AppError(
       `Insufficient stock: only ${available} available, requested ${input.quantity}`,

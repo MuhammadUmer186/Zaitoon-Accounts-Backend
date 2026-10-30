@@ -6,6 +6,7 @@ import morgan from 'morgan'
 import { config } from './config'
 import router from './routes/index'
 import { errorHandler } from './middleware/error'
+import { apiRateLimit } from './utils/rateLimit'
 
 const app = express()
 
@@ -21,8 +22,8 @@ app.use(morgan('dev'))
 app.use(express.json({ limit: '10mb', verify: (req, _res, buf) => { if (req.url?.includes('/payments/callbacks/')) (req as unknown as { rawBody?: Buffer }).rawBody = Buffer.from(buf) } }))
 app.use(express.urlencoded({ extended: true }))
 
-// Mount all routes
-app.use(config.apiPrefix, router)
+// Mount all routes (per-IP request cap first)
+app.use(config.apiPrefix, apiRateLimit, router)
 
 // 404 handler
 app.use((_req: Request, res: Response) => {

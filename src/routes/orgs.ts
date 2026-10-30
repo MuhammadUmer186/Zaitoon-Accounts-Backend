@@ -29,6 +29,7 @@ const orgSettingsSchema = z.object({
   hiddenNavigation: z.array(z.enum(NAVIGATION_PATHS)).max(NAVIGATION_PATHS.length)
     .transform((paths) => NAVIGATION_PATHS.filter((path) => paths.includes(path))).optional(),
   multiBranch: z.boolean().optional(),
+  requireAdminMfa: z.boolean().optional(),
   foodCostMethod: z.enum(['issues', 'recipes']).optional(),
   requireTillForCash: z.boolean().optional(),
   offlinePosEnabled: z.boolean().optional(),
@@ -154,6 +155,7 @@ router.get('/:orgId/users', requirePermission('can_manage_users'), async (req: R
         lastName: true,
         phone: true,
         isActive: true,
+        mfaEnabled: true,
         lastLoginAt: true,
         createdAt: true,
         roles: { include: { role: true } },

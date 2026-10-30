@@ -429,7 +429,7 @@ router.post('/:id/void', requirePermission('can_void_sales'), async (req: Reques
   }
 
   if (sale.journalEntryId) {
-    await reverseJournalEntry(prisma, sale.journalEntryId, req.user.id, `Void — ${voidReason}`)
+    await reverseJournalEntry(prisma, sale.journalEntryId, req.user.id, `Void — ${voidReason}`, req.user.organizationId)
   }
 
   const updated = await prisma.dailySale.update({

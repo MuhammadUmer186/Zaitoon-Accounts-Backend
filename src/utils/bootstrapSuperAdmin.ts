@@ -60,9 +60,14 @@ export async function bootstrapSuperAdmin(prisma: PrismaClient): Promise<void> {
       })
       log(`Created Super Admin user ${email}`)
     } else {
-      const data: { isActive?: boolean; passwordHash?: string } = {}
+      const data: Record<string, unknown> = {}
       if (!user.isActive) data.isActive = true
       if (resetPassword) data.passwordHash = await bcrypt.hash(password, 10)
+      // SUPER_ADMIN_RESET_MFA=true clears two-factor (lost phone recovery)
+      if (process.env.SUPER_ADMIN_RESET_MFA?.trim().toLowerCase() === 'true' && user.mfaEnabled) {
+        Object.assign(data, { mfaEnabled: false, mfaSecret: null, mfaPendingSecret: null, mfaRecoveryCodes: [], mfaLastStep: null })
+        log(`Two-factor reset for ${user.email} — set SUPER_ADMIN_RESET_MFA=false (or remove it) now`)
+      }
       if (Object.keys(data).length > 0) {
         await prisma.user.update({ where: { id: user.id }, data })
       }

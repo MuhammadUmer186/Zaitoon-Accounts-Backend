@@ -21,6 +21,9 @@ export function requirePermission(permissionKey: string) {
   }
 }
 
+// Passes when the user holds at least one of the given permissions. Used for
+// reads that several modules share (e.g. the supplier list is needed by
+// Purchasing, Purchase Orders, Bills and Expenses).
 export function requireAnyPermission(...permissionKeys: string[]) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
@@ -61,4 +64,10 @@ export async function assertNotOwnSubmission(req: Request, createdBy: string | n
   const { roles } = await getUserPermissions(prisma, req.user.id)
   if (roles.some((r) => r === 'super_admin' || r === 'owner')) return
   throw new AppError(`You prepared this ${what} — another user has to approve it`, 403, 'SELF_APPROVAL')
+}
+
+// Report exports (?format=pdf|excel|csv) additionally need can_export_reports.
+export async function requireExportPermission(req: Request, res: Response, next: NextFunction): Promise<void> {
+  if (!req.query.format) return next()
+  return requirePermission('can_export_reports')(req, res, next)
 }

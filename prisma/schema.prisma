@@ -193,6 +193,26 @@ model BranchRemoteCommand {
   @@index([publicId])
 }
 
+model DocumentSequence {
+  organizationId String
+  model          String
+  field          String
+  prefix         String
+  year           Int
+  lastNumber     Int
+
+  @@id([organizationId, model, field, prefix, year])
+}
+
+// Preserve all accounts used by each posting role across mapping changes.
+model AccountingMappingAccount {
+  organizationId String
+  key            AccountingMappingKey
+  accountId      String
+
+  @@id([organizationId, key, accountId])
+}
+
 model Organization {
   freeDishItems FreeDishItem[]
   freeDishQrs FreeDishQr[]
@@ -253,6 +273,7 @@ model Organization {
   // IANA zone the menu shift times (Breakfast/Lunch/Dinner) are written in —
   // the server itself may run in UTC.
   timezone             String              @default("Asia/Karachi")
+  requireAdminMfa      Boolean             @default(false)
   isActive             Boolean             @default(true)
   createdAt            DateTime            @default(now())
   updatedAt            DateTime            @updatedAt
@@ -331,6 +352,7 @@ model Branch {
   deliveryZones     DeliveryZone[]
   riders            Rider[]
 
+
   @@unique([organizationId, code])
 }
 
@@ -361,6 +383,12 @@ model User {
   avatarUrl      String?
   isActive       Boolean            @default(true)
   lastLoginAt    DateTime?
+  // Two-factor login (TOTP). Secrets are AES-encrypted; recovery codes are bcrypt hashes.
+  mfaEnabled       Boolean            @default(false)
+  mfaSecret        String?
+  mfaPendingSecret String?
+  mfaRecoveryCodes String[]           @default([])
+  mfaLastStep      Int?
   createdAt      DateTime           @default(now())
   updatedAt      DateTime           @updatedAt
   organization   Organization       @relation(fields: [organizationId], references: [id])
@@ -559,9 +587,10 @@ model BankAccount {
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
-  organization Organization @relation(fields: [organizationId], references: [id])
-  account      Account      @relation(fields: [accountId], references: [id])
-  branch       Branch?      @relation(fields: [branchId], references: [id])
+  organization   Organization        @relation(fields: [organizationId], references: [id])
+  account        Account             @relation(fields: [accountId], references: [id])
+  branch         Branch?             @relation(fields: [branchId], references: [id])
+  statementLines BankStatementLine[]
 
   @@index([organizationId])
 }
@@ -674,9 +703,37 @@ model JournalLine {
   lineOrder      Int          @default(0)
   journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
   account        Account      @relation(fields: [accountId], references: [id])
+  // Bank reconciliation: the bank-statement line this ledger line was matched to
+  statementLineId String?
+  statementLine   BankStatementLine? @relation(fields: [statementLineId], references: [id], onDelete: SetNull)
 
   @@index([accountId])
   @@index([journalEntryId])
+  @@index([statementLineId])
+}
+
+// One line of an imported bank statement. amount is signed: positive =
+// money into the account, negative = money out. Reconciliation matches it to
+// one or more JournalLines on the bank account's ledger account.
+model BankStatementLine {
+  id             String        @id @default(cuid())
+  organizationId String
+  bankAccountId  String
+  importBatch    String
+  date           DateTime
+  description    String
+  reference      String?
+  amount         Decimal       @db.Decimal(18, 2)
+  balance        Decimal?      @db.Decimal(18, 2)
+  status         String        @default("unmatched") // unmatched | matched | excluded
+  matchedAt      DateTime?
+  matchedBy      String?
+  createdAt      DateTime      @default(now())
+  bankAccount    BankAccount   @relation(fields: [bankAccountId], references: [id])
+  journalLines   JournalLine[]
+
+  @@index([bankAccountId, status])
+  @@index([bankAccountId, date])
 }
 
 // Daily Sales
@@ -1005,10 +1062,10 @@ model BranchSection {
   branchId       String
   name           String
   description    String?
-  isActive       Boolean    @default(true)
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
-  branch         Branch     @relation(fields: [branchId], references: [id])
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  branch         Branch       @relation(fields: [branchId], references: [id])
   stockOuts      StockOut[]
 
   @@unique([branchId, name])
@@ -1171,6 +1228,74 @@ model AuditLog {
 
   @@index([organizationId, module])
   @@index([organizationId, resourceType, resourceId])
+}
+
+// Fixed-asset register with straight-line monthly depreciation
+model FixedAsset {
+  id                           String                   @id @default(cuid())
+  organizationId               String
+  branchId                     String?
+  assetNo                      String
+  name                         String
+  category                     String?
+  purchaseDate                 DateTime
+  inServiceDate                DateTime
+  cost                         Decimal                  @db.Decimal(18, 2)
+  salvageValue                 Decimal                  @default(0) @db.Decimal(18, 2)
+  usefulLifeMonths             Int
+  assetAccountId               String
+  accumulatedDepAccountId      String
+  depreciationExpenseAccountId String
+  accumulatedDepreciation      Decimal                  @default(0) @db.Decimal(18, 2)
+  status                       String                   @default("active") // active | fully_depreciated | disposed
+  disposedAt                   DateTime?
+  disposalProceeds             Decimal?                 @db.Decimal(18, 2)
+  disposalJournalEntryId       String?
+  acquisitionJournalEntryId    String?
+  notes                        String?
+  createdBy                    String
+  createdAt                    DateTime                 @default(now())
+  updatedAt                    DateTime                 @updatedAt
+  depreciations                FixedAssetDepreciation[]
+
+  @@unique([organizationId, assetNo])
+  @@index([organizationId, status])
+}
+
+// One row per asset per month depreciated — makes depreciation runs idempotent
+model FixedAssetDepreciation {
+  id             String     @id @default(cuid())
+  assetId        String
+  periodMonth    String // "YYYY-MM"
+  amount         Decimal    @db.Decimal(18, 2)
+  journalEntryId String?
+  createdAt      DateTime   @default(now())
+  asset          FixedAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([assetId, periodMonth])
+}
+
+// Recurring journal template (rent, salaries accrual, ...) posted when due
+model RecurringJournal {
+  id             String    @id @default(cuid())
+  organizationId String
+  branchId       String
+  name           String
+  description    String
+  frequency      String // weekly | monthly | quarterly | yearly
+  startDate      DateTime
+  nextRunDate    DateTime
+  endDate        DateTime?
+  lines          Json // [{ accountId, description?, debitAmount, creditAmount }]
+  isActive       Boolean   @default(true)
+  lastRunAt      DateTime?
+  runCount       Int       @default(0)
+  lastError      String? // why the last automatic posting failed (period locked, archived account...)
+  createdBy      String
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([organizationId, isActive, nextRunDate])
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -443,7 +443,7 @@ router.post('/:id/void', requirePermission('can_void_expense'), async (req: Requ
     if (current.status === 'void') throw new AppError('Expense is already voided', 400, 'INVALID_STATUS')
     if (expense.billId) await tx.$queryRaw`SELECT id FROM "Bill" WHERE id = ${expense.billId} FOR UPDATE`
     if (current.journalEntryId) {
-      await reverseJournalEntry(db, current.journalEntryId, req.user.id, `Void — ${voidReason}`)
+      await reverseJournalEntry(db, current.journalEntryId, req.user.id, `Void — ${voidReason}`, req.user.organizationId)
     }
 
     // A purchasing-mode expense is a bill payment: voiding it must also undo

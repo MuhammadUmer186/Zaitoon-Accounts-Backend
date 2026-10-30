@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { requireModule, requirePermission } from '../middleware/authorize'
+import { requireAnyPermission } from '../middleware/authorize'
 import { AppError } from '../middleware/error'
 
 const router = Router()
@@ -18,7 +19,7 @@ const upsertTargetSchema = z.object({
 })
 
 // GET /targets?year=&month=
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', requireAnyPermission('can_view_reports', 'can_create_branch'), async (req: Request, res: Response) => {
   const orgId = req.user.organizationId
   const now = new Date()
   const year = req.query.year ? parseInt(req.query.year as string) : now.getFullYear()
@@ -33,7 +34,7 @@ router.get('/', async (req: Request, res: Response) => {
 })
 
 // PUT /targets — upsert a branch's target for a given year/month
-router.put('/', requirePermission('can_create_branch'), async (req: Request, res: Response) => {
+router.put('/', requireAnyPermission('can_create_branch', 'can_manage_settings'), async (req: Request, res: Response) => {
   const body = upsertTargetSchema.parse(req.body)
   const orgId = req.user.organizationId
 

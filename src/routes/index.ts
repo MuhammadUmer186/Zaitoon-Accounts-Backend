@@ -52,6 +52,10 @@ import zatcaRouter from './zatca'
 import onlineRouter from './online'
 import hrRouter from './hr'
 import { freeDishRouter, publicFreeDishRouter } from './freeDish'
+import backupRouter from './backup'
+import bankReconciliationRouter from './bankReconciliation'
+import fixedAssetsRouter from './fixedAssets'
+import recurringJournalsRouter from './recurringJournals'
 
 const router = Router()
 router.use('/printer-device', printerDeviceRouter)
@@ -120,5 +124,9 @@ router.use('/zatca', zatcaRouter)
 // QR ordering & reviews — no login
 router.use('/public', publicRouter)
 router.use('/public/online', onlineRouter)
+router.use('/backup', backupRouter)
+router.use('/bank-reconciliation', bankReconciliationRouter)
+router.use('/fixed-assets', fixedAssetsRouter)
+router.use('/recurring-journals', recurringJournalsRouter)
 
 export default router

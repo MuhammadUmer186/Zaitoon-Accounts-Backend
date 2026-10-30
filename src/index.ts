@@ -7,6 +7,9 @@ import { startZatcaWorker } from './services/zatca'
 import { startBranchSyncWorker } from './services/branchSync'
 import { startBranchControlPlaneMaintenance } from './services/branchReplicaTransport'
 import { startKitchenPrintWorker } from './services/kitchenPrinting'
+import { startRecurringJournalRunner } from './routes/recurringJournals'
+import { normalizeAccounts } from './utils/normalizeAccounts'
+import { ensurePermissions } from './utils/ensurePermissions'
 
 async function main() {
   try {
@@ -20,6 +23,10 @@ async function main() {
     startBranchSyncWorker()
     startBranchControlPlaneMaintenance()
     startKitchenPrintWorker()
+    await normalizeAccounts(prisma)
+    await ensurePermissions(prisma)
+    // Posts due recurring journal entries (on start, then hourly)
+    startRecurringJournalRunner()
 
     app.listen(config.port, process.env.BIND_HOST || '0.0.0.0', () => {
       console.log(`FoodSync Backend running on http://localhost:${config.port}`)
