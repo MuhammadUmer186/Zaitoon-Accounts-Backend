@@ -2,11 +2,13 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requireModule, requirePermission } from '../middleware/authorize'
 import { AppError } from '../middleware/error'
 
 const router = Router()
 
 router.use(authenticate)
+router.use(requireModule('branches', 'reports', 'sales'))
 
 const upsertTargetSchema = z.object({
   branchId: z.string(),
@@ -31,7 +33,7 @@ router.get('/', async (req: Request, res: Response) => {
 })
 
 // PUT /targets — upsert a branch's target for a given year/month
-router.put('/', async (req: Request, res: Response) => {
+router.put('/', requirePermission('can_create_branch'), async (req: Request, res: Response) => {
   const body = upsertTargetSchema.parse(req.body)
   const orgId = req.user.organizationId
 

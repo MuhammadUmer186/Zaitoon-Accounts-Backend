@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient, Prisma } from '@prisma/client'
 
 export interface UserPermissionSet {
   permissions: Set<string>
@@ -25,9 +25,11 @@ const FULL_ACCESS_ROLES = ['super_admin', 'owner']
 // permissions server-side (middleware/authorize.ts). super_admin/owner
 // implicitly hold every permission; admin holds every permission except
 // ADMIN_EXCLUDED_PERMISSIONS.
-export async function getUserPermissions(prisma: PrismaClient, userId: string): Promise<UserPermissionSet> {
+export async function getUserPermissions(prisma: PrismaClient | Prisma.TransactionClient, userId: string): Promise<UserPermissionSet> {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { organizationId: true, isActive: true, organization: { select: { isActive: true } } } })
+  if (!user?.isActive || !user.organization.isActive) return { permissions: new Set(), roles: [], moduleAccess: new Set() }
   const userRoles = await prisma.userRole.findMany({
-    where: { userId },
+    where: { userId, role: { organizationId: user.organizationId } },
     include: { role: { include: { permissions: { include: { permission: true } } } } },
   })
 
@@ -56,6 +58,11 @@ export async function getUserPermissions(prisma: PrismaClient, userId: string): 
       grant(p.key, p.module)
     }
   }
+
+  // One Purchases & Expenses workspace; retain legacy permission keys so
+  // existing roles work without a grant migration. Action permissions remain
+  // separate for expense creation, purchases, approval and payment.
+  if (moduleAccess.has('purchasing') || permissions.has('can_make_payment')) moduleAccess.add('expenses')
 
   return { permissions, roles, moduleAccess }
 }

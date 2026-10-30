@@ -1,8 +1,11 @@
+import { moneyTolerance as regionalMoneyTolerance } from '../utils/money'
+import { updateSchema } from '../utils/updateSchema'
 import fs from 'fs'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requireModule, requirePermission, requireAnyPermission } from '../middleware/authorize'
 import { upload } from '../middleware/upload'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { applyStockIn, applyStockOut } from '../utils/stock'
@@ -10,10 +13,30 @@ import { nextNumber } from '../utils/numbering'
 import { AppError } from '../middleware/error'
 import { postJournalEntry, resolveMappedAccount } from '../utils/ledger'
 import { assertBranchAccess, branchFilter, getBranchScope } from '../utils/branchScope'
+import { localTransferCall } from '../services/branchTransfers'
 
 const router = Router()
 
 router.use(authenticate)
+router.use(requireModule('inventory', 'purchase_orders', 'purchasing', 'approvals', 'menu'))
+router.get('/branch-transfers', requireAnyPermission('can_manage_inventory', 'can_transfer_stock'), async (req, res) => {
+  if (process.env.FOODSYNC_DEPLOYMENT_MODE !== 'branch') {
+    // The cloud sees every PC-to-PC transfer the user's branches take part in,
+    // so goods stuck in transit can be traced and, if lost, returned.
+    const scope = await getBranchScope(req)
+    const where = { organizationId: req.user.organizationId, ...(scope.restricted && { OR: [{ sourceBranchId: { in: scope.branchIds } }, { destinationBranchId: { in: scope.branchIds } }] }) }
+    const [data, branches] = await Promise.all([
+      prisma.branchStockTransfer.findMany({ where, orderBy: { createdAt: 'desc' }, take: 100 }),
+      prisma.branch.findMany({ where: { organizationId: req.user.organizationId }, select: { id: true, name: true } }),
+    ])
+    res.json({ mode: 'cloud', branches, data }); return
+  }
+  res.json({ ...await localTransferCall('view', req.user.id), mode: 'branch' })
+})
+router.post('/branch-transfers/:id/receive', requireAnyPermission('can_manage_inventory', 'can_transfer_stock'), async (req, res) => {
+  const input = z.object({ confirmPhysicalReceipt: z.literal(true) }).strict().parse(req.body)
+  res.json(await localTransferCall('receive', req.user.id, { transferId: req.params.id, ...input }))
+})
 
 const categorySchema = z.object({
   name: z.string().min(1),
@@ -37,6 +60,7 @@ const itemSchema = z.object({
 const stockOutSchema = z
   .object({
     type: z.enum(['branch_transfer', 'section']),
+    requestId: z.string().uuid().optional(),
     branchId: z.string(),
     toBranchId: z.string().optional(),
     sectionId: z.string().optional(),
@@ -81,7 +105,7 @@ router.get('/categories', async (req: Request, res: Response) => {
 })
 
 // POST /inventory/categories
-router.post('/categories', async (req: Request, res: Response) => {
+router.post('/categories', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const body = categorySchema.parse(req.body)
   const category = await prisma.itemCategory.create({
     data: { ...body, organizationId: req.user.organizationId },
@@ -90,19 +114,19 @@ router.post('/categories', async (req: Request, res: Response) => {
 })
 
 // PUT /inventory/categories/:id
-router.put('/categories/:id', async (req: Request, res: Response) => {
+router.put('/categories/:id', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const category = await prisma.itemCategory.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!category) throw new AppError('Category not found', 404, 'NOT_FOUND')
 
-  const body = categorySchema.partial().parse(req.body)
+  const body = updateSchema(categorySchema).parse(req.body)
   const updated = await prisma.itemCategory.update({ where: { id: req.params.id }, data: body })
   res.json(updated)
 })
 
 // DELETE /inventory/categories/:id
-router.delete('/categories/:id', async (req: Request, res: Response) => {
+router.delete('/categories/:id', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const category = await prisma.itemCategory.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -207,7 +231,7 @@ router.get('/items', async (req: Request, res: Response) => {
 })
 
 // POST /inventory/items — add a new product to the catalog
-router.post('/items', async (req: Request, res: Response) => {
+router.post('/items', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const body = itemSchema.parse(req.body)
 
   let unit = body.unit
@@ -227,13 +251,13 @@ router.post('/items', async (req: Request, res: Response) => {
 })
 
 // PUT /inventory/items/:id
-router.put('/items/:id', async (req: Request, res: Response) => {
+router.put('/items/:id', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const item = await prisma.item.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!item) throw new AppError('Item not found', 404, 'NOT_FOUND')
 
-  const body = itemSchema.partial().parse(req.body)
+  const body = updateSchema(itemSchema).parse(req.body)
   if (body.categoryId) {
     const category = await prisma.itemCategory.findFirst({
       where: { id: body.categoryId, organizationId: req.user.organizationId },
@@ -252,7 +276,7 @@ router.put('/items/:id', async (req: Request, res: Response) => {
 // DELETE /inventory/items/:id — items always have a BranchStock row per
 // branch (created up front) and often purchase/movement history, so this
 // always deactivates rather than hard-deleting.
-router.delete('/items/:id', async (req: Request, res: Response) => {
+router.delete('/items/:id', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const item = await prisma.item.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -283,7 +307,7 @@ router.get('/sections', async (req: Request, res: Response) => {
 // POST /inventory/sections — create a section in one branch, or (with
 // allBranches: true) the same-named section in every active branch that
 // doesn't already have it.
-router.post('/sections', async (req: Request, res: Response) => {
+router.post('/sections', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const body = sectionSchema.extend({
     branchId: z.string().optional(),
     allBranches: z.boolean().optional(),
@@ -322,18 +346,18 @@ router.post('/sections', async (req: Request, res: Response) => {
 })
 
 // PUT /inventory/sections/:id
-router.put('/sections/:id', async (req: Request, res: Response) => {
+router.put('/sections/:id', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
   if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, section.branchId)
-  const body = sectionSchema.partial().extend({ isActive: z.boolean().optional() }).parse(req.body)
+  const body = updateSchema(sectionSchema).extend({ isActive: z.boolean().optional() }).parse(req.body)
   const updated = await prisma.branchSection.update({ where: { id: section.id }, data: body })
   res.json(updated)
 })
 
 // DELETE /inventory/sections/:id — deactivates when the section has stock-out
 // history (so past issues keep their section), otherwise deletes.
-router.delete('/sections/:id', async (req: Request, res: Response) => {
+router.delete('/sections/:id', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const section = await prisma.branchSection.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId } })
   if (!section) throw new AppError('Section not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, section.branchId)
@@ -410,7 +434,7 @@ router.get('/sections/summary', async (req: Request, res: Response) => {
 //    the destination branch store. Inventory stays inventory, so no GL entry.
 //  - section: issues stock from the branch store to one of its sections —
 //    that's consumption, posted as Food Cost / Inventory.
-router.post('/stock-out', async (req: Request, res: Response) => {
+router.post('/stock-out', requireAnyPermission('can_manage_inventory', 'can_transfer_stock'), async (req: Request, res: Response) => {
   const body = stockOutSchema.parse(req.body)
   const orgId = req.user.organizationId
 
@@ -420,8 +444,25 @@ router.post('/stock-out', async (req: Request, res: Response) => {
   // of a branch transfer can be any branch.
   await assertBranchAccess(req, body.branchId)
 
+  if (body.type === 'branch_transfer' && process.env.FOODSYNC_DEPLOYMENT_MODE === 'branch') {
+    const runtime = await prisma.branchRuntime.findUnique({ where: { id: 'local' } })
+    if (!runtime || runtime.branchId !== body.branchId) throw new AppError('Source must be this PC branch', 403, 'BRANCH_FORBIDDEN')
+    if (!body.requestId) throw new AppError('A persistent requestId is required for safe transfer retries', 400, 'TRANSFER_REQUEST_ID_REQUIRED')
+    const transfer = await localTransferCall('start', req.user.id, { requestId: body.requestId, destinationBranchId: body.toBranchId, items: body.items })
+    res.status(202).json({ ...transfer, stockOutNo: body.requestId, transferPending: true }); return
+  }
+
   let toBranch: { id: string; name: string } | null = null
   let section: { id: string; name: string } | null = null
+  if (body.type !== 'branch_transfer') {
+    const org = await prisma.organization.findUnique({ where: { id: orgId }, select: { foodCostMethod: true } })
+    if (org?.foodCostMethod === 'recipes') {
+      throw new AppError(
+        'Food cost is set to "Recipes": ingredients are taken out of stock automatically when dishes are sold, so issuing stock to a kitchen section would count the cost twice. Use a branch transfer, or record spoilage under Wastage.',
+        400, 'RECIPE_MODE',
+      )
+    }
+  }
   if (body.type === 'branch_transfer') {
     if (body.toBranchId === body.branchId) throw new AppError('Destination branch must be different from the source branch', 400, 'VALIDATION_ERROR')
     toBranch = await prisma.branch.findFirst({ where: { id: body.toBranchId, organizationId: orgId }, select: { id: true, name: true } })
@@ -638,7 +679,7 @@ const addPurchaseSchema = z.object({
 // POST /inventory/purchases — receive an approved PO into branch stock, with
 // real costing/supplier/payment/invoice captured at the moment of receiving,
 // auto-creating the matching Supplier Bill (and Payment, if partly/fully paid).
-router.post('/purchases', upload.single('file'), async (req: Request, res: Response) => {
+router.post('/purchases', requireAnyPermission('can_manage_inventory', 'can_approve_purchase_order'), upload.single('file'), async (req: Request, res: Response) => {
   const body = addPurchaseSchema.parse(req.body)
   let itemInputs: { purchaseOrderItemId: string; unitCost: number }[]
   try {
@@ -692,7 +733,7 @@ router.post('/purchases', upload.single('file'), async (req: Request, res: Respo
       const billNo = await nextNumber(tx as unknown as typeof prisma, 'bill', 'billNo', 'BILL', req.user.organizationId)
       const paidAmount = body.paidAmount
       const balanceDue = body.totalAmount - paidAmount
-      const status = balanceDue <= 0.01 ? 'paid' : paidAmount > 0 ? 'partial' : 'approved'
+      const status = balanceDue <= regionalMoneyTolerance() ? 'paid' : paidAmount > 0 ? 'partial' : 'approved'
 
       const createdBill = await tx.bill.create({
         data: {
@@ -868,7 +909,7 @@ router.get('/wastage', async (req: Request, res: Response) => {
 })
 
 // POST /inventory/wastage
-router.post('/wastage', async (req: Request, res: Response) => {
+router.post('/wastage', requirePermission('can_manage_inventory'), async (req: Request, res: Response) => {
   const body = wastageSchema.parse(req.body)
 
   const branch = await prisma.branch.findFirst({
@@ -896,8 +937,11 @@ router.post('/wastage', async (req: Request, res: Response) => {
 })
 
 // POST /inventory/wastage/:id/approve
-router.post('/wastage/:id/approve', async (req: Request, res: Response) => {
-  const report = await prisma.wastageReport.findFirst({
+router.post('/wastage/:id/approve', requirePermission('can_approve_wastage'), async (req: Request, res: Response) => {
+  const updated = await prisma.$transaction(async (tx) => {
+  const db = tx as unknown as typeof prisma
+  await tx.$queryRaw`SELECT id FROM "WastageReport" WHERE id=${req.params.id} AND "organizationId"=${req.user.organizationId} FOR UPDATE`
+  const report = await db.wastageReport.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
     include: { items: true },
   })
@@ -905,23 +949,24 @@ router.post('/wastage/:id/approve', async (req: Request, res: Response) => {
   if (report.status !== 'draft') throw new AppError('Report already processed', 400, 'INVALID_STATUS')
   await assertBranchAccess(req, report.branchId)
 
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`branch-owner:${report.branchId}`}))`
   // Reduce stock for each item
   for (const wi of report.items) {
-    const stock = await prisma.branchStock.findUnique({
+    const stock = await db.branchStock.findUnique({
       where: { branchId_itemId: { branchId: report.branchId, itemId: wi.itemId } },
     })
 
     if (stock) {
       const newQty = Math.max(0, stock.quantityOnHand - wi.quantity)
       const newValue = newQty * stock.averageCost
-      await prisma.branchStock.update({
+      await db.branchStock.update({
         where: { branchId_itemId: { branchId: report.branchId, itemId: wi.itemId } },
         data: { quantityOnHand: newQty, totalValue: newValue, lastUpdated: new Date() },
       })
     }
 
     // Record movement
-    await prisma.stockMovement.create({
+    await db.stockMovement.create({
       data: {
         organizationId: req.user.organizationId,
         branchId: report.branchId,
@@ -938,11 +983,11 @@ router.post('/wastage/:id/approve', async (req: Request, res: Response) => {
   }
 
   const [wastageExpense, inventory] = await Promise.all([
-    resolveMappedAccount(prisma, req.user.organizationId, 'WASTAGE_EXPENSE'),
-    resolveMappedAccount(prisma, req.user.organizationId, 'INVENTORY'),
+    resolveMappedAccount(db, req.user.organizationId, 'WASTAGE_EXPENSE'),
+    resolveMappedAccount(db, req.user.organizationId, 'INVENTORY'),
   ])
 
-  const je = await postJournalEntry(prisma, {
+  const je = await postJournalEntry(db, {
     organizationId: req.user.organizationId,
     branchId: report.branchId,
     entryDate: report.reportDate,
@@ -958,10 +1003,12 @@ router.post('/wastage/:id/approve', async (req: Request, res: Response) => {
     ],
   })
 
-  const updated = await prisma.wastageReport.update({
+  return db.wastageReport.update({
     where: { id: req.params.id },
     data: { status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), journalEntryId: je?.id },
     include: { items: { include: { item: true } }, branch: true },
+  })
+
   })
 
   res.json(updated)

@@ -1,18 +1,26 @@
 {
-  "name": "zaitoon-backend",
+  "name": "foodsync-backend",
   "version": "1.0.0",
   "scripts": {
+    "test:spending": "npm run build && node tests/spending.cjs",
+    "test:free-dish": "npm run build && node tests/free-dish.cjs",
+    "test:hr": "npm run build && node tests/hr-runner.cjs",
+    "test:ordering-finance": "npm run build && node tests/ordering-finance.cjs",
     "dev": "ts-node-dev --respawn --transpile-only --ignore-watch node_modules --ignore-watch uploads --ignore-watch dist src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "db:push": "prisma db push",
     "db:seed": "node prisma/seed.js",
     "db:clear-data": "node prisma/clear-data.js",
+    "db:reset-all-data": "node prisma/reset-all-data.js",
     "db:clear-inventory": "node prisma/clear-inventory.js",
     "db:sync-permissions": "node prisma/sync-permissions.js",
     "db:reset-logins": "node prisma/reset-logins.js",
     "db:upgrade-chart-of-accounts": "node prisma/upgrade-chart-of-accounts.js",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "test:security": "npm run build && node tests/run-isolated.cjs --probes-only",
+    "test:isolated": "npm run build && node tests/run-isolated.cjs",
+    "test:branch": "npm run build && node tests/run-isolated.cjs --branch-only"
   },
   "dependencies": {
     "@prisma/client": "^6.0.0",
@@ -25,16 +33,20 @@
     "express-async-errors": "^3.1.1",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
+    "jsrsasign": "^11.1.0",
+    "jszip": "^3.10.1",
+    "libphonenumber-js": "^1.13.15",
     "morgan": "^1.10.0",
     "multer": "^2.2.0",
     "pdfkit": "^0.19.1",
-    "zod": "^3.23.8"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/jsonwebtoken": "^9.0.7",
+    "@types/jsrsasign": "^10.5.15",
     "@types/morgan": "^1.9.9",
     "@types/node": "^22.0.0",
     "@types/pdfkit": "^0.17.6",
@@ -42,5 +54,11 @@
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.6.0"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.0",
+    "exceljs": {
+      "uuid": "^11.1.1"
+    }
   }
 }

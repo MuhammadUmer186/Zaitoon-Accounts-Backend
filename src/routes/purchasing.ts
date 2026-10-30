@@ -1,10 +1,12 @@
+import { moneyTolerance as regionalMoneyTolerance } from '../utils/money'
+import { roundMoney, validMoneyPrecision } from '../utils/money'
 import fs from 'fs'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import multer from 'multer'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
-import { requirePermission } from '../middleware/authorize'
+import { requireModule, requirePermission } from '../middleware/authorize'
 import { upload } from '../middleware/upload'
 import { AppError } from '../middleware/error'
 import { createPurchaseBill, PurchaseItemInput } from '../services/purchasing'
@@ -15,12 +17,13 @@ import { assertBranchAccess, getBranchScope, BranchScope } from '../utils/branch
 const router = Router()
 
 router.use(authenticate)
+router.use(requireModule('purchasing', 'expenses', 'purchase_orders'))
 
 const memoryUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 const purchaseItemSchema = z.object({
   itemId: z.string().optional(),
-  description: z.string().min(1),
+  description: z.string().trim().min(1),
   quantity: z.number().positive(),
   unitCost: z.coerce.number().min(0),
 })
@@ -29,12 +32,16 @@ const createPurchaseSchema = z
   .object({
     branchId: z.string(),
     supplierId: z.string().optional(),
-    vendorName: z.string().optional(),
+    vendorName: z.string().trim().min(1).optional(),
     vendorCity: z.string().optional(),
     vendorVatNumber: z.string().optional(),
     categoryId: z.string().min(1, 'Category is required'),
-    supplyDate: z.string(),
+    supplyDate: z.iso.date(),
     vatPercent: z.coerce.number().min(0).max(100),
+    amountPaid: z.coerce.number().min(0).default(0),
+    paymentDate: z.iso.date().optional(),
+    paymentType: z.enum(['cash', 'bank_transfer']).default('cash'),
+    paidBy: z.string().trim().optional(),
     items: z.string(), // JSON-stringified purchaseItemSchema[]
   })
   .refine((b) => b.supplierId || b.vendorName, {
@@ -42,21 +49,17 @@ const createPurchaseSchema = z
     path: ['vendorName'],
   })
 
-// POST /purchasing — one-shot vendor purchase entry: creates/uses a Supplier,
-// posts the Bill approval journal entry (as an unpaid payable), attaches the
-// mandatory reference bill, and updates branch stock for any catalog-linked
-// line — all in a single transaction. No payment is taken here: it's recorded
-// later from Expenses → New Expense → Purchasing, which settles the bill
-// fully or partially (see expenses.ts /purchasing-payment).
+// Creates the bill, attachment, stock and optional payment atomically.
 router.post(
   '/',
   requirePermission('can_create_purchasing_entry'),
-  upload.fields([{ name: 'file', maxCount: 1 }]),
+  upload.fields([{ name: 'file', maxCount: 1 }, { name: 'paymentSlip', maxCount: 1 }]),
   async (req: Request, res: Response) => {
     const files = req.files as Record<string, Express.Multer.File[]> | undefined
     const billFile = files?.file?.[0]
+    const paymentSlip = files?.paymentSlip?.[0]
     const cleanupFiles = () => {
-      if (billFile) { try { fs.unlinkSync(billFile.path) } catch { /* best-effort cleanup */ } }
+      for (const file of [billFile, paymentSlip]) if (file) { try { fs.unlinkSync(file.path) } catch { /* best-effort cleanup */ } }
     }
 
     const parsed = createPurchaseSchema.safeParse(req.body)
@@ -65,7 +68,10 @@ router.post(
       throw parsed.error
     }
     const body = parsed.data
-    if (!billFile) throw new AppError('Attaching the reference bill (PDF/JPG/PNG) is required', 400, 'VALIDATION_ERROR')
+    if (!billFile) { cleanupFiles(); throw new AppError('Attaching the reference bill (PDF/JPG/PNG) is required', 400, 'VALIDATION_ERROR') }
+    if (paymentSlip && body.amountPaid === 0) { cleanupFiles(); throw new AppError('A transfer slip must belong to a payment', 400, 'VALIDATION_ERROR') }
+    if (body.amountPaid > 0 && !body.paidBy) { cleanupFiles(); throw new AppError('Paid By is required', 400, 'VALIDATION_ERROR') }
+    if (body.amountPaid > 0 && body.paymentType === 'bank_transfer' && !paymentSlip) { cleanupFiles(); throw new AppError('Attach the bank transfer slip', 400, 'VALIDATION_ERROR') }
 
     let itemInputs: z.infer<typeof purchaseItemSchema>[]
     try {
@@ -111,21 +117,29 @@ router.post(
 
         const supplyDate = new Date(body.supplyDate)
 
-        const { bill: createdBill } = await createPurchaseBill(tx as unknown as typeof prisma, {
+        const paymentDocument = paymentSlip ? await tx.document.create({ data: {
+          organizationId: req.user.organizationId, branchId: body.branchId, originalFilename: paymentSlip.originalname,
+          storedFilename: paymentSlip.filename, filePath: paymentSlip.path, fileType: paymentSlip.mimetype,
+          fileSize: paymentSlip.size, documentType: 'payment_slip', uploadedBy: req.user.id,
+        } }) : null
+        const { bill: createdBill, payment: createdPayment } = await createPurchaseBill(tx as unknown as typeof prisma, {
           organizationId: req.user.organizationId,
           branchId: body.branchId,
           supplierId: supplier.id,
           supplierName: supplier.name,
           categoryId: category.id,
           supplyDate,
-          paymentDate: supplyDate,
-          paymentType: 'cash',
+          paymentDate: body.paymentDate ? new Date(body.paymentDate) : supplyDate,
+          paymentType: body.paymentType,
+          paidBy: body.paidBy,
+          paymentDocumentId: paymentDocument?.id,
           vatPercent: body.vatPercent,
-          amountPaid: 0,
+          amountPaid: body.amountPaid,
           items: itemInputs,
           createdBy: req.user.id,
         })
 
+        if (paymentDocument && createdPayment) await tx.document.update({ where: { id: paymentDocument.id }, data: { linkedType: 'payment', linkedId: createdPayment.id } })
         {
           const document = await tx.document.create({
             data: {
@@ -145,6 +159,7 @@ router.post(
           await tx.bill.update({ where: { id: createdBill.id }, data: { documentId: document.id } })
         }
 
+        await logAudit(tx, { req, action: 'purchase.created', module: 'expenses', resourceType: 'bill', resourceId: createdBill.id, branchId: body.branchId, newData: { totalAmount: createdBill.totalAmount, paidAmount: createdBill.paidAmount } })
         return tx.bill.findUniqueOrThrow({
           where: { id: createdBill.id },
           include: { items: true, payments: true, supplier: true, branch: true, category: true },
@@ -169,7 +184,7 @@ router.post(
 const IMPORT_COLUMNS = ['branchName', 'supplierName', 'categoryName', 'supplyDate', 'paymentDate', 'paymentType', 'itemCode', 'itemDescription', 'itemUnit', 'quantity', 'unitCost', 'vatPercent', 'amountPaid']
 
 router.get('/import/template', requirePermission('can_create_purchasing_entry'), async (req: Request, res: Response) => {
-  sendImportTemplate(res, IMPORT_COLUMNS, 'purchasing-import-template')
+  sendImportTemplate(res, res.locals.singleBranch ? IMPORT_COLUMNS.filter(c => c !== 'branchName') : IMPORT_COLUMNS, 'purchasing-import-template')
 })
 
 // Accepts the manual entry form's own vocabulary ("Online Transfer") plus
@@ -193,6 +208,12 @@ interface PurchaseImportRowResult {
 }
 
 async function validatePurchaseImportRows(organizationId: string, rows: Record<string, string>[], scope?: BranchScope): Promise<PurchaseImportRowResult[]> {
+  const org = await prisma.organization.findUnique({ where: { id: organizationId }, select: { multiBranch: true, name: true, tradeName: true } })
+  if (org?.multiBranch === false) {
+    const active = await prisma.branch.findMany({ where: { organizationId, isActive: true }, select: { name: true } })
+    if (active.length !== 1) throw new AppError('The restaurant needs one active location before importing.', 400, 'SINGLE_BRANCH_MODE')
+    rows = rows.map(row => ({ ...row, branchName: !row.branchName?.trim() || [org.name, org.tradeName].some(name => name?.toLowerCase() === row.branchName.trim().toLowerCase()) ? active[0].name : row.branchName }))
+  }
   const [branches, suppliers, items, categories] = await Promise.all([
     prisma.branch.findMany({ where: { organizationId }, select: { id: true, name: true } }),
     prisma.supplier.findMany({ where: { organizationId }, select: { name: true } }),
@@ -247,11 +268,12 @@ async function validatePurchaseImportRows(organizationId: string, rows: Record<s
     if (isNaN(vatPercent) || vatPercent < 0 || vatPercent > 100) errors.push('vatPercent must be between 0 and 100')
 
     const amountPaid = data.amountPaid?.trim() ? Number(data.amountPaid) : 0
-    if (isNaN(amountPaid) || amountPaid < 0) errors.push('amountPaid must be a non-negative number')
+    if (!validMoneyPrecision(amountPaid) || amountPaid < 0) errors.push('amountPaid must be a non-negative amount with the selected currency precision')
 
     if (errors.length === 0) {
-      const total = Math.round(quantity * unitCost * (1 + vatPercent / 100) * 100) / 100
-      if (amountPaid > total + 0.01) errors.push('amountPaid cannot exceed the purchase total')
+      const base = roundMoney(quantity * unitCost)
+      const total = roundMoney(base + roundMoney(base * vatPercent / 100))
+      if (amountPaid > total + regionalMoneyTolerance()) errors.push('amountPaid cannot exceed the purchase total')
     }
 
     const supplierKey = supplierName?.toLowerCase()

@@ -1,0 +1,168 @@
+// Isolated PostgreSQL + real TCP printer simulator + HTTP authorization checks.
+const assert = require('node:assert/strict'), net = require('node:net'), crypto = require('node:crypto'), fs = require('node:fs/promises'), path = require('node:path');
+const { createScratch } = require('./scratch-db.cjs');
+let scratch, db, appDb, httpServer, checks = 0;
+const results = [], check = (name, fn) => { fn(); results.push(name); checks++; console.log('PASS ' + name); };
+(async () => {
+  scratch = await createScratch(); process.env.DATABASE_URL = scratch.url; process.env.NODE_ENV = 'test'; delete process.env.FOODSYNC_DEPLOYMENT_MODE;
+  db = scratch.client();
+  const { enqueueKitchenPrinter: enqueue, deliverKitchenPrinter: deliver, sendKitchenBytes, readKitchenPrinters, automaticKitchenStations } = require('../dist/services/kitchenPrinting');
+  const app = require('../dist/app').default; appDb = require('../dist/config').prisma;
+  const { signAccessToken, signPosAccessToken, verifyAccessToken } = require('../dist/utils/jwt');
+  const org = await db.organization.create({ data: { name: 'Printer QA' } });
+  const otherOrg = await db.organization.create({ data: { name: 'Other QA' } });
+  const branch = await db.branch.create({ data: { organizationId: org.id, name: 'Kitchen', code: 'K' } });
+  const otherBranch = await db.branch.create({ data: { organizationId: org.id, name: 'Restricted', code: 'B' } });
+  const station = await db.kitchenStation.create({ data: { organizationId: org.id, name: 'Grill', printerName: 'EPSON-GRILL' } });
+  const bar = await db.kitchenStation.create({ data: { organizationId: org.id, name: 'Bar' } });
+  const cat = await db.menuCategory.create({ data: { organizationId: org.id, name: 'Mains' } });
+  const dish = await db.dish.create({ data: { organizationId: org.id, categoryId: cat.id, name: 'Meal', price: 25 } });
+  const actor = async (name, organizationId, roleName, keys, scoped) => {
+    const user = await db.user.create({ data: { organizationId, email: name + '@example.invalid', passwordHash: '!', firstName: name, lastName: 'QA' } });
+    const role = await db.role.create({ data: { organizationId, name: roleName, displayName: name } });
+    await db.userRole.create({ data: { userId: user.id, roleId: role.id } });
+    for (const key of keys) {
+      const perm = await db.permission.upsert({ where: { key }, create: { key, module: 'kitchen' }, update: {} });
+      await db.rolePermission.create({ data: { roleId: role.id, permissionId: perm.id } });
+    }
+    if (scoped) await db.userBranchAccess.create({ data: { userId: user.id, organizationId, branchId: branch.id } });
+    return signAccessToken(user.id, organizationId, user.email);
+  };
+  const owner = await actor('owner', org.id, 'owner', [], false);
+  const cook = await actor('cook', org.id, 'qa_cook', ['can_manage_kitchen'], true);
+  const viewer = await actor('viewer', org.id, 'qa_viewer', [], false);
+  const outsider = await actor('outsider', otherOrg.id, 'owner', [], false);
+  const scopedAdmin = await actor('scoped', org.id, 'qa_scoped', ['can_manage_kitchen', 'can_manage_settings'], true);
+  await db.branchRuntime.create({ data: { id: 'local', nodeId: crypto.randomUUID(), organizationId: org.id, branchId: branch.id, numberSeries: 'P1' } });
+  const p = { id: 'test', organizationId: org.id, branchId: branch.id, stationId: station.id, host: '192.168.1.50', port: 9100, key: crypto.randomBytes(32).toString('hex'), enabledAt: new Date(Date.now() - 60000).toISOString() };
+  process.env.KITCHEN_PRINTERS_JSON = JSON.stringify([p]); delete process.env.KITCHEN_PRINTERS_FILE;
+  const localRouting = await automaticKitchenStations(org.id, branch.id, [p]);
+  const otherRouting = await automaticKitchenStations(org.id, otherBranch.id, [p]);
+  const foreignRouting = await automaticKitchenStations(otherOrg.id, branch.id, [p]);
+  check('automatic routing is isolated to the configured local branch and tenant', () => { assert.deepEqual(localRouting, [station.id]); assert.deepEqual(otherRouting, []); assert.deepEqual(foreignRouting, []); });
+  check('private LAN printer configuration validates', () => assert.equal(readKitchenPrinters()[0].id, 'test'));
+  for (const host of ['127.0.0.1', '8.8.8.8', 'example.com']) {
+    process.env.KITCHEN_PRINTERS_JSON = JSON.stringify([{ ...p, host }]);
+    check('configuration rejects non-LAN target ' + host, () => assert.throws(readKitchenPrinters));
+  }
+  process.env.KITCHEN_PRINTERS_JSON = JSON.stringify([p, p]);
+  check('duplicate printer routing is refused', () => assert.throws(readKitchenPrinters));
+  process.env.KITCHEN_PRINTERS_JSON = JSON.stringify([p]);
+  let orderNo = 0;
+  const makeOrder = (status, items = [{ stationId: station.id }]) => db.customerOrder.create({ data: { organizationId: org.id, branchId: branch.id, orderNo: ++orderNo, orderType: 'takeaway', status, ...(status === 'completed' && { closedAt: new Date() }), subtotal: 25, itemsTotal: 25, totalAmount: 25, items: { create: items.map(i => ({ dishId: dish.id, dishName: 'Chicken Meal', quantity: 1, unitPrice: 25, lineTotal: 25, status: 'pending', notes: 'No chilli', selection: { size: { name: 'Large' }, modifiers: [{ name: 'Extra sauce' }] }, ...i })) } }, include: { items: true } });
+  await makeOrder('open');
+  const paid = await makeOrder('completed', [{ stationId: station.id }, { stationId: station.id, held: true, course: 2 }, { stationId: bar.id }]);
+  await Promise.all([enqueue(p), enqueue(p)]);
+  let jobs = await db.kitchenPrintJob.findMany();
+  check('concurrent scanners create one paid, released, station-specific ticket', () => { assert.equal(jobs.length, 1); assert.deepEqual(jobs[0].itemIds, [paid.items[0].id]); });
+  const text = Buffer.from(jobs[0].payload, 'base64').toString('ascii');
+  check('80mm slip contains order, quantity, choices and kitchen notes, without prices', () => { assert.ok(text.includes('ORDER #' + paid.orderNo)); assert.ok(text.includes('1 x Chicken Meal')); assert.ok(text.includes('Extra sauce')); assert.ok(text.includes('No chilli')); assert.ok(!text.includes('25.00')); });
+  await db.branchRuntime.update({ where: { id: 'local' }, data: { writesFrozen: 'QA handover' } });
+  let frozenSend = false; await deliver(p, async () => { frozenSend = true; return 'usb_complete'; });
+  check('a handed-over PC cannot dispatch its queued slips', () => assert.equal(frozenSend, false));
+  await db.branchRuntime.update({ where: { id: 'local' }, data: { writesFrozen: null } });
+  await enqueue(p);
+  check('repeated scan after restart does not create another ticket', () => {}); assert.equal(await db.kitchenPrintJob.count(), 1);
+  const held = paid.items.find(i => i.held);
+  await db.customerOrderItem.update({ where: { id: held.id }, data: { held: false, firedAt: new Date() } });
+  await enqueue(p);
+  jobs = await db.kitchenPrintJob.findMany({ orderBy: { sequence: 'asc' } });
+  check('firing a held course queues only its new line', () => { assert.equal(jobs.length, 2); assert.deepEqual(jobs[1].itemIds, [held.id]); });
+  let sends = 0;
+  const sent = [];
+  await Promise.all([deliver(p, async (_p, job) => { sends++; sent.push(job); return 'usb_complete'; }), deliver(p, async (_p, job) => { sends++; sent.push(job); return 'usb_complete'; })]);
+  check('concurrent workers never claim the same job twice', () => assert.equal(new Set(sent.map(j => j.id)).size, sends));
+  await deliver(p, async () => 'usb_complete');
+  await db.customerOrderItem.update({ where: { id: paid.items[0].id }, data: { status: 'cancelled' } });
+  await enqueue(p);
+  const cancel = await db.kitchenPrintJob.findFirst({ where: { kind: 'cancel' } });
+  check('a cancellation of a delivered line queues an explicit stop-preparing slip', () => { assert.ok(cancel); assert.ok(Buffer.from(cancel.payload, 'base64').toString().includes('CANCEL - DO NOT PREPARE')); });
+  await deliver(p, async () => 'usb_complete');
+  const staleOrder = await makeOrder('completed'); await enqueue(p);
+  await db.customerOrderItem.updateMany({ where: { orderId: staleOrder.id }, data: { status: 'cancelled' } });
+  await deliver(p, async () => { throw Error('stale ticket must not be sent'); });
+  check('cancelled-before-delivery order suppresses its stale ticket', () => {});
+  assert.equal((await db.kitchenPrintJob.findFirst({ where: { orderId: staleOrder.id } })).state, 'suppressed');
+  const offline = await makeOrder('completed'); await enqueue(p);
+  await deliver(p, async () => 'queued');
+  const retrying = await db.kitchenPrintJob.findFirst({ where: { orderId: offline.id } });
+  check('printer unavailable preserves the queued job for retry', () => { assert.equal(retrying.state, 'queued'); assert.equal(retrying.attempts, 1); });
+  await deliver(p, async () => 'uncertain');
+  const newer = await makeOrder('completed'); await enqueue(p);
+  let attempted = false; await deliver(p, async () => { attempted = true; return 'usb_complete'; });
+  check('ambiguous delivery pauses the printer rather than silently duplicating', () => assert.equal(attempted, false));
+  const uncertain = await db.kitchenPrintJob.findFirst({ where: { orderId: offline.id } });
+  httpServer = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  const base = `http://127.0.0.1:${httpServer.address().port}/api/v1/kitchen/printers`;
+  const request = async (method, suffix, token, body) => { const r = await fetch(base + suffix, { method, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, ...(body && { body: JSON.stringify(body) }) }); return { status: r.status, data: await r.json() }; };
+  const pinUser = verifyAccessToken(cook), pin = signPosAccessToken(pinUser.userId, org.id, pinUser.email, branch.id);
+  const pinRouting = await fetch(base.replace('/printers', '/print-routing') + '?branchId=' + branch.id, { headers: { Authorization: 'Bearer ' + pin } });
+  check('a branch PIN session may read its non-sensitive printer routing', () => assert.equal(pinRouting.status, 200));
+  const pinForeignBranch = await fetch(base.replace('/printers', '/print-routing') + '?branchId=' + otherBranch.id, { headers: { Authorization: 'Bearer ' + pin } });
+  const pinJobs = await request('GET', '', pin);
+  check('PIN routing does not expose another branch or privileged queue APIs', () => { assert.equal(pinForeignBranch.status, 403); assert.equal(pinJobs.status, 403); });
+  let r = await request('GET', '?branchId=' + branch.id, cook);
+  check('kitchen sees held jobs without printer keys or ticket payloads', () => { assert.equal(r.status, 200); assert.ok(r.data.held.some(j => j.id === uncertain.id)); assert.ok(!JSON.stringify(r.data).includes(p.key)); assert.ok(!JSON.stringify(r.data).includes(uncertain.payload)); });
+  check('users without kitchen/order permissions cannot inspect spool', () => {}); assert.equal((await request('GET', '', viewer)).status, 403);
+  const decision = { decision: 'retry', checkedPrinter: true, reason: 'Operator checked the paper and confirmed this slip did not print.' };
+  assert.equal((await request('POST', '/jobs/' + uncertain.id + '/resolve', cook, decision)).status, 403);
+  assert.equal((await request('POST', '/jobs/' + uncertain.id + '/resolve', outsider, decision)).status, 404);
+  check('retry requires admin authority and tenant ownership', () => {});
+  assert.equal((await request('POST', '/jobs/' + uncertain.id + '/resolve', owner, { ...decision, checkedPrinter: false })).status, 400);
+  r = await request('POST', '/jobs/' + uncertain.id + '/resolve', owner, decision);
+  const replacement = await db.kitchenPrintJob.findUnique({ where: { id: r.data.replacementId } });
+  check('explicit checked retry creates a new device sequence and audit record', () => { assert.equal(r.status, 200); assert.ok(replacement.sequence > uncertain.sequence); });
+  assert.equal(await db.auditLog.count({ where: { resourceId: uncertain.id, action: 'resolve' } }), 1);
+  const restricted = await db.kitchenPrintJob.create({ data: { organizationId: org.id, branchId: otherBranch.id, orderId: 'synthetic', printerId: 'other', kind: 'new', itemIds: [], eventKey: crypto.randomUUID(), payload: '', state: 'uncertain' } });
+  assert.equal((await request('POST', '/jobs/' + restricted.id + '/resolve', scopedAdmin, decision)).status, 403);
+  assert.equal((await request('GET', '?branchId=' + otherBranch.id, cook)).status, 403);
+  check('spool operations preserve assigned branch boundaries', () => {});
+  await db.kitchenPrintJob.updateMany({ where: { printerId: p.id, state: 'queued' }, data: { state: 'sending', updatedAt: new Date(Date.now() - 120000) } });
+  await deliver(p, async () => { throw Error('must not resend interrupted work'); });
+  check('a crashed delivery becomes uncertain instead of automatically reprinting', () => {});
+  assert.ok(await db.kitchenPrintJob.count({ where: { printerId: p.id, state: 'uncertain' } }));
+  await db.kitchenPrintJob.updateMany({ where: { printerId: p.id, state: { in: ['uncertain', 'sending', 'queued'] } }, data: { state: 'discarded' } });
+  const unicode = await makeOrder('completed', [{ stationId: station.id, dishName: '\u0622\u0626\u0633' }]); await enqueue(p);
+  check('unsupported native printer script is held visibly rather than garbled', () => {});
+  assert.equal((await db.kitchenPrintJob.findFirst({ where: { orderId: unicode.id } })).state, 'blocked');
+  const readable = await makeOrder('completed'); await enqueue(p); await deliver(p, async () => 'usb_complete');
+  const readableJob = await db.kitchenPrintJob.findFirst({ where: { orderId: readable.id } });
+  check('an unsupported-script ticket does not block other printable orders', () => assert.equal(readableJob.state, 'usb_complete'));
+  const { buildBranchReplica } = require('../dist/services/branchReplica');
+  const snapshot = await buildBranchReplica(db);
+  check('printer jobs never enter the cloud/branch replication package', () => assert.equal(snapshot.tables.KitchenPrintJob, undefined));
+  // Real loopback network tests; the production config disallows loopback.
+  for (const answer of ['ok', 'ok-long', 'wrong-id', 'not-ready', 'lost-ack', 'unsigned-ack', 'forged-ack']) {
+    let validFrame = false;
+    const tcp = net.createServer(socket => {
+      let bytes = Buffer.alloc(0), handled = false;
+      socket.on('data', chunk => {
+        bytes = Buffer.concat([bytes, chunk]); const split = bytes.indexOf(10); if (split < 0 || handled) return;
+        const [magic, sequence, id, length, hash, mac] = bytes.subarray(0, split).toString().split(' ');
+        const payload = bytes.subarray(split + 1); if (payload.length < Number(length)) return; handled = true;
+        validFrame = magic === 'FS1' && hash === crypto.createHash('sha256').update(payload).digest('hex') && mac === crypto.createHmac('sha256', p.key).update(`${sequence}:${id}:${length}:${hash}`).digest('hex');
+        if (answer === 'lost-ack') socket.destroy();
+        else {
+          const message = ['ok', 'ok-long', 'unsigned-ack', 'forged-ack'].includes(answer) ? `OK ${id}` : answer === 'not-ready' ? 'ERROR NOT_READY' : 'OK wrong-id';
+          const signature = crypto.createHmac('sha256', p.key).update(`ACK:${sequence}:${id}:${hash}:${message}`).digest('hex');
+          socket.end(message + (answer === 'unsigned-ack' ? '' : ' ' + (answer === 'forged-ack' ? '0'.repeat(64) : signature)) + '\n');
+        }
+      });
+    });
+    await new Promise(resolve => tcp.listen(0, '127.0.0.1', resolve));
+    const binary = answer === 'ok-long' ? Buffer.from(Array.from({ length: 12000 }, (_, n) => n % 256)) : Buffer.from('Test kitchen slip');
+    const state = await sendKitchenBytes({ ...p, host: '127.0.0.1', port: tcp.address().port }, { id: crypto.randomUUID(), sequence: 101n, payload: binary.toString('base64') }, 1500);
+    await new Promise(resolve => tcp.close(resolve));
+    check('signed TCP delivery handles ' + answer, () => { assert.equal(validFrame, true); assert.equal(state, answer === 'ok' || answer === 'ok-long' ? 'usb_complete' : answer === 'not-ready' ? 'queued' : 'uncertain'); });
+  }
+  const unavailable = net.createServer(); await new Promise(r => unavailable.listen(0, '127.0.0.1', r)); const unavailablePort = unavailable.address().port; await new Promise(r => unavailable.close(r));
+  const unreachable = await sendKitchenBytes({ ...p, host: '127.0.0.1', port: unavailablePort }, { id: crypto.randomUUID(), sequence: 102n, payload: Buffer.from('Offline retry').toString('base64') }, 1000);
+  check('connection refused before sending remains safely queued', () => assert.equal(unreachable, 'queued'));
+  void newer;
+  console.log(`${checks} ESP32 kitchen printing checks passed.`);
+})().catch(e => { console.error(e.stack || e.message); process.exitCode = 1; }).finally(async () => {
+  if (httpServer) await new Promise(r => httpServer.close(r));
+  await db?.$disconnect(); await appDb?.$disconnect(); await scratch?.drop();
+  const output = path.resolve(__dirname, '../../outputs/esp32-kitchen-2026-10-28'); await fs.mkdir(output, { recursive: true });
+  await fs.writeFile(path.join(output, 'results.json'), JSON.stringify({ passed: checks, failed: !!process.exitCode, scratchRemoved: !!scratch, results }, null, 2));
+});

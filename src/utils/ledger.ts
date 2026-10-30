@@ -1,3 +1,4 @@
+import { roundMoney, moneyTolerance } from './money'
 import { PrismaClient, Prisma, AccountingMappingKey } from '@prisma/client'
 import { nextNumber } from './numbering'
 import { AppError } from '../middleware/error'
@@ -21,6 +22,8 @@ export const MAPPING_LABELS: Record<AccountingMappingKey, string> = {
   CASH_OVER_SHORT: 'Cash Over or Short',
   RETAINED_EARNINGS: 'Retained Earnings',
   OPENING_BALANCE_EQUITY: 'Opening Balance Equity',
+  GIFT_CARD_LIABILITY: 'Gift Card Liability',
+  LOYALTY_LIABILITY: 'Loyalty Points Liability',
 }
 
 // Resolves a well-known posting role (e.g. SALES_REVENUE) to the Account the
@@ -54,6 +57,7 @@ export function mappingKeyForPaymentMethod(paymentMethod: string): AccountingMap
     case 'bank':
     case 'cheque':
       return 'DEFAULT_BANK'
+    case 'mada':
     case 'card':
       return 'CARD_CLEARING'
     case 'credit':
@@ -119,7 +123,9 @@ export async function postJournalEntry(prisma: PrismaClient, input: PostJournalE
     if (existing) return existing
   }
 
-  const filteredLines = input.lines.filter((l) => (l.debitAmount ?? 0) > 0.001 || (l.creditAmount ?? 0) > 0.001)
+  const org = await prisma.organization.findUniqueOrThrow({ where: { id: input.organizationId }, select: { currency: true } })
+  const currency = org.currency
+  const filteredLines = input.lines.filter((l) => (l.debitAmount ?? 0) > moneyTolerance(currency) || (l.creditAmount ?? 0) > moneyTolerance(currency))
   if (filteredLines.length === 0) return null
 
   await assertPeriodOpen(prisma, input.organizationId, input.entryDate)
@@ -144,14 +150,14 @@ export async function postJournalEntry(prisma: PrismaClient, input: PostJournalE
   const resolvedLines = filteredLines.map((l, i) => ({
     accountId: l.accountId,
     description: l.description,
-    debitAmount: Math.round((l.debitAmount ?? 0) * 100) / 100,
-    creditAmount: Math.round((l.creditAmount ?? 0) * 100) / 100,
+    debitAmount: roundMoney(l.debitAmount ?? 0, currency),
+    creditAmount: roundMoney(l.creditAmount ?? 0, currency),
     lineOrder: i + 1,
   }))
 
   const totalDebit = resolvedLines.reduce((s, l) => s + l.debitAmount, 0)
   const totalCredit = resolvedLines.reduce((s, l) => s + l.creditAmount, 0)
-  const isBalanced = Math.abs(totalDebit - totalCredit) < 0.01
+  const isBalanced = Math.abs(totalDebit - totalCredit) < moneyTolerance(currency)
   if (!isBalanced) {
     throw new AppError('Journal entry does not balance (total debit ≠ total credit)', 400, 'UNBALANCED_ENTRY')
   }

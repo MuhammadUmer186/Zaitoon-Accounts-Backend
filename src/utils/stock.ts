@@ -19,6 +19,8 @@ export interface StockInInput {
 // Shared by the manual stock-in endpoint (inventory.ts) and Purchase Order receiving
 // (purchaseOrders.ts) so both paths keep BranchStock/StockMovement consistent.
 export async function applyStockIn(prisma: PrismaClient, input: StockInInput) {
+  await prisma.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`branch-owner:${input.branchId}`}))`
+  await prisma.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`stock:${input.branchId}:${input.itemId}`}))`
   const totalValue = input.quantity * input.unitCost
 
   const movement = await prisma.stockMovement.create({
@@ -94,6 +96,8 @@ export interface StockOutInput {
 // "Stock Out" endpoint (general usage/consumption/adjustment for any branch,
 // applied immediately — no approval step, unlike wastage reports).
 export async function applyStockOut(prisma: PrismaClient, input: StockOutInput) {
+  await prisma.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`branch-owner:${input.branchId}`}))`
+  await prisma.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`stock:${input.branchId}:${input.itemId}`}))`
   const existingStock = await prisma.branchStock.findUnique({
     where: { branchId_itemId: { branchId: input.branchId, itemId: input.itemId } },
   })

@@ -1,3 +1,4 @@
+import { updateSchema } from '../utils/updateSchema'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
@@ -46,7 +47,7 @@ router.patch('/:id', requirePermission('tax_rates_manage'), async (req: Request,
   const existing = await prisma.taxRate.findFirst({ where: { id: req.params.id, organizationId: orgId } })
   if (!existing) throw new AppError('Tax rate not found', 404, 'NOT_FOUND')
 
-  const body = taxRateSchema.partial().parse(req.body)
+  const body = updateSchema(taxRateSchema).parse(req.body)
 
   // Changing a rate's percentage or default status never touches historical
   // journal lines or VAT reports — those already recorded their own amounts

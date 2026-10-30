@@ -1,7 +1,10 @@
+import { roundMoney, runWithCurrency, validMoneyPrecision } from '../utils/money'
 import { PrismaClient } from '@prisma/client'
 import { nextNumber } from '../utils/numbering'
 import { postJournalEntry, resolveMappedAccount, mappingKeyForPaymentMethod } from '../utils/ledger'
 import { applyStockIn } from '../utils/stock'
+import { AppError } from '../middleware/error'
+import { lockPurchasing, recordPurchasePayment } from './purchasePayments'
 import { toHijriDate } from '../utils/hijriDate'
 
 export interface PurchaseItemInput {
@@ -24,6 +27,8 @@ export interface CreatePurchaseBillParams {
   amountPaid: number
   items: PurchaseItemInput[]
   createdBy: string
+  paidBy?: string
+  paymentDocumentId?: string
 }
 
 // Core "Purchasing" posting logic — creates the Bill (+ items), posts the
@@ -33,12 +38,29 @@ export interface CreatePurchaseBillParams {
 // accounting behavior; only supplier resolution and file attachments differ
 // between the two callers.
 export async function createPurchaseBill(prisma: PrismaClient, params: CreatePurchaseBillParams) {
-  const subtotal = params.items.reduce((sum, i) => sum + i.quantity * i.unitCost, 0)
-  const vatAmount = Math.round(subtotal * (params.vatPercent / 100) * 100) / 100
-  const totalAmount = subtotal + vatAmount
+  const org = await prisma.organization.findUniqueOrThrow({ where: { id: params.organizationId }, select: { currency: true } })
+  return runWithCurrency(org.currency, () => createPurchaseBillInCurrency(prisma, params))
+}
+
+async function createPurchaseBillInCurrency(prisma: PrismaClient, params: CreatePurchaseBillParams) {
+  await lockPurchasing(prisma, params.organizationId)
+  if (!params.items.length || params.items.some(i => !Number.isFinite(i.quantity) || i.quantity <= 0 || !Number.isFinite(i.unitCost) || i.unitCost < 0)) throw new AppError('Invalid purchase items', 400, 'VALIDATION_ERROR')
+  if (!Number.isFinite(params.supplyDate.getTime()) || !Number.isFinite(params.paymentDate.getTime())) throw new AppError('Invalid purchase date', 400, 'VALIDATION_ERROR')
+  const linkedIds = [...new Set(params.items.map(i => i.itemId).filter((id): id is string => !!id))]
+  if (linkedIds.length !== await prisma.item.count({ where: { id: { in: linkedIds }, organizationId: params.organizationId, isActive: true } })) throw new AppError('One or more stock items were not found', 400, 'VALIDATION_ERROR')
+  const lines = params.items.map(item => {
+    const base = roundMoney(item.quantity * item.unitCost)
+    const tax = roundMoney(base * params.vatPercent / 100)
+    return { ...item, base, tax, total: roundMoney(base + tax) }
+  })
+  const subtotal = roundMoney(lines.reduce((sum, item) => sum + item.base, 0))
+  const vatAmount = roundMoney(lines.reduce((sum, item) => sum + item.tax, 0))
+  const totalAmount = roundMoney(subtotal + vatAmount)
+  if (totalAmount <= 0) throw new AppError('Purchase total must be positive', 400, 'VALIDATION_ERROR')
+  if (!validMoneyPrecision(params.amountPaid) || params.amountPaid < 0 || params.amountPaid > totalAmount) throw new AppError('Invalid amount paid for this currency', 400, 'OVERPAYMENT')
   const paidAmount = params.amountPaid
-  const balanceDue = totalAmount - paidAmount
-  const status = balanceDue <= 0.01 ? 'paid' : paidAmount > 0 ? 'partial' : 'approved'
+  const balanceDue = roundMoney(totalAmount - paidAmount)
+  const status = balanceDue === 0 ? 'paid' : paidAmount > 0 ? 'partial' : 'approved'
 
   const billNo = await nextNumber(prisma, 'bill', 'billNo', 'BILL', params.organizationId)
 
@@ -53,29 +75,29 @@ export async function createPurchaseBill(prisma: PrismaClient, params: CreatePur
       subtotal,
       vatAmount,
       totalAmount,
-      paidAmount,
-      balanceDue,
-      status,
+      paidAmount: 0,
+      balanceDue: totalAmount,
+      status: 'approved',
       source: 'purchasing',
       categoryId: params.categoryId,
       hijriDate: toHijriDate(params.supplyDate),
       createdBy: params.createdBy,
       items: {
-        create: params.items.map((i) => ({
-          description: i.description,
-          quantity: i.quantity,
-          unitPrice: i.unitCost,
-          vatRate: params.vatPercent,
-          vatAmount: Math.round(i.quantity * i.unitCost * (params.vatPercent / 100) * 100) / 100,
-          totalAmount: Math.round(i.quantity * i.unitCost * (1 + params.vatPercent / 100) * 100) / 100,
-          itemId: i.itemId,
+        create: lines.map((i) => ({
+          description: i.description, quantity: i.quantity, unitPrice: i.unitCost,
+          vatRate: params.vatPercent, vatAmount: i.tax, totalAmount: i.total, itemId: i.itemId,
         })),
       },
     },
   })
 
-  const [inventoryAccount, inputVat, payable] = await Promise.all([
-    resolveMappedAccount(prisma, params.organizationId, 'INVENTORY'),
+  const stockTotal = roundMoney(lines.filter(i => i.itemId).reduce((sum, i) => sum + i.base, 0))
+  const otherTotal = roundMoney(subtotal - stockTotal)
+  const category = params.categoryId ? await prisma.expenseCategory.findFirst({ where: { id: params.categoryId, organizationId: params.organizationId, isActive: true } }) : null
+  if (params.categoryId && !category) throw new AppError('Category not found', 404, 'NOT_FOUND')
+  const [inventoryAccount, otherAccount, inputVat, payable] = await Promise.all([
+    stockTotal > 0 ? resolveMappedAccount(prisma, params.organizationId, 'INVENTORY') : null,
+    otherTotal > 0 ? (category?.accountId ? prisma.account.findFirstOrThrow({ where: { id: category.accountId, organizationId: params.organizationId } }) : resolveMappedAccount(prisma, params.organizationId, 'DEFAULT_EXPENSE')) : null,
     vatAmount > 0 ? resolveMappedAccount(prisma, params.organizationId, 'INPUT_VAT') : null,
     resolveMappedAccount(prisma, params.organizationId, 'ACCOUNTS_PAYABLE'),
   ])
@@ -91,7 +113,8 @@ export async function createPurchaseBill(prisma: PrismaClient, params: CreatePur
     description: `Purchase ${billNo} — ${params.supplierName}`,
     createdBy: params.createdBy,
     lines: [
-      { accountId: inventoryAccount.id, description: 'Purchased goods', debitAmount: subtotal },
+      ...(inventoryAccount ? [{ accountId: inventoryAccount.id, description: 'Purchased stock', debitAmount: stockTotal }] : []),
+      ...(otherAccount ? [{ accountId: otherAccount.id, description: 'Non-stock purchase', debitAmount: otherTotal }] : []),
       ...(inputVat ? [{ accountId: inputVat.id, description: 'Input VAT', debitAmount: vatAmount }] : []),
       { accountId: payable.id, description: 'Payable to vendor', creditAmount: totalAmount },
     ],
@@ -100,36 +123,12 @@ export async function createPurchaseBill(prisma: PrismaClient, params: CreatePur
 
   let createdPayment: { id: string } | null = null
   if (paidAmount > 0) {
-    createdPayment = await prisma.payment.create({
-      data: {
-        organizationId: params.organizationId,
-        branchId: params.branchId,
-        billId: createdBill.id,
-        paymentDate: params.paymentDate,
-        amount: paidAmount,
-        paymentMethod: params.paymentType,
-        createdBy: params.createdBy,
-      },
+    const result = await recordPurchasePayment(prisma, {
+      organizationId: params.organizationId, billId: createdBill.id, createdBy: params.createdBy,
+      paymentDate: params.paymentDate, amount: paidAmount, paymentMethod: params.paymentType,
+      paidBy: params.paidBy || 'Imported payment', documentId: params.paymentDocumentId,
     })
-
-    const paidFrom = await resolveMappedAccount(prisma, params.organizationId, mappingKeyForPaymentMethod(params.paymentType))
-
-    const paymentJe = await postJournalEntry(prisma, {
-      organizationId: params.organizationId,
-      branchId: params.branchId,
-      entryDate: params.paymentDate,
-      referenceType: 'payment',
-      referenceId: createdPayment.id,
-      sourceType: 'BILL_PAYMENT',
-      sourceKey: `BILL_PAYMENT:${createdPayment.id}:POST`,
-      description: `Payment for Purchase ${billNo}`,
-      createdBy: params.createdBy,
-      lines: [
-        { accountId: payable.id, description: 'Payable settled', debitAmount: paidAmount },
-        { accountId: paidFrom.id, description: 'Payment made', creditAmount: paidAmount },
-      ],
-    })
-    await prisma.payment.update({ where: { id: createdPayment.id }, data: { journalEntryId: paymentJe?.id } })
+    createdPayment = result.payment
   }
 
   for (const item of params.items) {
@@ -147,5 +146,5 @@ export async function createPurchaseBill(prisma: PrismaClient, params: CreatePur
     })
   }
 
-  return { bill: createdBill, payment: createdPayment }
+  return { bill: { ...createdBill, paidAmount, balanceDue, status }, payment: createdPayment }
 }

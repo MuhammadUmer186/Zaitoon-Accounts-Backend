@@ -1,3 +1,4 @@
+import { isValidCurrency } from '../utils/regions'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
@@ -22,7 +23,7 @@ const bankAccountSchema = z.object({
   accountTitle: z.string().min(1),
   accountNumberLast4: z.string().regex(/^\d{4}$/, 'Must be exactly 4 digits'),
   ibanLast4: z.string().regex(/^\d{4}$/, 'Must be exactly 4 digits').optional(),
-  currency: z.string().min(1),
+  currency: z.string().trim().toUpperCase().refine(isValidCurrency, 'Invalid currency code').optional(),
   branchId: z.string().optional(),
   openingDate: z.string().optional(),
   isDefault: z.boolean().default(false),
@@ -33,7 +34,7 @@ const updateBankAccountSchema = z.object({
   bankName: z.string().min(1).optional(),
   accountTitle: z.string().min(1).optional(),
   branchId: z.string().nullable().optional(),
-  currency: z.string().min(1).optional(),
+  currency: z.string().trim().toUpperCase().refine(isValidCurrency, 'Invalid currency code').optional(),
   isDefault: z.boolean().optional(),
 })
 
@@ -55,6 +56,7 @@ router.get('/', requirePermission('bank_accounts_manage'), async (req: Request, 
 router.post('/', requirePermission('bank_accounts_manage'), async (req: Request, res: Response) => {
   const body = bankAccountSchema.parse(req.body)
   const orgId = req.user.organizationId
+  const org = await prisma.organization.findUniqueOrThrow({ where: { id: orgId }, select: { currency: true } })
   await assertUniqueCode(prisma, orgId, body.code)
 
   const result = await prisma.$transaction(async (tx) => {
@@ -87,7 +89,7 @@ router.post('/', requirePermission('bank_accounts_manage'), async (req: Request,
         accountNumberMasked: maskLast4(body.accountNumberLast4),
         accountNumberLast4: body.accountNumberLast4,
         ibanMasked: body.ibanLast4 ? maskLast4(body.ibanLast4, 2) : undefined,
-        currency: body.currency,
+        currency: body.currency || org.currency,
         openingDate: body.openingDate ? new Date(body.openingDate) : undefined,
         isDefault: body.isDefault,
         createdById: req.user.id,

@@ -4,3 +4,4 @@ dist/
 *.log
 prisma/migrations/
 uploads/
+backups/

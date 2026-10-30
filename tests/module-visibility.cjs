@@ -1,0 +1,38 @@
+﻿const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
+module.exports = async ({ tx, api, org, branch, signAccessToken, check }) => {
+  await tx.$executeRawUnsafe('SAVEPOINT module_visibility_settings')
+  try {
+    const paths = require('../dist/utils/navigation').NAVIGATION_PATHS
+    const user = await tx.user.create({ data: { organizationId: org.id, email: `visibility-${crypto.randomUUID()}@test.invalid`, firstName: 'Staff', lastName: 'Test', passwordHash: 'x' } })
+    const token = signAccessToken(user.id, org.id, user.email)
+    const other = await tx.organization.create({ data: { name: 'Other organization visibility' } })
+    let r = await api('GET', `/orgs/${org.id}`, undefined, true)
+    check('existing organizations show every module by default', () => assert.deepEqual(r.data.hiddenNavigation, []))
+    r = await api('PUT', `/orgs/${org.id}`, { hiddenNavigation: ['/call-center'] }, token)
+    check('ordinary staff cannot change organization module visibility', () => assert.equal(r.status, 403))
+    r = await api('PUT', `/orgs/${other.id}`, { hiddenNavigation: ['/call-center'] }, true)
+    check('module visibility cannot be changed across organizations', () => assert.equal(r.status, 403))
+    r = await api('PUT', `/orgs/${org.id}`, { hiddenNavigation: ['/call-center', '/pos', '/call-center'] }, true)
+    check('owners can hide any page and duplicate choices are normalized', () => { assert.equal(r.status, 200, JSON.stringify(r.data)); assert.deepEqual(new Set(r.data.hiddenNavigation), new Set(['/call-center', '/pos'])); assert.equal(r.data.hiddenNavigation.length, 2) })
+    r = await api('GET', `/orgs/${org.id}`, undefined, token)
+    check('saved visibility is available to every staff member', () => assert.ok(r.data.hiddenNavigation.includes('/call-center')))
+    r = await api('GET', `/orgs/${other.id}`, undefined, true)
+    check('staff cannot read another organization visibility settings', () => assert.equal(r.status, 403))
+    r = await api('GET', `/pos/menu?branchId=${branch.id}`, undefined, true)
+    check('hiding POS navigation preserves the existing order workflows and permissions', () => assert.equal(r.status, 200, JSON.stringify(r.data)))
+    r = await api('PUT', `/orgs/${org.id}`, { hiddenNavigation: ['/not-a-module'] }, true)
+    check('unknown module identifiers are rejected', () => assert.equal(r.status, 400))
+    r = await api('PUT', `/orgs/${org.id}`, { hiddenNavigation: '/call-center' }, true)
+    check('invalid visibility data is rejected', () => assert.equal(r.status, 400))
+    r = await api('PUT', `/orgs/${org.id}`, { hiddenNavigation: paths }, true)
+    check('all sidebar pages including administration can be hidden', () => { assert.equal(r.status, 200, JSON.stringify(r.data)); assert.deepEqual(r.data.hiddenNavigation, paths) })
+    r = await api('GET', '/auth/me', undefined, true)
+    check('hiding administration never removes permission to restore it', () => assert.ok(r.data.permissionMatrix.permissions.includes('can_manage_settings')))
+    r = await api('PUT', `/orgs/${org.id}`, { hiddenNavigation: [] }, true)
+    check('all modules can be restored without losing data', () => { assert.equal(r.status, 200, JSON.stringify(r.data)); assert.deepEqual(r.data.hiddenNavigation, []) })
+  } finally {
+    await tx.$executeRawUnsafe('ROLLBACK TO SAVEPOINT module_visibility_settings')
+    await tx.$executeRawUnsafe('RELEASE SAVEPOINT module_visibility_settings')
+  }
+}

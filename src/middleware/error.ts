@@ -28,14 +28,31 @@ export function errorHandler(
 
   if (err instanceof ZodError) {
     res.status(400).json({
-      message: err.errors[0]?.message ?? 'Validation error',
+      message: err.issues[0]?.message ?? 'Validation error',
       code: 'VALIDATION_ERROR',
-      errors: err.errors,
+      errors: err.issues,
+    })
+    return
+  }
+
+  if (err.name === 'MulterError') {
+    const multerErr = err as Error & { code?: string }
+    res.status(400).json({
+      message: multerErr.code === 'LIMIT_FILE_SIZE' ? 'File is too large' : err.message,
+      code: 'UPLOAD_ERROR',
     })
     return
   }
 
   // Prisma errors
+  if (err.message?.includes('FOODSYNC_BRANCH_FROZEN')) {
+    res.status(409).json({ message: 'This PC has handed the branch over. No new transactions can be recorded here.', code: 'BRANCH_HANDED_OVER' })
+    return
+  }
+  if (err.message?.includes('FOODSYNC_BRANCH_OWNERSHIP')) {
+    res.status(409).json({ message: 'This branch is operated by its local PC. Cloud writes remain locked until a verified handover.', code: 'BRANCH_LOCAL_OWNER' })
+    return
+  }
   if (err.constructor.name === 'PrismaClientKnownRequestError') {
     const prismaErr = err as Error & { code?: string; meta?: { target?: string[] } }
     if (prismaErr.code === 'P2002') {

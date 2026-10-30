@@ -1,3 +1,6 @@
+import { roundMoney as regionalRoundMoney, currentCurrency } from '../utils/money'
+import { currencyDecimals } from '../utils/regions'
+import { updateSchema } from '../utils/updateSchema'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import multer from 'multer'
@@ -37,7 +40,7 @@ const createAccountSchema = z.object({
   allowManualPosting: z.boolean().default(true),
 })
 
-const updateAccountSchema = createAccountSchema.partial()
+const updateAccountSchema = updateSchema(createAccountSchema)
 
 // ── Account Mappings & Tax Rate cross-checks ────────────────────────────────
 async function assertTaxRateBelongsToOrg(organizationId: string, taxRateId: string | undefined) {
@@ -65,7 +68,7 @@ router.get('/export/:format', requirePermission('accounts_export'), async (req: 
   const orgId = req.user.organizationId
 
   const filters: Record<string, unknown> = {}
-  if (accountClass) filters.accountClass = accountClass
+  if (accountClass) filters.accountClass = accountClass.toUpperCase()
   if (status) filters.status = status
 
   const accounts = await fetchAllForExport(orgId, filters)
@@ -78,7 +81,7 @@ router.get('/export/:format', requirePermission('accounts_export'), async (req: 
     accountClass: a.accountClass,
     reportingGroup: a.reportingGroup ?? '',
     taxRate: a.taxRate ? `${a.taxRate.name} (${a.taxRate.rate}%)` : '',
-    balance: (balances.get(a.id)?.balance ?? 0).toFixed(2),
+    balance: (balances.get(a.id)?.balance ?? 0).toFixed(currencyDecimals(currentCurrency())),
     status: a.status,
   }))
 
@@ -235,7 +238,7 @@ async function validateOpeningBalances(organizationId: string, body: z.infer<typ
 
   const totalDebit = body.lines.reduce((s, l) => s + l.debit, 0)
   const totalCredit = body.lines.reduce((s, l) => s + l.credit, 0)
-  const plug = Math.round((totalDebit - totalCredit) * 100) / 100
+  const plug = regionalRoundMoney(totalDebit - totalCredit)
 
   const existing = await prisma.journalEntry.findFirst({
     where: { organizationId, sourceType: 'OPENING_BALANCE', entryDate: new Date(body.openingDate), reversedById: null },
@@ -415,7 +418,7 @@ router.get('/', requirePermission('accounts_view'), async (req: Request, res: Re
   const orgId = req.user.organizationId
 
   const where: Record<string, unknown> = { organizationId: orgId }
-  if (accountClass) where.accountClass = accountClass
+  if (accountClass) where.accountClass = accountClass.toUpperCase()
   if (reportingGroup) where.reportingGroup = reportingGroup
   if (status) where.status = status
   if (parentId) where.parentId = parentId
@@ -522,7 +525,7 @@ router.get('/:id', requirePermission('accounts_view'), async (req: Request, res:
     taxRate: account.taxRate,
     bankAccount: account.bankAccount,
     mappings: account.mappings,
-    currency: org?.currency ?? 'SAR',
+    currency: org?.currency ?? 'PKR',
     balance: balance.get(account.id)?.balance ?? 0,
     ytdDebit: ytd.get(account.id)?.debit ?? 0,
     ytdCredit: ytd.get(account.id)?.credit ?? 0,
@@ -649,7 +652,7 @@ router.get('/:id/ledger', requirePermission('accounts_view_ledger'), async (req:
   const rows = allLines.map((l) => {
     const debit = Number(l.debitAmount)
     const credit = Number(l.creditAmount)
-    running += account.normalBalance === 'DEBIT' ? debit - credit : credit - debit
+    running += account.normalBalance.toUpperCase() === 'DEBIT' ? debit - credit : credit - debit
     return {
       id: l.id,
       entryNo: l.journalEntry.entryNo,

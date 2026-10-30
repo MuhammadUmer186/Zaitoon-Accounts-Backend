@@ -1,3 +1,4 @@
+import { SYSTEM_EMAIL_DOMAIN } from '../services/payments'
 import { Router, Request, Response } from 'express'
 import bcrypt from 'bcryptjs'
 import { z } from 'zod'
@@ -6,21 +7,7 @@ import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
-import { isStoreKeeperRole } from '../utils/branchScope'
-
-// A branch-scoped role (store keeper) works in exactly one branch — enforce
-// that whenever roles or branch access are set.
-async function assertBranchScopedRoleHasOneBranch(organizationId: string, roleIds: string[], branchIds: string[]) {
-  if (roleIds.length === 0) return
-  const roles = await prisma.role.findMany({
-    where: { id: { in: roleIds }, organizationId },
-    select: { name: true, displayName: true },
-  })
-  const scoped = roles.filter(isStoreKeeperRole)
-  if (scoped.length > 0 && branchIds.length !== 1) {
-    throw new AppError(`${scoped[0].displayName} must be assigned to exactly one branch`, 400, 'VALIDATION_ERROR')
-  }
-}
+import { validateUserAccess } from '../services/userAccess'
 
 const router = Router()
 
@@ -56,6 +43,8 @@ router.get('/', async (req: Request, res: Response) => {
 
   const where = {
     organizationId: req.user.organizationId,
+    // the inactive "Online payments" actor is not a staff account
+    NOT: { email: { endsWith: SYSTEM_EMAIL_DOMAIN } },
     ...(search && {
       OR: [
         { firstName: { contains: search, mode: 'insensitive' as const } },
@@ -93,39 +82,43 @@ router.get('/', async (req: Request, res: Response) => {
 // POST /users
 router.post('/', async (req: Request, res: Response) => {
   const body = createUserSchema.parse(req.body)
-  await assertBranchScopedRoleHasOneBranch(req.user.organizationId, body.roleIds ?? [], body.branchIds ?? [])
   const passwordHash = await bcrypt.hash(body.password, config.bcryptRounds)
 
-  const user = await prisma.user.create({
-    data: {
-      email: body.email,
-      firstName: body.firstName,
-      lastName: body.lastName,
-      phone: body.phone,
-      passwordHash,
-      organizationId: req.user.organizationId,
-    },
+  const user = await prisma.$transaction(async tx => {
+    await validateUserAccess(tx, req.user.organizationId, body.roleIds ?? [], body.branchIds ?? [])
+    const user = await tx.user.create({
+      data: {
+        email: body.email,
+        firstName: body.firstName,
+        lastName: body.lastName,
+        phone: body.phone,
+        passwordHash,
+        organizationId: req.user.organizationId,
+      },
+    })
+
+    if (body.roleIds && body.roleIds.length > 0) {
+      await tx.userRole.createMany({
+        data: body.roleIds.map((roleId) => ({ userId: user.id, roleId })),
+        skipDuplicates: true,
+      })
+    }
+
+    if (body.branchIds && body.branchIds.length > 0) {
+      await tx.userBranchAccess.createMany({
+        data: body.branchIds.map((branchId) => ({
+          userId: user.id,
+          organizationId: req.user.organizationId,
+          branchId,
+        })),
+        skipDuplicates: true,
+      })
+    }
+
+    return user
   })
 
-  if (body.roleIds && body.roleIds.length > 0) {
-    await prisma.userRole.createMany({
-      data: body.roleIds.map((roleId) => ({ userId: user.id, roleId })),
-      skipDuplicates: true,
-    })
-  }
-
-  if (body.branchIds && body.branchIds.length > 0) {
-    await prisma.userBranchAccess.createMany({
-      data: body.branchIds.map((branchId) => ({
-        userId: user.id,
-        organizationId: req.user.organizationId,
-        branchId,
-      })),
-      skipDuplicates: true,
-    })
-  }
-
-  const { passwordHash: _ph, ...userWithoutPassword } = user
+  const { passwordHash: _ph, posPin: _pin, posPinLookup: _lookup, ...userWithoutPassword } = user
   res.status(201).json(userWithoutPassword)
 })
 
@@ -133,7 +126,7 @@ router.post('/', async (req: Request, res: Response) => {
 router.get('/:id', async (req: Request, res: Response) => {
   const id = req.params['id'] as string
   const user = await prisma.user.findFirst({
-    where: { id, organizationId: req.user.organizationId },
+    where: { id, organizationId: req.user.organizationId, NOT: { email: { endsWith: SYSTEM_EMAIL_DOMAIN } } },
     select: {
       id: true,
       email: true,
@@ -158,67 +151,72 @@ router.put('/:id', async (req: Request, res: Response) => {
   const body = updateUserSchema.parse(req.body)
 
   const user = await prisma.user.findFirst({
-    where: { id, organizationId: req.user.organizationId },
+    where: { id, organizationId: req.user.organizationId, NOT: { email: { endsWith: SYSTEM_EMAIL_DOMAIN } } },
   })
   if (!user) throw new AppError('User not found', 404, 'NOT_FOUND')
 
   const { roleIds, branchIds, password, ...rest } = body
 
-  if (roleIds !== undefined || branchIds !== undefined) {
-    const [currentRoles, currentBranches] = await Promise.all([
-      prisma.userRole.findMany({ where: { userId: id }, select: { roleId: true } }),
-      prisma.userBranchAccess.findMany({ where: { userId: id }, select: { branchId: true } }),
-    ])
-    await assertBranchScopedRoleHasOneBranch(
-      req.user.organizationId,
-      roleIds ?? currentRoles.map((r) => r.roleId),
-      branchIds ?? currentBranches.map((b) => b.branchId),
-    )
-  }
-
-  const updateData: Record<string, unknown> = { ...rest }
-  if (password) {
-    updateData.passwordHash = await bcrypt.hash(password, config.bcryptRounds)
-  }
-
-  await prisma.user.update({ where: { id }, data: updateData })
-
-  if (roleIds !== undefined) {
-    await prisma.userRole.deleteMany({ where: { userId: id } })
-    if (roleIds.length > 0) {
-      await prisma.userRole.createMany({
-        data: roleIds.map((roleId) => ({ userId: id, roleId })),
-        skipDuplicates: true,
-      })
+  const passwordHash = password ? await bcrypt.hash(password, config.bcryptRounds) : undefined
+  const updated = await prisma.$transaction(async tx => {
+    if (roleIds !== undefined || branchIds !== undefined) {
+      const [currentRoles, currentBranches] = await Promise.all([
+        tx.userRole.findMany({ where: { userId: id }, select: { roleId: true } }),
+        tx.userBranchAccess.findMany({ where: { userId: id }, select: { branchId: true } }),
+      ])
+      await validateUserAccess(
+        tx, req.user.organizationId,
+        roleIds ?? currentRoles.map((r) => r.roleId),
+        branchIds ?? currentBranches.map((b) => b.branchId),
+      )
     }
-  }
 
-  if (branchIds !== undefined) {
-    await prisma.userBranchAccess.deleteMany({ where: { userId: id } })
-    if (branchIds.length > 0) {
-      await prisma.userBranchAccess.createMany({
-        data: branchIds.map((branchId) => ({
-          userId: id,
-          organizationId: req.user.organizationId,
-          branchId,
-        })),
-        skipDuplicates: true,
-      })
+    const updateData: Record<string, unknown> = { ...rest }
+    if (password) {
+      updateData.passwordHash = passwordHash
     }
-  }
 
-  const updated = await prisma.user.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      email: true,
-      firstName: true,
-      lastName: true,
-      phone: true,
-      isActive: true,
-      roles: { include: { role: true } },
-      branchAccess: { include: { branch: true } },
-    },
+    await tx.user.update({ where: { id }, data: updateData })
+    if (rest.isActive === false || password) await tx.refreshToken.deleteMany({ where: { userId: id } })
+
+    if (roleIds !== undefined) {
+      await tx.userRole.deleteMany({ where: { userId: id } })
+      if (roleIds.length > 0) {
+        await tx.userRole.createMany({
+          data: roleIds.map((roleId) => ({ userId: id, roleId })),
+          skipDuplicates: true,
+        })
+      }
+    }
+
+    if (branchIds !== undefined) {
+      await tx.userBranchAccess.deleteMany({ where: { userId: id } })
+      if (branchIds.length > 0) {
+        await tx.userBranchAccess.createMany({
+          data: branchIds.map((branchId) => ({
+            userId: id,
+            organizationId: req.user.organizationId,
+            branchId,
+          })),
+          skipDuplicates: true,
+        })
+      }
+    }
+
+    return tx.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        isActive: true,
+        roles: { include: { role: true } },
+        branchAccess: { include: { branch: true } },
+      },
+    })
+
   })
 
   res.json(updated)
@@ -229,15 +227,17 @@ router.delete('/:id', async (req: Request, res: Response) => {
   const id = req.params['id'] as string
 
   const user = await prisma.user.findFirst({
-    where: { id, organizationId: req.user.organizationId },
+    where: { id, organizationId: req.user.organizationId, NOT: { email: { endsWith: SYSTEM_EMAIL_DOMAIN } } },
   })
   if (!user) throw new AppError('User not found', 404, 'NOT_FOUND')
 
-  await prisma.userRole.deleteMany({ where: { userId: id } })
-  await prisma.userBranchAccess.deleteMany({ where: { userId: id } })
-  await prisma.refreshToken.deleteMany({ where: { userId: id } })
-  await prisma.notification.deleteMany({ where: { userId: id } })
-  await prisma.user.delete({ where: { id } })
+  await prisma.$transaction(async tx => {
+  await tx.userRole.deleteMany({ where: { userId: id } })
+  await tx.userBranchAccess.deleteMany({ where: { userId: id } })
+  await tx.refreshToken.deleteMany({ where: { userId: id } })
+  await tx.notification.deleteMany({ where: { userId: id } })
+  await tx.user.delete({ where: { id } })
+  })
 
   res.json({ message: 'User deleted' })
 })

@@ -13,7 +13,8 @@ RUN npx prisma generate
 RUN npm run build
 
 FROM node:20-alpine AS runner
-RUN apk add --no-cache openssl
+# tzdata: lets TZ=Asia/Karachi (docker-compose) set the server's local day
+RUN apk add --no-cache openssl tzdata
 WORKDIR /app
 
 ENV NODE_ENV=production
@@ -25,17 +26,22 @@ RUN addgroup --system --gid 1001 nodejs \
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/scripts ./scripts
 # Brand assets (logo) used by the PDF / Excel report exports
 COPY --from=builder /app/assets ./assets
 COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/docker-entrypoint.sh ./docker-entrypoint.sh
 
 # middleware/upload.ts writes to UPLOAD_ROOT/<organizationId>/ at runtime as
 # the non-root `backend` user — without this, /app (owned by root) has no
 # writable location at all and every file upload crashes with EACCES.
-RUN mkdir -p /app/uploads && chown -R backend:nodejs /app/uploads
+# backups/ is where db:reset-all-data writes its safety copy.
+RUN chmod +x /app/docker-entrypoint.sh \
+  && mkdir -p /app/uploads /app/backups \
+  && chown -R backend:nodejs /app/uploads /app/backups
 
 USER backend
 
 EXPOSE 4000
 
-CMD ["node", "dist/index.js"]
+CMD ["./docker-entrypoint.sh"]

@@ -1,0 +1,200 @@
+// Real HTTP, journal, stock, permission and concurrency checks on a disposable
+// database. Never writes to the configured application database.
+const assert = require('node:assert/strict')
+const path = require('node:path')
+const fs = require('node:fs')
+const { randomUUID } = require('node:crypto')
+const { createScratch } = require('./scratch-db.cjs')
+let scratch, db, appDb, server, orgId, checks = 0
+const check = (name, run) => { run(); checks++; console.log('PASS', name) }
+async function main() {
+  scratch = await createScratch({ apply: [] })
+  process.env.DATABASE_URL = scratch.url
+  db = scratch.client()
+  const config = require('../dist/config'); appDb = config.prisma
+  const app = require('../dist/app').default
+  const { signAccessToken } = require('../dist/utils/jwt')
+  const { createPurchaseBill } = require('../dist/services/purchasing')
+  const org = await db.organization.create({ data: { name: 'Spending QA' } }); orgId = org.id
+  const foreignOrg = await db.organization.create({ data: { name: 'Other spending QA' } })
+  const branch = await db.branch.create({ data: { organizationId: org.id, name: 'Kitchen', code: 'K' } })
+  const otherBranch = await db.branch.create({ data: { organizationId: org.id, name: 'Other', code: 'O' } })
+  const owner = await db.user.create({ data: { organizationId: org.id, email: 'spend-owner@example.invalid', passwordHash: 'unused', firstName: 'Spend', lastName: 'Owner' } })
+  const role = await db.role.create({ data: { organizationId: org.id, name: 'owner', displayName: 'Owner' } })
+  await db.userRole.create({ data: { userId: owner.id, roleId: role.id } })
+  for (const [key, module] of [['can_create_expense', 'expenses'], ['can_approve_expense', 'expenses'], ['can_void_expense', 'expenses'], ['can_create_purchasing_entry', 'purchasing'], ['can_make_payment', 'suppliers'], ['can_approve_bill', 'bills'], ['can_manage_settings', 'settings'], ['can_create_branch', 'branches']]) {
+    await db.permission.create({ data: { key, module, description: key } })
+  }
+  const accounts = {}
+  for (const [key, accountClass, normalBalance] of [['CASH_ON_HAND','ASSET','DEBIT'], ['DEFAULT_BANK','ASSET','DEBIT'], ['CARD_CLEARING','ASSET','DEBIT'], ['INVENTORY','ASSET','DEBIT'], ['INPUT_VAT','ASSET','DEBIT'], ['ACCOUNTS_PAYABLE','LIABILITY','CREDIT'], ['DEFAULT_EXPENSE','EXPENSE','DEBIT']]) {
+    const account = await db.account.create({ data: { organizationId: org.id, code: key, name: key, accountClass, normalBalance } }); accounts[key] = account.id
+    await db.accountingMapping.create({ data: { organizationId: org.id, key, accountId: account.id } })
+  }
+  const category = await db.expenseCategory.create({ data: { organizationId: org.id, name: 'Kitchen costs', accountId: accounts.DEFAULT_EXPENSE } })
+  const foreignCategory = await db.expenseCategory.create({ data: { organizationId: foreignOrg.id, name: 'Foreign' } })
+  const supplier = await db.supplier.create({ data: { organizationId: org.id, name: 'Vendor' } })
+  const item = await db.item.create({ data: { organizationId: org.id, code: 'RICE', name: 'Rice' } })
+  server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)) })
+  const base = `http://127.0.0.1:${server.address().port}/api/v1`
+  const token = signAccessToken(owner.id, org.id, owner.email)
+  const api = async (method, url, body, auth = token) => {
+    const form = body instanceof FormData
+    const res = await fetch(base + url, { method, headers: { ...(auth && { Authorization: `Bearer ${auth}` }), ...(!form && { 'Content-Type': 'application/json' }) }, ...(body !== undefined && { body: form ? body : JSON.stringify(body) }) })
+    return { status: res.status, data: await res.json() }
+  }
+  const pdf = () => new Blob(['%PDF-1.4\nSpending fixture\n%%EOF\n'], { type: 'application/pdf' })
+  const purchaseForm = (overrides = {}) => {
+    const form = new FormData()
+    for (const [key, value] of Object.entries({ branchId: branch.id, supplierId: supplier.id, categoryId: category.id, supplyDate: '2026-10-30', vatPercent: 10,
+      items: JSON.stringify([{ itemId: item.id, description: 'Rice', quantity: 2, unitCost: 100 }, { description: 'Delivery', quantity: 1, unitCost: 50 }]), ...overrides })) form.set(key, String(value))
+    form.set('file', pdf(), 'bill.pdf'); return form
+  }
+  let response = await api('POST', '/purchasing', purchaseForm())
+  check('purchase creates unpaid bill', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.balanceDue, 275); assert.equal(response.data.status, 'approved') })
+  const bill = response.data
+  const stock = await db.branchStock.findUnique({ where: { branchId_itemId: { branchId: branch.id, itemId: item.id } } })
+  check('only stock-linked line increases stock', () => assert.equal(stock.quantityOnHand, 2))
+  const journal = await db.journalEntry.findUnique({ where: { id: bill.journalEntryId }, include: { lines: true } })
+  check('stock and operating lines post to their respective accounts', () => { assert.equal(Number(journal.lines.find(l => l.accountId === accounts.INVENTORY).debitAmount), 200); assert.equal(Number(journal.lines.find(l => l.accountId === accounts.DEFAULT_EXPENSE).debitAmount), 50) })
+  const pay = (amount, extra = {}) => ({ billId: bill.id, paymentDate: '2026-10-30', paymentMethod: 'cash', amount, paidBy: 'QA Owner', ...extra })
+  const requestId = randomUUID()
+  response = await api('POST', '/expenses/purchasing-payment', pay(100, { requestId }))
+  check('partial payment creates linked receipt', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.paymentId, requestId); assert.equal(response.data.billId, bill.id) })
+  const receiptId = response.data.id
+  response = await api('POST', '/expenses/purchasing-payment', pay(100, { requestId }))
+  check('retry returns the existing payment receipt', () => { assert.equal(response.status, 201); assert.equal(response.data.id, receiptId) })
+  const paymentCount = await db.payment.count({ where: { billId: bill.id } })
+  check('retry never duplicates payment', () => assert.equal(paymentCount, 1))
+  response = await api('GET', '/expenses/register')
+  check('register counts bill once and excludes payment mirror', () => { assert.equal(response.status, 200); assert.equal(response.data.total, 1); assert.equal(response.data.summary.total, 275); assert.equal(response.data.summary.paid, 100); assert.equal(response.data.summary.due, 175) })
+  response = await api('POST', '/expenses/purchasing-payment', pay(176))
+  check('overpayment rejected', () => { assert.equal(response.status, 400); assert.equal(response.data.code, 'OVERPAYMENT') })
+  response = await api('POST', '/expenses/purchasing-payment', pay(1.001))
+  check('sub-cent payment rejected', () => assert.equal(response.status, 400))
+  response = await api('POST', '/expenses/purchasing-payment', pay(1, { paymentMethod: 'bank_transfer' }))
+  check('bank transfer requires evidence', () => assert.equal(response.status, 400))
+  const race = await Promise.all([api('POST', '/expenses/purchasing-payment', pay(120)), api('POST', '/expenses/purchasing-payment', pay(120))])
+  check('simultaneous payments cannot exceed the balance', () => assert.deepEqual(race.map(r => r.status).sort(), [201, 400]))
+  const afterRace = await db.bill.findUnique({ where: { id: bill.id } })
+  check('balance is correct after competing payments', () => { assert.equal(afterRace.paidAmount, 220); assert.equal(afterRace.balanceDue, 55) })
+  response = await api('POST', `/expenses/${receiptId}/void`, { voidReason: 'Wrong payment' })
+  check('payment reversal succeeds', () => assert.equal(response.status, 200))
+  const reversed = await db.bill.findUnique({ where: { id: bill.id } })
+  check('reversal restores payable balance', () => { assert.equal(reversed.paidAmount, 120); assert.equal(reversed.balanceDue, 155) })
+  const originalPayment = await db.payment.findUnique({ where: { id: requestId } })
+  check('original payment retained for audit', () => assert.ok(originalPayment))
+  response = await api('POST', `/expenses/${receiptId}/void`, { voidReason: 'Repeated' })
+  check('repeated reversal cannot restore the balance twice', () => assert.equal(response.status, 400))
+  response = await api('GET', `/suppliers/bills/${bill.id}`)
+  check('bill history marks original payment as reversed', () => assert.equal(response.data.payments.find(p => p.id === requestId).status, 'void'))
+  response = await api('GET', '/expenses/register?kind=payment')
+  check('payment register excludes reversals', () => { assert.equal(response.data.total, 1); assert.equal(response.data.data[0].totalAmount, 120) })
+  response = await api('POST', '/expenses/purchasing-payment', pay(155))
+  check('final payment settles bill', () => assert.equal(response.status, 201))
+  const settled = await db.bill.findUnique({ where: { id: bill.id } })
+  check('settled bill has zero balance', () => { assert.equal(settled.status, 'paid'); assert.equal(settled.balanceDue, 0) })
+  response = await api('POST', '/purchasing', purchaseForm({ amountPaid: 275, paymentType: 'cash', paidBy: 'QA Owner' }))
+  check('purchase with immediate full payment is atomic', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.status, 'paid'); assert.equal(response.data.payments.length, 1) })
+  const before = await db.bill.count()
+  response = await api('POST', '/purchasing', purchaseForm({ amountPaid: 999, paidBy: 'QA Owner' }))
+  check('invalid immediate payment rejects purchase', () => assert.equal(response.status, 400))
+  const afterFailed = await db.bill.count()
+  const stockAfterFailed = await db.branchStock.findUnique({ where: { branchId_itemId: { branchId: branch.id, itemId: item.id } } })
+  check('failed purchase leaves no bill or stock increase', () => { assert.equal(afterFailed, before); assert.equal(stockAfterFailed.quantityOnHand, 4) })
+  response = await api('POST', '/expenses', { branchId: branch.id, categoryId: category.id, expenseDate: '2026-10-30', amount: 100, vatRate: 10, vatAmount: 999, totalAmount: 1, description: 'Cleaning', submitForApproval: true })
+  check('expense computes totals and submits atomically', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.totalAmount, 110); assert.equal(response.data.status, 'submitted') })
+  const expenseId = response.data.id
+  response = await api('POST', `/expenses/${expenseId}/approve`)
+  check('expense approves and posts once', () => assert.equal(response.status, 200))
+  response = await api('POST', `/expenses/${expenseId}/approve`)
+  check('second expense approval rejected', () => assert.equal(response.status, 400))
+  response = await api('GET', '/expenses/register')
+  check('combined spending totals include purchases and approved expenses only', () => { assert.equal(response.data.total, 3); assert.equal(response.data.summary.total, 660); assert.equal(response.data.summary.paid, 660); assert.equal(response.data.summary.due, 0) })
+  response = await api('GET', '/expenses/register?kind=expense')
+  check('expense filter excludes supplier bills and payment receipts', () => { assert.equal(response.data.total, 1); assert.equal(response.data.data[0].id, expenseId) })
+  response = await api('GET', '/expenses/register?limit=1&page=2')
+  check('combined register paginates both sources', () => { assert.equal(response.data.data.length, 1); assert.equal(response.data.totalPages, 3) })
+  response = await api('GET', '/expenses/register?fromDate=2026-10-31')
+  check('date filters scope register and totals', () => { assert.equal(response.data.total, 0); assert.equal(response.data.summary.total, 0) })
+  response = await api('POST', '/expenses', { branchId: branch.id, categoryId: foreignCategory.id, expenseDate: '2026-10-30', amount: 10, totalAmount: 10, description: 'Forbidden' })
+  check('foreign category is rejected', () => assert.equal(response.status, 404))
+  const permission = await db.permission.findUnique({ where: { key: 'can_create_purchasing_entry' } })
+  const restrictedRole = await db.role.create({ data: { organizationId: org.id, name: 'store_keeper', displayName: 'Store Keeper', permissions: { create: { permissionId: permission.id } } } })
+  const restricted = await db.user.create({ data: { organizationId: org.id, email: 'spend-store@example.invalid', passwordHash: 'unused', firstName: 'Store', lastName: 'Keeper', roles: { create: { roleId: restrictedRole.id } } } })
+  await db.userBranchAccess.create({ data: { userId: restricted.id, organizationId: org.id, branchId: otherBranch.id } })
+  const restrictedToken = signAccessToken(restricted.id, org.id, restricted.email)
+  response = await api('GET', '/expenses/register', undefined, restrictedToken)
+  check('combined register respects assigned branches', () => { assert.equal(response.status, 200); assert.equal(response.data.total, 0) })
+  response = await api('POST', '/expenses/purchasing-payment', pay(1), restrictedToken)
+  check('cross-branch purchase payment is forbidden', () => assert.equal(response.status, 403))
+  response = await api('GET', `/expenses/${expenseId}`, undefined, restrictedToken)
+  check('cross-branch expense detail is forbidden', () => assert.equal(response.status, 403))
+  response = await api('GET', '/expenses/register', undefined, null)
+  check('unauthenticated register is forbidden', () => assert.equal(response.status, 401))
+  // The import service uses exactly the same payment + receipt path.
+  const imported = await db.$transaction(tx => createPurchaseBill(tx, { organizationId: org.id, branchId: branch.id, supplierId: supplier.id, supplierName: supplier.name, categoryId: category.id,
+    supplyDate: new Date('2026-10-30'), paymentDate: new Date('2026-10-30'), paymentType: 'cash', vatPercent: 0, amountPaid: 25, items: [{ description: 'Imported cost', quantity: 1, unitCost: 50 }], createdBy: owner.id }))
+  const importedReceipts = await db.expense.count({ where: { billId: imported.bill.id, paymentId: imported.payment.id } })
+  check('imported payments create the same linked receipts', () => assert.equal(importedReceipts, 1))
+  const paymentPermission = await db.permission.findUnique({ where: { key: 'can_make_payment' } })
+  const payerRole = await db.role.create({ data: { organizationId: org.id, name: 'payer', displayName: 'Payer', permissions: { create: { permissionId: paymentPermission.id } } } })
+  const payer = await db.user.create({ data: { organizationId: org.id, email: 'spend-payer@example.invalid', passwordHash: 'unused', firstName: 'Payment', lastName: 'Clerk', roles: { create: { roleId: payerRole.id } } } })
+  const payerToken = signAccessToken(payer.id, org.id, payer.email)
+  response = await api('GET', '/expenses/register', undefined, payerToken)
+  check('payment-only staff can access the combined workspace', () => assert.equal(response.status, 200))
+  response = await api('POST', '/expenses', { branchId: branch.id, categoryId: category.id, expenseDate: '2026-10-30', amount: 10, totalAmount: 10, description: 'Not allowed' }, payerToken)
+  check('workspace access does not grant expense creation', () => assert.equal(response.status, 403))
+  response = await api('GET', '/expenses/register?limit=abc')
+  check('invalid pagination is rejected', () => assert.equal(response.status, 400))
+  response = await api('GET', '/expenses/register?fromDate=2026-11-01&toDate=2026-10-30')
+  check('reversed date range is rejected', () => assert.equal(response.status, 400))
+  const maintenanceForm = (overrides = {}) => {
+    const form = new FormData()
+    for (const [key, value] of Object.entries({ branchId: branch.id, source: 'maintenance', expenseDate: '2026-10-30', amount: 200, vatRate: 15, totalAmount: 0, description: 'AC repair', paymentMethod: 'cash', supplierId: supplier.id, ...overrides })) form.set(key, String(value))
+    return form
+  }
+  const maintenanceReceipt = maintenanceForm({ submitForApproval: 'true' }); maintenanceReceipt.set('receipt', pdf(), 'receipt.pdf')
+  response = await api('POST', '/expenses', maintenanceReceipt)
+  const maintenanceCategory = await db.expenseCategory.findFirst({ where: { organizationId: org.id, name: 'Maintenance' } })
+  check('maintenance entry is an operating expense filed under an auto-created Maintenance category', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.source, 'maintenance'); assert.equal(response.data.status, 'submitted'); assert.equal(response.data.totalAmount, 230); assert.equal(response.data.categoryId, maintenanceCategory.id); assert.equal(response.data.supplierId, null); assert.ok(response.data.receiptDocumentId) })
+  const maintenanceId = response.data.id
+  response = await api('POST', '/expenses', maintenanceForm({ amount: 50, vatRate: 0 }))
+  check('second maintenance entry reuses the Maintenance category', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.categoryId, maintenanceCategory.id); assert.equal(response.data.status, 'draft') })
+  response = await api('POST', '/expenses', { branchId: branch.id, expenseDate: '2026-10-30', amount: 10, totalAmount: 10, description: 'No category' })
+  check('regular expense still requires a category', () => assert.equal(response.status, 400))
+  response = await api('POST', `/expenses/${maintenanceId}/approve`)
+  const maintenanceExpense = await db.expense.findUnique({ where: { id: maintenanceId } })
+  const maintenanceJournal = await db.journalEntry.findUnique({ where: { id: maintenanceExpense.journalEntryId }, include: { lines: true } })
+  check('approved maintenance is paid from cash, not left payable', () => { assert.equal(response.status, 200); assert.ok(maintenanceJournal.lines.some(l => l.accountId === accounts.CASH_ON_HAND && Number(l.creditAmount) === 230)); assert.ok(!maintenanceJournal.lines.some(l => l.accountId === accounts.ACCOUNTS_PAYABLE)) })
+  response = await api('GET', '/expenses/register?kind=maintenance')
+  check('maintenance filter lists only maintenance entries', () => { assert.equal(response.data.total, 2); assert.ok(response.data.data.every(r => r.kind === 'maintenance')) })
+  check('summary reports maintenance separately inside operating expenses', () => { assert.equal(response.data.summary.maintenance, 230); assert.equal(response.data.summary.expenses, 230) })
+  response = await api('GET', '/expenses/register?kind=expense')
+  check('operating expense filter includes maintenance', () => assert.ok(response.data.data.some(r => r.id === maintenanceId && r.kind === 'maintenance')))
+  response = await api('GET', '/expenses/register?kind=purchase')
+  check('purchase filter excludes maintenance', () => assert.ok(!response.data.data.some(r => r.kind === 'maintenance')))
+  response = await api('DELETE', `/expenses/categories/${category.id}`)
+  check('categories used by bills cannot be deleted', () => assert.equal(response.status, 400))
+  const parallelId = randomUUID()
+  const samePayment = pay(5, { billId: imported.bill.id, requestId: parallelId })
+  const retried = await Promise.all([api('POST', '/expenses/purchasing-payment', samePayment), api('POST', '/expenses/purchasing-payment', samePayment)])
+  check('simultaneous retries return one linked payment', () => { assert.deepEqual(retried.map(r => r.status), [201, 201]); assert.equal(retried[0].data.id, retried[1].data.id) })
+  const rounded = await db.$transaction(tx => createPurchaseBill(tx, { organizationId: org.id, branchId: branch.id, supplierId: supplier.id, supplierName: supplier.name, categoryId: category.id,
+    supplyDate: new Date('2026-10-30'), paymentDate: new Date('2026-10-30'), paymentType: 'cash', vatPercent: 10, amountPaid: 0,
+    items: [{ description: 'Tiny 1', quantity: 1, unitCost: 0.05 }, { description: 'Tiny 2', quantity: 1, unitCost: 0.05 }], createdBy: owner.id }))
+  const roundedItems = await db.billItem.findMany({ where: { billId: rounded.bill.id } })
+  check('line tax rounds consistently with bill total', () => { assert.equal(rounded.bill.vatAmount, 0.02); assert.equal(rounded.bill.totalAmount, 0.12); assert.equal(Math.round(roundedItems.reduce((sum, item) => sum + item.totalAmount, 0) * 100) / 100, 0.12) })
+  await require('./regional-spending.cjs')({ db, api, org, branch, category, supplier, owner, check, purchaseForm, scratch })
+  console.log(`${checks} spending checks passed.`)
+}
+main().catch(error => { console.error(error); process.exitCode = 1 }).finally(async () => {
+  if (server) await new Promise(resolve => server.close(resolve))
+  if (db) await db.$disconnect()
+  if (appDb) await appDb.$disconnect()
+  if (scratch) await scratch.drop()
+  if (orgId) {
+    const root = path.resolve(__dirname, '../uploads'), target = path.resolve(root, orgId)
+    if (path.dirname(target) !== root) throw new Error('Unsafe test upload cleanup')
+    fs.rmSync(target, { recursive: true, force: true })
+  }
+})

@@ -2,12 +2,208 @@ generator client {
   provider = "prisma-client-js"
 }
 
+model AuthAttemptBucket {
+  key String @id
+  attempts Int @default(1)
+  expiresAt DateTime
+  @@index([expiresAt])
+}
+
+// Operational print spool. Never replicated; cloud devices use cloud- printer IDs.
+model KitchenPrintJob {
+  id String @id @default(uuid())
+  sequence BigInt @unique @default(autoincrement())
+  organizationId String
+  branchId String
+  orderId String
+  printerId String
+  kind String
+  itemIds Json
+  eventKey String @unique
+  payload String
+  state String @default("queued")
+  attempts Int @default(0)
+  lastError String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([organizationId, branchId, printerId, state, sequence])
+  @@index([organizationId, branchId, printerId, orderId])
+}
+
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
+model BranchRuntime {
+  id String @id @default("local")
+  nodeId String @unique
+  organizationId String
+  branchId String
+  lastSequence BigInt @default(0)
+  lastSyncedAt DateTime?
+  lastError String?
+  configurationHash String?
+  configurationSyncedAt DateTime?
+  configurationError String?
+  dataRevision BigInt @default(0)
+  lastReplicaRevision BigInt @default(-1)
+  lastReplicaAt DateTime?
+  lastReplicaDigest String?
+  replicaChainError String?
+  pendingReplicaRevision BigInt?
+  pendingReplicaDigest String?
+  numberSeries String?
+  replicaError String?
+  writesFrozen String?
+  handoverState String?
+  syncHr Boolean @default(false)
+}
+
+model BranchOutbox {
+  id String @id @default(uuid())
+  nodeId String
+  sequence BigInt
+  entity String
+  entityId String
+  operation String
+  payload Json
+  createdAt DateTime @default(now())
+  acknowledgedAt DateTime?
+  @@unique([nodeId, sequence])
+  @@index([acknowledgedAt, sequence])
+}
+
+model BranchSyncNode {
+  id String @id @default(uuid())
+  organizationId String
+  branchId String
+  name String
+  tokenHash String @unique
+  isActive Boolean @default(true)
+  ownsWrites Boolean @default(true)
+  provisionedBy String?
+  replicaRevision BigInt @default(-1)
+  replicaAt DateTime?
+  replicaDigest String?
+  numberSeries String?
+  replicaError String?
+  replicaErrorAt DateTime?
+  healthReport Json?
+  healthReportedAt DateTime?
+  alertsNotified String?
+  walletSequenceSeen BigInt @default(0)
+  walletSequenceReported BigInt?
+  walletRestoreDetectedAt DateTime?
+  walletRecoveryAcceptedAt DateTime?
+  walletRecoveryAcceptedBy String?
+  walletRecoveryReason String?
+  handoverRequestedAt DateTime?
+  releasedAt DateTime?
+  releasedBy String?
+  releaseReason String?
+  reportedDataRevision BigInt @default(0)
+  syncHr Boolean @default(false)
+  lastSequence BigInt @default(0)
+  lastSeenAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([organizationId, branchId])
+  @@unique([organizationId, numberSeries])
+}
+
+model BranchSyncEvent {
+  id String @id @default(uuid())
+  nodeId String
+  sequence BigInt
+  digest String
+  receivedAt DateTime @default(now())
+  @@unique([nodeId, sequence])
+}
+
+model BranchSyncProjection {
+  id String @id @default(uuid())
+  nodeId String
+  entity String
+  entityId String
+  sequence BigInt
+  payload Json
+  deleted Boolean @default(false)
+  receivedAt DateTime @default(now())
+  @@unique([nodeId, entity, entityId])
+}
+
+model BranchReplicaSession {
+  id String @id @default(uuid())
+  nodeId String
+  revision BigInt
+  schema String
+  manifest Json
+  digest String
+  kind String @default("full")
+  baseRevision BigInt?
+  baseDigest String?
+  committedAt DateTime?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@unique([nodeId, revision])
+  @@index([expiresAt])
+}
+
+model BranchReplicaPart {
+  id String @id @default(uuid())
+  sessionId String
+  entity String
+  part Int
+  rows Json
+  digest String
+  @@unique([sessionId, entity, part])
+  @@index([sessionId])
+}
+
+// Branch PC only: one row per revision, written by the revision trigger, so an
+// incremental checkpoint can prove it covers every change since its base.
+model BranchChangeLog {
+  revision BigInt @id
+  entity String
+  entityId String
+}
+model BranchRemoteCommand {
+  id String @id @default(uuid())
+  nodeId String
+  organizationId String
+  branchId String
+  key String
+  publicId String?
+  kind String
+  digest String
+  payload Json
+  status String @default("queued")
+  claimToken String?
+  leaseUntil DateTime?
+  expiresAt DateTime
+  responseStatus Int?
+  result Json?
+  attempts Int @default(0)
+  claimedAt DateTime?
+  createdAt DateTime @default(now())
+  completedAt DateTime?
+  @@unique([nodeId, key])
+  @@index([status, createdAt])
+  @@index([nodeId, status, createdAt])
+  @@index([publicId])
+}
+
 model Organization {
+  freeDishItems FreeDishItem[]
+  freeDishQrs FreeDishQr[]
+  freeDishSubmissions FreeDishSubmission[]
+  hrEmployees          HrEmployee[]
+  hrRecords            HrRecord[]
+  hrAttendance         HrAttendance[]
+  hrLeaves             HrLeaveRequest[]
+  hrPayrollRuns        HrPayrollRun[]
+  hrSettings           HrSettings?
+  hiddenNavigation     String[]            @default([])
   id                   String              @id @default(cuid())
   name                 String
   tradeName            String?
@@ -17,12 +213,46 @@ model Organization {
   phone                String?
   address              String?
   city                 String?
-  country              String              @default("SA")
-  currency             String              @default("SAR")
+  country              String              @default("PK")
+  currency             String              @default("PKR")
+  // number and date style for screens and reports (Settings → Regional)
+  locale               String              @default("en-PK")
+  dateFormat           String              @default("DD MMM YYYY")
+  // what the indirect tax is called on documents: Sales Tax, VAT, GST …
+  taxLabel             String              @default("Sales Tax")
+  // Saudi e-invoicing (ZATCA / Fatoora): signed invoices with QR, reported per branch device
+  zatcaEnabled         Boolean             @default(false)
+  // commercial registration number shown on tax invoices
+  crNumber             String?
   fiscalYearStart      String              @default("01-01")
   logoUrl              String?
+  // Uploaded brand logo (transparent PNG) — used in the portal, QR pages and
+  // report exports instead of the default FoodSync logo when set.
+  logoPath             String?
+  // false = single-restaurant setup: the portal hides every branch selector,
+  // filter and comparison and works with the one branch
+  multiBranch          Boolean             @default(true)
+  // How food cost reaches the books:
+  //  "issues"  — cost is booked when stock is issued to kitchen sections
+  //              (Stock Out); recipes give the theoretical cost for reports
+  //  "recipes" — stock is deducted from recipes when dishes are sold and the
+  //              day's cost of sales is posted when the day is finalized
+  foodCostMethod       String              @default("issues")
   lowStockThreshold    Float?
   purchaseOrderEnabled Boolean             @default(true)
+  // Order types the public online menu offers (dine_in | takeaway | delivery);
+  // empty = online ordering switched off
+  onlineOrderTypes     String[]            @default(["dine_in", "takeaway", "delivery"])
+  // largest discount (% of the bill) staff without can_apply_discount may give
+  maxStaffDiscountPct  Float               @default(10)
+  // cash needs an open till session (switch on in Settings once cashiers and PINs are set up)
+  requireTillForCash   Boolean             @default(false)
+  offlinePosEnabled   Boolean             @default(true)
+  offlinePosDisabledAt DateTime?
+  offlinePosRevokedAt DateTime[]          @default([])
+  // IANA zone the menu shift times (Breakfast/Lunch/Dinner) are written in —
+  // the server itself may run in UTC.
+  timezone             String              @default("Asia/Karachi")
   isActive             Boolean             @default(true)
   createdAt            DateTime            @default(now())
   updatedAt            DateTime            @updatedAt
@@ -47,42 +277,59 @@ model Organization {
   taxRates             TaxRate[]
   accountingMappings   AccountingMapping[]
   accountingPeriods    AccountingPeriod[]
+  menuCategories       MenuCategory[]
+  menuShifts           MenuShift[]
+  dishes               Dish[]
+  diningTables         DiningTable[]
+  customerOrders       CustomerOrder[]
+  orderReviews         OrderReview[]
 }
 
 model Branch {
-  id             String             @id @default(cuid())
-  organizationId String
-  name           String
-  code           String
-  city           String?
-  address        String?
-  phone          String?
-  email          String?
-  managerUserId  String?
-  vatEnabled     Boolean            @default(true)
-  vatRate        Float              @default(15)
-  invoicePrefix  String             @default("INV")
-  salePrefix     String             @default("SL")
-  expensePrefix  String             @default("EXP")
-  isActive       Boolean            @default(true)
-  createdAt      DateTime           @default(now())
-  updatedAt      DateTime           @updatedAt
-  organization   Organization       @relation(fields: [organizationId], references: [id])
-  dailySales     DailySale[]
-  cashClosings   CashClosing[]
-  expenses       Expense[]
-  bills          Bill[]
-  branchStocks   BranchStock[]
-  stockMovements StockMovement[]
-  wastageReports WastageReport[]
-  journalEntries JournalEntry[]
-  userAccess     UserBranchAccess[]
-  targets        BranchTarget[]
-  purchaseOrders PurchaseOrder[]
-  bankAccounts   BankAccount[]
-  sections       BranchSection[]
-  stockOutsFrom  StockOut[]         @relation("StockOutFrom")
-  stockOutsTo    StockOut[]         @relation("StockOutTo")
+  freeDishQrs FreeDishQr[]
+  freeDishSubmissions FreeDishSubmission[]
+  hrEmployees       HrEmployee[]
+  id                String             @id @default(cuid())
+  organizationId    String
+  name              String
+  code              String
+  city              String?
+  address           String?
+  phone             String?
+  email             String?
+  managerUserId     String?
+  vatEnabled        Boolean            @default(true)
+  vatRate           Float              @default(16)
+  invoicePrefix     String             @default("INV")
+  // secret link of the customer-facing "order ready" screen
+  readyDisplayToken String?            @unique
+  salePrefix        String             @default("SL")
+  expensePrefix     String             @default("EXP")
+  isActive          Boolean            @default(true)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  organization      Organization       @relation(fields: [organizationId], references: [id])
+  dailySales        DailySale[]
+  cashClosings      CashClosing[]
+  expenses          Expense[]
+  bills             Bill[]
+  branchStocks      BranchStock[]
+  stockMovements    StockMovement[]
+  wastageReports    WastageReport[]
+  journalEntries    JournalEntry[]
+  userAccess        UserBranchAccess[]
+  targets           BranchTarget[]
+  purchaseOrders    PurchaseOrder[]
+  bankAccounts      BankAccount[]
+  sections          BranchSection[]
+  stockOutsFrom     StockOut[]         @relation("StockOutFrom")
+  stockOutsTo       StockOut[]         @relation("StockOutTo")
+  diningTables      DiningTable[]
+  customerOrders    CustomerOrder[]
+  orderReviews      OrderReview[]
+  dishesOutOfStock  DishOutOfStock[]
+  deliveryZones     DeliveryZone[]
+  riders            Rider[]
 
   @@unique([organizationId, code])
 }
@@ -106,6 +353,8 @@ model User {
   organizationId String
   email          String
   passwordHash   String
+  posPin         String?
+  posPinLookup   String?
   firstName      String
   lastName       String
   phone          String?
@@ -119,8 +368,10 @@ model User {
   branchAccess   UserBranchAccess[]
   refreshTokens  RefreshToken[]
   notifications  Notification[]
+  riderProfile   Rider?
 
   @@unique([organizationId, email])
+  @@unique([organizationId, posPinLookup])
 }
 
 model Role {
@@ -240,6 +491,8 @@ enum AccountingMappingKey {
   CASH_OVER_SHORT
   RETAINED_EARNINGS
   OPENING_BALANCE_EQUITY
+  GIFT_CARD_LIABILITY
+  LOYALTY_LIABILITY
 }
 
 // Organization-level chart of accounts (never per-branch — branch scoping
@@ -390,8 +643,8 @@ model JournalEntry {
   sourceKey      String?
   description    String
   status         String        @default("draft")
-  totalDebit     Decimal       @default(0) @db.Decimal(18, 2)
-  totalCredit    Decimal       @default(0) @db.Decimal(18, 2)
+  totalDebit     Decimal       @default(0) @db.Decimal(19, 3)
+  totalCredit    Decimal       @default(0) @db.Decimal(19, 3)
   isBalanced     Boolean       @default(false)
   reversalOfId   String?
   reversedById   String?
@@ -416,8 +669,8 @@ model JournalLine {
   journalEntryId String
   accountId      String
   description    String?
-  debitAmount    Decimal      @default(0) @db.Decimal(18, 2)
-  creditAmount   Decimal      @default(0) @db.Decimal(18, 2)
+  debitAmount    Decimal      @default(0) @db.Decimal(19, 3)
+  creditAmount   Decimal      @default(0) @db.Decimal(19, 3)
   lineOrder      Int          @default(0)
   journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
   account        Account      @relation(fields: [accountId], references: [id])
@@ -428,6 +681,7 @@ model JournalLine {
 
 // Daily Sales
 model DailySale {
+  checks             OrderCheck[]
   id                 String              @id @default(cuid())
   organizationId     String
   branchId           String
@@ -438,13 +692,17 @@ model DailySale {
   deliveryAmount     Float               @default(0)
   bankTransferAmount Float               @default(0)
   otherAmount        Float               @default(0)
+  // paid with a gift card, loyalty points or on a customer house account
+  giftCardAmount     Float               @default(0)
+  loyaltyAmount      Float               @default(0)
+  houseAccountAmount Float               @default(0)
   subtotal           Float
   discountAmount     Float               @default(0)
   vatAmount          Float               @default(0)
   totalAmount        Float
   refundAmount       Float               @default(0)
   netAmount          Float
-  vatRate            Float               @default(15)
+  vatRate            Float               @default(16)
   status             String              @default("draft")
   notes              String?
   journalEntryId     String?
@@ -459,6 +717,15 @@ model DailySale {
   organization       Organization        @relation(fields: [organizationId], references: [id])
   branch             Branch              @relation(fields: [branchId], references: [id])
   deliveryBreakdown  DeliveryBreakdown[]
+  // "manual" = typed in on the Daily Sales page; "orders" = built
+  // automatically from completed POS / QR orders of that branch and day
+  source             String              @default("manual")
+  orders             CustomerOrder[]
+  // recipe cost of the orders in an automatic "orders" sale; in "recipes"
+  // mode it is posted (Dr Cost of Sales / Cr Inventory) when the day is
+  // finalized
+  costOfSales        Float               @default(0)
+  cogsJournalEntryId String?
 
   @@unique([organizationId, saleNo])
 }
@@ -687,6 +954,7 @@ model Item {
   movements          StockMovement[]
   wastageItems       WastageItem[]
   purchaseOrderItems PurchaseOrderItem[]
+  dishIngredients    DishIngredient[]
 
   @@unique([organizationId, code])
 }
@@ -730,6 +998,8 @@ model StockMovement {
 // A consumption point inside a branch (e.g. Juices, Broast, Kitchen) that
 // store stock is issued to via Stock Out.
 model BranchSection {
+  freeDishQrs FreeDishQr[]
+  freeDishSubmissions FreeDishSubmission[]
   id             String     @id @default(cuid())
   organizationId String
   branchId       String
@@ -901,4 +1171,1371 @@ model AuditLog {
 
   @@index([organizationId, module])
   @@index([organizationId, resourceType, resourceId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Menu & QR Ordering
+// ─────────────────────────────────────────────────────────────────────────
+
+model MenuCategory {
+  id             String       @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  sortOrder      Int          @default(0)
+  isActive       Boolean      @default(true)
+  // kitchen station that prepares this category (dishes can override)
+  stationId      String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  dishes         Dish[]
+
+  @@unique([organizationId, name])
+}
+
+// Breakfast / Lunch / Dinner. Times are "HH:mm" in Organization.timezone; an
+// endTime earlier than startTime runs past midnight (e.g. 19:00 → 01:00).
+// A guest scanning a table QR only sees the dishes of the shift running now.
+model MenuShift {
+  id             String          @id @default(cuid())
+  organizationId String
+  name           String
+  startTime      String
+  endTime        String
+  sortOrder      Int             @default(0)
+  isActive       Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  organization   Organization    @relation(fields: [organizationId], references: [id])
+  dishes         DishShift[]
+  orders         CustomerOrder[]
+
+  @@unique([organizationId, name])
+}
+
+model Dish {
+  id             String              @id @default(cuid())
+  organizationId String
+  categoryId     String
+  name           String
+  description    String?
+  // VAT-inclusive menu price
+  price          Float
+  imagePath      String?
+  sortOrder      Int                 @default(0)
+  isActive       Boolean             @default(true)
+  // a combo/deal: sold at its own price, made of choices (ComboGroup)
+  isCombo        Boolean             @default(false)
+  // overrides the category's kitchen station
+  stationId      String?
+  // target preparation time; kitchen tickets turn amber/red past it
+  prepMinutes    Int?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  organization   Organization        @relation(fields: [organizationId], references: [id])
+  category       MenuCategory        @relation(fields: [categoryId], references: [id])
+  shifts         DishShift[]
+  outOfStock     DishOutOfStock[]
+  orderItems     CustomerOrderItem[]
+  ingredients    DishIngredient[]
+  sizes          DishSize[]
+  modifierLinks  DishModifierGroup[]
+  comboGroups    ComboGroup[]
+  comboOptions   ComboOption[]       @relation("ComboComponent")
+
+  @@index([organizationId, categoryId])
+}
+
+// One line of a dish's recipe: how much of an inventory item goes into ONE
+// portion (in the item's own unit, e.g. 0.25 kg), plus the trim/cooking loss.
+model DishIngredient {
+  id        String @id @default(cuid())
+  dishId    String
+  itemId    String
+  quantity  Float
+  wastePct  Float  @default(0)
+  sortOrder Int    @default(0)
+  dish      Dish   @relation(fields: [dishId], references: [id], onDelete: Cascade)
+  item      Item   @relation(fields: [itemId], references: [id])
+
+  @@unique([dishId, itemId])
+}
+
+model DishShift {
+  dishId  String
+  shiftId String
+  dish    Dish      @relation(fields: [dishId], references: [id], onDelete: Cascade)
+  shift   MenuShift @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+
+  @@id([dishId, shiftId])
+}
+
+// Kitchen-side "out of stock" switch — a row here hides the dish from the
+// QR menu of that one branch until the kitchen switches it back on.
+model DishOutOfStock {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String
+  dishId         String
+  markedBy       String
+  createdAt      DateTime @default(now())
+  branch         Branch   @relation(fields: [branchId], references: [id])
+  dish           Dish     @relation(fields: [dishId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, dishId])
+}
+
+// A registered table. orderToken / reviewToken are the unguessable values
+// behind the table's two printed QR codes (/t/<orderToken>, /r/<reviewToken>).
+model DiningTable {
+  id             String          @id @default(cuid())
+  organizationId String
+  branchId       String
+  name           String
+  seats          Int?
+  section        String          @default("Main")
+  x              Float           @default(5)
+  y              Float           @default(5)
+  shape          String          @default("rectangle")
+  seatedAt       DateTime?
+  guestCount     Int?
+  needsClearing  Boolean         @default(false)
+  orderToken     String          @unique
+  reviewToken    String          @unique
+  isActive       Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  organization   Organization    @relation(fields: [organizationId], references: [id])
+  branch         Branch          @relation(fields: [branchId], references: [id])
+  orders         CustomerOrder[]
+  reviews        OrderReview[]
+
+  @@unique([branchId, name])
+}
+
+// One running order per table: every guest who orders from the table's QR
+// while it is "open" adds items to the same order (merged), until staff
+// complete or cancel it. Item lines carry their own kitchen status.
+model CustomerOrder {
+  counterCode              String               @default("main")
+  id                       String               @id @default(cuid())
+  organizationId           String
+  branchId                 String
+  // null for takeaway orders
+  tableId                  String?
+  shiftId                  String?
+  orderNo                  Int
+  // dine_in | takeaway | delivery
+  orderType                String               @default("dine_in")
+  // qr (guest scanned the table QR) | pos (taken by a cashier) | online
+  source                   String               @default("qr")
+  customerName             String?
+  customerPhone            String?
+  deliveryAddress          String?
+  customerId               String?
+  customer                 Customer?            @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  intakeRequestId          String?
+  intakeRequestHash        String?
+  deliveryZoneId           String?
+  deliveryZone             DeliveryZone?        @relation(fields: [deliveryZoneId], references: [id], onDelete: SetNull)
+  deliveryZoneName         String?
+  deliveryArea             String?
+  deliveryMinimumOrder     Float                @default(0)
+  deliveryFee              Float                @default(0)
+  deliveryFeeVatRate       Float                @default(0)
+  deliveryFeeVatAmount     Float                @default(0)
+  deliveryFeeTaxCategory   String               @default("S")
+  deliveryFeeTaxReasonCode String?
+  deliveryFeeTaxReason     String?
+  deliveryPaymentMode      String?
+  riderId                  String?
+  rider                    Rider?               @relation(fields: [riderId], references: [id], onDelete: Restrict)
+  deliveryStatus           String?
+  dispatchedAt             DateTime?
+  deliveredAt              DateTime?
+  deliveryFailureReason    String?
+  deliveryEvents           DeliveryEvent[]
+  riderCollection          RiderCashCollection?
+  // pending (online order waiting for staff to accept it — not yet in the
+  // kitchen) | open | completed | cancelled | refunded
+  status                   String               @default("open")
+  acceptedBy               String?
+  acceptedAt               DateTime?
+  // the ready time promised to an online customer when the order was accepted
+  estimatedReadyAt         DateTime?
+  // set when staff turned an online order down (cancelReason is shown to the customer)
+  rejectedAt               DateTime?
+  // itemsTotal - discountAmount = totalAmount (VAT-inclusive); subtotal is
+  // the ex-VAT part of totalAmount
+  itemsTotal               Float                @default(0)
+  discountAmount           Float                @default(0)
+  // automatic / coupon promotions (not the staff discount); itemsTotal -
+  // discountAmount - promotionAmount (+ delivery fee) = totalAmount
+  promotionAmount          Float                @default(0)
+  promotions               Json?
+  couponCode               String?
+  subtotal                 Float                @default(0)
+  vatRate                  Float                @default(0)
+  vatAmount                Float                @default(0)
+  totalAmount              Float                @default(0)
+  // recipe cost of the dishes on the order, fixed when it is paid
+  foodCost                 Float                @default(0)
+  // set when (in "recipes" mode) the ingredients were taken out of stock
+  stockDeductedAt          DateTime?
+  // cash | card | bank_transfer | other, or "split" when payments has several lines
+  paymentMethod            String?
+  // [{ method, amount }] — how the bill was settled; always sums to totalAmount
+  payments                 Json?
+  discountReason           String?
+  amountTendered           Float?
+  changeAmount             Float?
+  notes                    String?
+  cancelReason             String?
+  createdBy                String?
+  closedBy                 String?
+  // paid receipts printed; the second and later say "Reprint"
+  receiptPrints            Int                  @default(0)
+  prebillPrints            Int                  @default(0)
+  guestCount               Int?
+  checks                   OrderCheck[]
+  offlineOrderNo           String?
+  offlineSyncedAt          DateTime?
+  closedAt                 DateTime?
+  // set when the guest taps "Request the bill" on the table QR page
+  billRequestedAt          DateTime?
+  // the automatic "orders" Daily Sale this completed order is counted in
+  dailySaleId              String?
+  tillSessionId            String?
+  tillSession              TillSession?         @relation(fields: [tillSessionId], references: [id])
+  createdAt                DateTime             @default(now())
+  updatedAt                DateTime             @updatedAt
+  organization             Organization         @relation(fields: [organizationId], references: [id])
+  branch                   Branch               @relation(fields: [branchId], references: [id])
+  table                    DiningTable?         @relation(fields: [tableId], references: [id])
+  shift                    MenuShift?           @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  dailySale                DailySale?           @relation(fields: [dailySaleId], references: [id], onDelete: SetNull)
+  items                    CustomerOrderItem[]
+  reviews                  OrderReview[]
+  zatcaDocuments           ZatcaDocument[]
+  offlineSync              OfflineOrderSync?
+
+  @@unique([organizationId, branchId, orderNo])
+  @@unique([organizationId, intakeRequestId])
+  @@index([branchId, deliveryStatus])
+  @@index([branchId, status])
+  @@index([tableId, status])
+  @@index([dailySaleId])
+}
+
+// Each check is an immutable financial snapshot once paid. The parent order
+// remains the kitchen ticket; stock is consumed once, on its first payment.
+model OrderCheck {
+  counterCode    String @default("main")
+  id             String          @id @default(cuid())
+  organizationId String
+  branchId       String
+  orderId        String
+  number         Int
+  label          String
+  mode           String
+  itemIds        String[]        @default([])
+  lines          Json
+  itemsTotal     Float
+  discountAmount Float           @default(0)
+  totalAmount    Float
+  vatRate        Float
+  vatAmount      Float
+  foodCost       Float           @default(0)
+  status         String          @default("unpaid")
+  payments       Json?
+  amountTendered Float?
+  changeAmount   Float?
+  paidAt         DateTime?
+  paidBy         String?
+  refundedAt     DateTime?
+  receiptPrints  Int             @default(0)
+  dailySaleId    String?
+  createdAt      DateTime        @default(now())
+  order          CustomerOrder   @relation(fields: [orderId], references: [id])
+  dailySale      DailySale?      @relation(fields: [dailySaleId], references: [id], onDelete: SetNull)
+  zatcaDocuments ZatcaDocument[]
+
+  @@unique([orderId, number])
+  @@index([organizationId, branchId, status])
+  @@index([dailySaleId])
+}
+
+// Settings-only configuration; payment activation belongs to a verified adapter.
+model CommerceSettings {
+  organizationId     String   @id
+  loyaltyEarnPerUnit Float    @default(0)
+  loyaltyPointValue  Float    @default(0)
+  promotionsStack    Boolean  @default(false)
+  providerName       String   @default("")
+  paymentEnvironment String   @default("sandbox")
+  merchantId         String   @default("")
+  publicKey          String   @default("")
+  secretSealed       String?
+  // the payment integration in use: none | simulator (sandbox only). A real
+  // provider adapter is added in code once its official API is integrated.
+  paymentAdapter     String   @default("none")
+  updatedAt          DateTime @updatedAt
+  updatedBy          String
+}
+
+model Customer {
+  id                  String                    @id @default(cuid())
+  organizationId      String
+  phone               String
+  name                String
+  email               String?
+  notes               String?
+  addresses           Json                      @default("[]")
+  tags                String[]                  @default([])
+  // cached from completed / refunded orders
+  visitCount          Int                       @default(0)
+  totalSpend          Float                     @default(0)
+  lastVisitAt         DateTime?
+  // loyalty points balance (immutable history in LoyaltyTransaction)
+  loyaltyPoints       Float                     @default(0)
+  // house account: what the customer owes, up to the credit limit
+  houseAccountEnabled Boolean                   @default(false)
+  creditLimit         Float                     @default(0)
+  houseBalance        Float                     @default(0)
+  giftCards           GiftCard[]
+  loyaltyTransactions LoyaltyTransaction[]
+  houseTransactions   HouseAccountTransaction[]
+  receipts            CustomerReceipt[]
+  createdAt           DateTime                  @default(now())
+  updatedAt           DateTime                  @updatedAt
+  orders              CustomerOrder[]
+
+  @@unique([organizationId, phone])
+}
+
+model DeliveryZone {
+  id               String          @id @default(cuid())
+  organizationId   String
+  branchId         String
+  name             String
+  fee              Float           @default(0)
+  minimumOrder     Float           @default(0)
+  areas            String[]        @default([])
+  etaMinutes       Int             @default(45)
+  feeVatRate       Float?
+  feeTaxCategory   String          @default("S")
+  feeTaxReasonCode String?
+  feeTaxReason     String?
+  isActive         Boolean         @default(true)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  branch           Branch          @relation(fields: [branchId], references: [id])
+  orders           CustomerOrder[]
+
+  @@unique([branchId, name])
+  @@index([organizationId, branchId, isActive])
+}
+
+model Rider {
+  id             String                @id @default(cuid())
+  organizationId String
+  branchId       String
+  name           String
+  phone          String
+  active         Boolean               @default(true)
+  // the rider's own login: sees and updates only deliveries assigned to them
+  userId         String?               @unique
+  user           User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  branch         Branch                @relation(fields: [branchId], references: [id])
+  orders         CustomerOrder[]
+  collections    RiderCashCollection[]
+  settlements    RiderSettlement[]
+
+  @@index([organizationId, branchId, active])
+}
+
+model DeliveryEvent {
+  id         String        @id @default(cuid())
+  orderId    String
+  fromStatus String?
+  toStatus   String
+  riderId    String?
+  riderName  String?
+  userId     String
+  reason     String?
+  createdAt  DateTime      @default(now())
+  order      CustomerOrder @relation(fields: [orderId], references: [id])
+
+  @@index([orderId, createdAt])
+}
+
+model RiderCashCollection {
+  id             String           @id @default(cuid())
+  organizationId String
+  branchId       String
+  riderId        String
+  orderId        String           @unique
+  tillPaymentId  String           @unique
+  amount         Float
+  businessDate   DateTime
+  collectedAt    DateTime         @default(now())
+  settlementId   String?
+  order          CustomerOrder    @relation(fields: [orderId], references: [id])
+  rider          Rider            @relation(fields: [riderId], references: [id])
+  payment        TillPayment      @relation(fields: [tillPaymentId], references: [id])
+  settlement     RiderSettlement? @relation(fields: [settlementId], references: [id])
+
+  @@index([organizationId, branchId, businessDate])
+  @@index([riderId, settlementId])
+}
+
+model RiderSettlement {
+  id             String                @id @default(cuid())
+  organizationId String
+  branchId       String
+  riderId        String
+  number         Int
+  requestId      String
+  userId         String
+  tillSessionId  String
+  businessDate   DateTime
+  expectedCash   Float
+  countedCash    Float
+  difference     Float
+  notes          String?
+  settledAt      DateTime              @default(now())
+  rider          Rider                 @relation(fields: [riderId], references: [id])
+  collections    RiderCashCollection[]
+  tillSession    TillSession           @relation(fields: [tillSessionId], references: [id])
+
+  @@unique([organizationId, requestId])
+  @@unique([branchId, number])
+  @@index([organizationId, branchId, businessDate])
+}
+
+model PosOfflineDevice {
+  id             String             @id
+  organizationId String
+  branchId       String
+  number         Int
+  name           String
+  isActive       Boolean            @default(true)
+  createdAt      DateTime           @default(now())
+  lastSeenAt     DateTime           @default(now())
+  orders         OfflineOrderSync[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, branchId])
+}
+
+model OfflineOrderSync {
+  id              String           @id @default(cuid())
+  organizationId  String
+  clientUuid      String
+  deviceId        String
+  sequence        Int
+  userId          String
+  baseHash        String
+  paymentHash     String?
+  orderId         String           @unique
+  clientCreatedAt DateTime
+  syncedAt        DateTime         @default(now())
+  device          PosOfflineDevice @relation(fields: [deviceId], references: [id])
+  order           CustomerOrder    @relation(fields: [orderId], references: [id])
+
+  @@unique([organizationId, clientUuid])
+  @@unique([deviceId, sequence])
+}
+
+model TillSession {
+  id               String            @id @default(cuid())
+  organizationId   String
+  branchId         String
+  userId           String
+  deviceName       String?
+  openedAt         DateTime          @default(now())
+  openingFloat     Float
+  closedAt         DateTime?
+  countedCash      Float?
+  expectedCash     Float             @default(0)
+  difference       Float             @default(0)
+  status           String            @default("open")
+  notes            String?
+  movements        TillMovement[]
+  payments         TillPayment[]
+  orders           CustomerOrder[]
+  zReport          ZReport?
+  riderSettlements RiderSettlement[]
+
+  @@index([organizationId, branchId, userId, status])
+}
+
+model TillMovement {
+  id        String      @id @default(cuid())
+  sessionId String
+  type      String
+  amount    Float
+  reason    String
+  userId    String
+  createdAt DateTime    @default(now())
+  session   TillSession @relation(fields: [sessionId], references: [id])
+
+  @@index([sessionId])
+}
+
+// Immutable payment events keep closed tills unchanged when a later till refunds.
+model TillPayment {
+  id              String               @id @default(cuid())
+  organizationId  String
+  branchId        String
+  userId          String
+  sessionId       String?
+  orderId         String
+  checkId         String?
+  referenceKey    String               @unique
+  method          String
+  amount          Float
+  type            String
+  createdAt       DateTime             @default(now())
+  session         TillSession?         @relation(fields: [sessionId], references: [id])
+  riderCollection RiderCashCollection?
+
+  @@index([sessionId])
+  @@index([orderId])
+}
+
+model ZReport {
+  id             String      @id @default(cuid())
+  organizationId String
+  branchId       String
+  sessionId      String      @unique
+  number         Int
+  report         Json
+  createdAt      DateTime    @default(now())
+  session        TillSession @relation(fields: [sessionId], references: [id])
+
+  @@unique([branchId, number])
+}
+
+model VoidReason {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  isActive       Boolean @default(true)
+
+  @@unique([organizationId, name])
+}
+
+model PosApproval {
+  id             String    @id @default(cuid())
+  organizationId String
+  branchId       String
+  cashierId      String
+  approvedBy     String
+  action         String
+  resourceId     String
+  expiresAt      DateTime
+  consumedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([expiresAt])
+}
+
+model CustomerOrderItem {
+  id           String          @id @default(cuid())
+  orderId      String
+  dishId       String
+  dishName     String
+  unitPrice    Float
+  quantity     Int
+  lineTotal    Float
+  // recipe cost of one portion when the order was paid
+  unitCost     Float           @default(0)
+  notes        String?
+  guestName    String?
+  // awaiting (sent from a table QR, waiting for staff to accept) | pending |
+  // preparing | ready | served | cancelled
+  status       String          @default("pending")
+  // why staff turned down a table-QR dish (shown to the guest)
+  rejectReason String?
+  // why staff removed the dish, and who did
+  cancelReason String?
+  cancelledBy  String?
+  // set when the dish was already being cooked when it was cancelled: its
+  // ingredients are written off as wastage
+  wastedAt     DateTime?
+  // size, modifiers and combo choices as sold: { size?, modifiers?, combo? }
+  // (unitPrice already includes them)
+  selection    Json?
+  // kitchen station that prepares this line (resolved when ordered)
+  stationId    String?
+  station      KitchenStation? @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  // courses: a held line stays off the kitchen screen and slips until fired
+  course       Int             @default(1)
+  held         Boolean         @default(false)
+  firedAt      DateTime?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  order        CustomerOrder   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  dish         Dish            @relation(fields: [dishId], references: [id])
+
+  @@index([orderId])
+}
+
+model OrderReview {
+  id             String        @id @default(cuid())
+  organizationId String
+  branchId       String
+  // null for takeaway orders (reviewed from the QR on their receipt)
+  tableId        String?
+  orderId        String
+  rating         Int
+  comment        String
+  guestName      String?
+  imagePath      String?
+  createdAt      DateTime      @default(now())
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  branch         Branch        @relation(fields: [branchId], references: [id])
+  table          DiningTable?  @relation(fields: [tableId], references: [id])
+  order          CustomerOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
+}
+
+// A ZATCA EGS unit: the POS of one branch, onboarded with its own key pair
+// and certificate (CSID). Invoices it issues are numbered by the invoice
+// counter (ICV) and chained by the previous invoice hash (PIH).
+model ZatcaDevice {
+  id                     String          @id @default(cuid())
+  organizationId         String
+  branchId               String
+  counterCode            String          @default("main")
+  // sandbox | simulation | production
+  environment            String
+  // onboarding | active | failed
+  status                 String          @default("onboarding")
+  egsSerial              String
+  commonName             String
+  // seller address printed on the invoices of this branch
+  street                 String
+  building               String
+  district               String
+  city                   String
+  postalCode             String
+  industry               String          @default("Restaurant")
+  csr                    String?
+  privateKeySealed       String?
+  complianceToken        String?
+  complianceSecretSealed String?
+  complianceRequestId    String?
+  productionToken        String?
+  productionSecretSealed String?
+  certificateExpiresAt   DateTime?
+  icv                    Int             @default(0)
+  lastInvoiceHash        String?
+  onboardingLog          Json?
+  lastError              String?
+  createdAt              DateTime        @default(now())
+  updatedAt              DateTime        @updatedAt
+  documents              ZatcaDocument[]
+
+  @@unique([branchId, counterCode])
+  @@index([organizationId])
+}
+
+// A signed ZATCA document (simplified tax invoice / credit note / debit note)
+model ZatcaDocument {
+  id             String         @id @default(cuid())
+  organizationId String
+  branchId       String
+  deviceId       String
+  orderId        String?
+  checkId        String?
+  check          OrderCheck?    @relation(fields: [checkId], references: [id])
+  // invoice | credit | debit
+  type           String
+  invoiceNo      String
+  uuid           String
+  icv            Int
+  hash           String
+  previousHash   String
+  qr             String
+  xml            String
+  issuedAt       DateTime
+  totalAmount    Float
+  vatAmount      Float
+  // what was billed (lines, discount, payable, VAT rate, payment means) — a
+  // credit note reverses exactly this, whatever happened to the order since
+  billed         Json?
+  // pending | reported | warnings | rejected | failed (will retry)
+  status         String         @default("pending")
+  attempts       Int            @default(0)
+  nextAttemptAt  DateTime       @default(now())
+  response       Json?
+  reportedAt     DateTime?
+  createdAt      DateTime       @default(now())
+  device         ZatcaDevice    @relation(fields: [deviceId], references: [id])
+  order          CustomerOrder? @relation(fields: [orderId], references: [id])
+
+  @@unique([deviceId, icv])
+  @@index([organizationId, status])
+  @@index([orderId])
+}
+
+// A size of a dish (Half / Full, Regular / Large) with its own VAT-inclusive
+// price; recipeFactor scales the dish recipe (Half = 0.5)
+model DishSize {
+  id           String  @id @default(cuid())
+  dishId       String
+  name         String
+  price        Float
+  recipeFactor Float   @default(1)
+  isDefault    Boolean @default(false)
+  sortOrder    Int     @default(0)
+  dish         Dish    @relation(fields: [dishId], references: [id], onDelete: Cascade)
+
+  @@index([dishId])
+}
+
+// A reusable set of choices ("Spice level", "Extra toppings")
+model ModifierGroup {
+  id             String              @id @default(cuid())
+  organizationId String
+  name           String
+  minSelect      Int                 @default(0)
+  maxSelect      Int                 @default(1)
+  sortOrder      Int                 @default(0)
+  isActive       Boolean             @default(true)
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  options        ModifierOption[]
+  dishes         DishModifierGroup[]
+
+  @@index([organizationId])
+}
+
+model ModifierOption {
+  id           String        @id @default(cuid())
+  groupId      String
+  name         String
+  // VAT-inclusive price added to the dish
+  price        Float         @default(0)
+  // stock this option uses (e.g. 0.03 kg cheese), in the item's unit
+  itemId       String?
+  itemQuantity Float         @default(0)
+  isDefault    Boolean       @default(false)
+  isActive     Boolean       @default(true)
+  sortOrder    Int           @default(0)
+  group        ModifierGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId])
+}
+
+// A modifier group on a dish, with per-dish rules (Foodics-style): min / max
+// selections, how many are free, options not offered on this dish
+model DishModifierGroup {
+  id                String        @id @default(cuid())
+  dishId            String
+  groupId           String
+  sortOrder         Int           @default(0)
+  minSelect         Int?
+  maxSelect         Int?
+  freeCount         Int           @default(0)
+  excludedOptionIds String[]      @default([])
+  dish              Dish          @relation(fields: [dishId], references: [id], onDelete: Cascade)
+  group             ModifierGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([dishId, groupId])
+}
+
+// A choice inside a combo ("Choose your drink")
+model ComboGroup {
+  id        String        @id @default(cuid())
+  dishId    String
+  name      String
+  minSelect Int           @default(1)
+  maxSelect Int           @default(1)
+  sortOrder Int           @default(0)
+  dish      Dish          @relation(fields: [dishId], references: [id], onDelete: Cascade)
+  options   ComboOption[]
+
+  @@index([dishId])
+}
+
+model ComboOption {
+  id         String     @id @default(cuid())
+  groupId    String
+  // the component dish (and size) given in the combo
+  dishId     String
+  sizeId     String?
+  // added to the combo price when chosen (e.g. +3 for a large drink)
+  priceDelta Float      @default(0)
+  isDefault  Boolean    @default(false)
+  sortOrder  Int        @default(0)
+  group      ComboGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  dish       Dish       @relation("ComboComponent", fields: [dishId], references: [id], onDelete: Cascade)
+
+  @@index([groupId])
+}
+
+// A kitchen station (Grill, Tandoor, Bar …): dishes are routed to one, each
+// gets its own kitchen slip, printed on its own printer
+model KitchenStation {
+  id             String              @id @default(cuid())
+  organizationId String
+  name           String
+  // printer name on the local print relay; empty = the device's default printer
+  printerName    String?
+  sortOrder      Int                 @default(0)
+  isActive       Boolean             @default(true)
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  items          CustomerOrderItem[]
+
+  @@unique([organizationId, name])
+}
+
+// ── Phase 6: gift cards, loyalty, house accounts, promotions ────────────────
+
+// Prepaid stored value. Selling one is a liability, not revenue; spending it
+// is a payment. The balance can never go below zero (CHECK constraint).
+model GiftCard {
+  id             String                @id @default(cuid())
+  organizationId String
+  code           String
+  customerId     String?
+  initialAmount  Float
+  balance        Float
+  // active | void
+  status         String                @default("active")
+  expiresAt      DateTime?
+  issuedBranchId String
+  createdBy      String
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  customer       Customer?             @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  transactions   GiftCardTransaction[]
+
+  @@unique([organizationId, code])
+}
+
+model GiftCardTransaction {
+  id             String   @id @default(cuid())
+  organizationId String
+  giftCardId     String
+  // issue | redeem | refund | void
+  type           String
+  // + credits the card, - spends it
+  amount         Float
+  balanceAfter   Float
+  orderId        String?
+  receiptId      String?
+  referenceKey   String   @unique
+  userId         String
+  createdAt      DateTime @default(now())
+  giftCard       GiftCard @relation(fields: [giftCardId], references: [id])
+
+  @@index([organizationId, createdAt])
+}
+
+model LoyaltyTransaction {
+  id             String   @id @default(cuid())
+  organizationId String
+  customerId     String
+  // earn | redeem | reverse_earn | reverse_redeem
+  type           String
+  points         Float
+  // money value at the configured point value when it happened
+  value          Float
+  balanceAfter   Float
+  orderId        String?
+  referenceKey   String   @unique
+  userId         String
+  createdAt      DateTime @default(now())
+  customer       Customer @relation(fields: [customerId], references: [id])
+
+  @@index([organizationId, createdAt])
+}
+
+model HouseAccountTransaction {
+  id             String   @id @default(cuid())
+  organizationId String
+  customerId     String
+  // charge | reverse_charge | payment
+  type           String
+  // + increases what the customer owes, - reduces it
+  amount         Float
+  balanceAfter   Float
+  orderId        String?
+  receiptId      String?
+  referenceKey   String   @unique
+  userId         String
+  createdAt      DateTime @default(now())
+  customer       Customer @relation(fields: [customerId], references: [id])
+
+  @@index([customerId, createdAt])
+}
+
+// Money taken outside a sale: a gift card sold, or a house account payment.
+// Cash ones belong to the cashier's till and the branch's cash closing.
+model CustomerReceipt {
+  id             String    @id @default(cuid())
+  organizationId String
+  branchId       String
+  // gift_card_sale | house_account_payment
+  type           String
+  method         String
+  amount         Float
+  customerId     String?
+  giftCardId     String?
+  tillSessionId  String?
+  userId         String
+  requestId      String
+  businessDate   DateTime
+  journalEntryId String?
+  createdAt      DateTime  @default(now())
+  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  @@unique([organizationId, requestId])
+  @@index([organizationId, branchId, businessDate])
+}
+
+// Applied on the server when an order is priced; never by the client.
+model Promotion {
+  id             String    @id @default(cuid())
+  organizationId String
+  name           String
+  // percent | fixed | buy_x_get_y | free_item_over | price_override
+  type           String
+  // percent off, money off, or the override price
+  value          Float     @default(0)
+  // all | dishes | categories
+  scope          String    @default("all")
+  dishIds        String[]  @default([])
+  categoryIds    String[]  @default([])
+  // empty = every branch / every day
+  branchIds      String[]  @default([])
+  daysOfWeek     Int[]     @default([])
+  // HH:mm in the restaurant's time zone; empty = all day
+  startTime      String?
+  endTime        String?
+  startsAt       DateTime?
+  endsAt         DateTime?
+  customerTags   String[]  @default([])
+  couponCode     String?
+  buyQuantity    Int?
+  getQuantity    Int?
+  minimumSpend   Float?
+  freeDishId     String?
+  priority       Int       @default(0)
+  stackable      Boolean   @default(false)
+  isActive       Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([organizationId, couponCode])
+  @@index([organizationId, isActive])
+}
+
+// ── Payments and customer-facing checkout ───────────────────────────────────
+
+// One attempt to collect money through a payment integration (QR, kiosk,
+// card terminal). The order or check is settled only from a verified
+// callback whose amount, currency and merchant match this row.
+model PaymentIntent {
+  counterCode     String @default("main")
+  id              String         @id @default(cuid())
+  organizationId  String
+  branchId        String
+  orderId         String
+  checkId         String?
+  // qr | kiosk | terminal
+  channel         String
+  adapter         String
+  environment     String
+  amount          Float
+  currency        String
+  merchantId      String         @default("")
+  // created | pending | succeeded | failed | cancelled | expired | needs_review
+  status          String         @default("created")
+  providerRef     String?
+  checkoutUrl     String?
+  // set when the money was applied to the order / check
+  settledAt       DateTime?
+  // none | pending | refunded | failed
+  refundStatus    String         @default("none")
+  refundedAmount  Float          @default(0)
+  refundRef       String?
+  failureReason   String?
+  // one-time token the hosted payment page and the guest use
+  accessTokenHash String
+  idempotencyKey  String
+  createdBy       String?
+  expiresAt       DateTime
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  events          PaymentEvent[]
+
+  @@unique([organizationId, idempotencyKey])
+  @@unique([adapter, providerRef])
+  @@index([orderId])
+  @@index([organizationId, status])
+}
+
+// Every callback received, verified or not (immutable).
+model PaymentEvent {
+  id              String         @id @default(cuid())
+  organizationId  String?
+  intentId        String?
+  adapter         String
+  providerEventId String
+  type            String
+  signatureValid  Boolean
+  outcome         String
+  payloadHash     String
+  createdAt       DateTime       @default(now())
+  intent          PaymentIntent? @relation(fields: [intentId], references: [id], onDelete: SetNull)
+
+  @@unique([adapter, providerEventId])
+  @@index([intentId])
+}
+
+// A paired customer display or self-service kiosk. Only a hash of its link
+// token is stored; revoking it stops the device at once.
+model CheckoutDevice {
+  id             String    @id @default(cuid())
+  organizationId String
+  branchId       String
+  // customer_display | kiosk
+  kind           String
+  name           String
+  tokenHash      String    @unique
+  isActive       Boolean   @default(true)
+  // customer display: the order the cashier is showing
+  showOrderId    String?
+  lastSeenAt     DateTime?
+  createdBy      String
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([organizationId, branchId])
+}
+
+// HR master data. Monetary values are decimal; approved payroll stores snapshots.
+model HrEmployee {
+  id String @id @default(cuid())
+  organizationId String
+  branchId String
+  code String
+  firstName String
+  lastName String
+  email String?
+  phone String?
+  address String?
+  nationalId String?
+  emergencyContact String?
+  joiningDate DateTime @db.Date
+  exitDate DateTime? @db.Date
+  employmentType String @default("full_time")
+  status String @default("active")
+  departmentId String?
+  designationId String?
+  salaryStructureId String?
+  basicSalary Decimal @default(0) @db.Decimal(15, 3)
+  biometricId String?
+  createdBy String
+  version Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  organization Organization @relation(fields: [organizationId], references: [id])
+  branch Branch @relation(fields: [branchId], references: [id])
+  records HrRecord[]
+  attendance HrAttendance[]
+  leaves HrLeaveRequest[]
+  payrollLines HrPayrollLine[]
+  @@unique([organizationId, code])
+  @@unique([organizationId, biometricId])
+  @@index([organizationId, branchId, status])
+}
+
+// Typed, validated HR registers share a workflow envelope. The service registry
+// validates each kind's payload and references before saving or approving it.
+model HrRecord {
+  id String @id @default(cuid())
+  organizationId String
+  branchId String
+  kind String
+  employeeId String?
+  title String
+  date DateTime @db.Date
+  endDate DateTime? @db.Date
+  amount Decimal @default(0) @db.Decimal(15, 3)
+  quantity Decimal @default(0) @db.Decimal(12, 2)
+  recoveredAmount Decimal @default(0) @db.Decimal(15, 3)
+  data Json @default("{}")
+  status String @default("draft")
+  createdBy String
+  approvedBy String?
+  approvedAt DateTime?
+  rejectionReason String?
+  version Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  organization Organization @relation(fields: [organizationId], references: [id])
+  employee HrEmployee? @relation(fields: [employeeId], references: [id])
+  @@index([organizationId, branchId, kind, status])
+  @@index([employeeId, date])
+}
+
+model HrAttendance {
+  id String @id @default(cuid())
+  organizationId String
+  branchId String
+  employeeId String
+  date DateTime @db.Date
+  checkIn DateTime?
+  checkOut DateTime?
+  status String
+  source String @default("manual")
+  notes String?
+  createdBy String
+  version Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  organization Organization @relation(fields: [organizationId], references: [id])
+  employee HrEmployee @relation(fields: [employeeId], references: [id])
+  @@unique([employeeId, date])
+  @@index([organizationId, branchId, date])
+}
+
+model HrLeaveRequest {
+  id String @id @default(cuid())
+  organizationId String
+  branchId String
+  employeeId String
+  leaveTypeId String
+  startDate DateTime @db.Date
+  endDate DateTime @db.Date
+  days Decimal @db.Decimal(8, 2)
+  reason String
+  status String @default("submitted")
+  createdBy String
+  approvedBy String?
+  approvedAt DateTime?
+  rejectionReason String?
+  version Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  organization Organization @relation(fields: [organizationId], references: [id])
+  employee HrEmployee @relation(fields: [employeeId], references: [id])
+  @@index([organizationId, branchId, status])
+  @@index([employeeId, startDate, endDate])
+}
+
+model HrPayrollRun {
+  inputHash String
+  id String @id @default(cuid())
+  organizationId String
+  branchId String
+  period String
+  status String @default("draft")
+  grossAmount Decimal @default(0) @db.Decimal(17, 3)
+  deductionAmount Decimal @default(0) @db.Decimal(17, 3)
+  netAmount Decimal @default(0) @db.Decimal(17, 3)
+  createdBy String
+  approvedBy String?
+  approvedAt DateTime?
+  journalEntryId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lines HrPayrollLine[]
+  @@unique([organizationId, branchId, period])
+}
+
+model HrPayrollLine {
+  id String @id @default(cuid())
+  runId String
+  employeeId String
+  employeeCode String
+  employeeName String
+  basicAmount Decimal @db.Decimal(15, 3)
+  allowanceAmount Decimal @db.Decimal(15, 3)
+  overtimeAmount Decimal @db.Decimal(15, 3)
+  deductionAmount Decimal @db.Decimal(15, 3)
+  netAmount Decimal @db.Decimal(15, 3)
+  paidAmount Decimal @default(0) @db.Decimal(15, 3)
+  breakdown Json
+  run HrPayrollRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  employee HrEmployee @relation(fields: [employeeId], references: [id])
+  payments HrPayrollPayment[]
+  @@unique([runId, employeeId])
+}
+
+model HrPayrollPayment {
+  id String @id @default(cuid())
+  lineId String
+  requestId String @unique
+  amount Decimal @db.Decimal(15, 3)
+  method String
+  reference String
+  paymentDate DateTime @db.Date
+  createdBy String
+  journalEntryId String
+  createdAt DateTime @default(now())
+  line HrPayrollLine @relation(fields: [lineId], references: [id])
+}
+
+model HrSettings {
+  organizationId String @id
+  workingDaysPerMonth Int @default(26)
+  hoursPerDay Decimal @default(8) @db.Decimal(5, 2)
+  overtimeMultiplier Decimal @default(1.5) @db.Decimal(5, 2)
+  salaryExpenseAccountId String?
+  salaryPayableAccountId String?
+  employeeReceivableAccountId String?
+  deductionPayableAccountId String?
+  updatedAt DateTime @updatedAt
+  organization Organization @relation(fields: [organizationId], references: [id])
+}
+
+model FreeDishItem {
+  id String @id @default(cuid())
+  organizationId String
+  organization Organization @relation(fields: [organizationId], references: [id])
+  name String @db.VarChar(80)
+  description String? @db.VarChar(200)
+  isActive Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  offers FreeDishQr[]
+  @@unique([organizationId, name])
+}
+
+model FreeDishQr {
+  id String @id @default(cuid())
+  organizationId String
+  organization Organization @relation(fields: [organizationId], references: [id])
+  branchId String
+  branch Branch @relation(fields: [branchId], references: [id])
+  sectionId String
+  section BranchSection @relation(fields: [sectionId], references: [id])
+  itemId String
+  item FreeDishItem @relation(fields: [itemId], references: [id])
+  name String @db.VarChar(120)
+  quantity Int @default(1)
+  publicToken String @unique
+  isActive Boolean @default(true)
+  voucherValidDays Int?
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  submissions FreeDishSubmission[]
+  @@index([organizationId, branchId, createdAt])
+}
+
+model FreeDishSubmission {
+  id String @id @default(cuid())
+  organizationId String
+  organization Organization @relation(fields: [organizationId], references: [id])
+  qrId String
+  qr FreeDishQr @relation(fields: [qrId], references: [id])
+  branchId String
+  branch Branch @relation(fields: [branchId], references: [id])
+  sectionId String
+  section BranchSection @relation(fields: [sectionId], references: [id])
+  fullName String @db.VarChar(120)
+  country String @db.Char(2)
+  normalizedWhatsApp String
+  normalizedEmail String @db.VarChar(160)
+  dateOfBirth DateTime @db.Date
+  voucherCode String @unique
+  status String @default("issued")
+  expiresAt DateTime?
+  redeemedAt DateTime?
+  redeemedBy String?
+  itemName String
+  quantity Int
+  branchName String
+  sectionName String
+  createdAt DateTime @default(now())
+  @@unique([qrId, normalizedWhatsApp])
+  @@unique([qrId, normalizedEmail])
+  @@index([organizationId, branchId, createdAt])
+  @@index([organizationId, status, expiresAt])
+}
+
+model FreeDishRateLimit {
+  key String @id
+  attempts Int @default(1)
+  expiresAt DateTime
+  @@index([expiresAt])
+}
+
+// Cloud reservation and local transaction receipt are deliberately separate.
+// A reservation never expires on a timer: the PC may have committed while its
+// acknowledgment was lost. Recovery resolves it under the local checkout lock.
+model BranchWalletReservation {
+  id String @id
+  nodeId String
+  organizationId String
+  branchId String
+  orderId String
+  reference String
+  digest String
+  payload Json
+  state String @default("reserved")
+  sequence BigInt?
+  resolvedBy String?
+  resolutionReason String?
+  resolvedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([nodeId, state, createdAt])
+  @@index([organizationId, reference, state])
+}
+
+model BranchWalletReceipt {
+  id String @id
+  organizationId String
+  branchId String
+  orderId String
+  reference String
+  payload Json
+  refunded Boolean @default(false)
+  acknowledged Boolean @default(false)
+  createdAt DateTime @default(now())
+  @@index([acknowledged, createdAt])
+  @@index([orderId])
+}
+
+model BranchStockTransfer {
+  id String @id
+  organizationId String
+  sourceBranchId String
+  destinationBranchId String
+  sourceNodeId String
+  destinationNodeId String
+  actorId String
+  digest String
+  items Json
+  dispatch Json?
+  state String @default("queued")
+  error String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([organizationId, state, createdAt])
+}
+
+model BranchTransferReceipt {
+  id String @id
+  organizationId String
+  branchId String
+  transferId String
+  digest String
+  result Json
+  createdAt DateTime @default(now())
 }

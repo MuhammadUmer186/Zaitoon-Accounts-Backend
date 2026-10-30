@@ -1,12 +1,23 @@
+import { roundMoney as regionalRoundMoney } from '../utils/money'
+
+import { moneyTolerance as regionalMoneyTolerance } from '../utils/money'
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
-import { sendGeneralLedgerCsv, sendGeneralLedgerExcel, sendGeneralLedgerPdf, GLReportData, GLReportAccount, GLReportLine } from '../utils/glReport'
+import { withReportingScope } from '../middleware/reportScope'
+import { withReportFormat } from '../utils/reportFormat'
+import { requireModule, requirePermission } from '../middleware/authorize'
+import { ProReport, ReportRow, ReportColumn, sendProReport, reportScope, periodLabelFor, plural, round2 } from '../utils/proReport'
+import { todayInZone, formatMoney } from '../utils/reportFormat'
+import { netByAccount } from '../services/financialStatements'
 import { getEverStockedKeys, isNeverStocked } from '../utils/stock'
 
 const router = Router()
 
 router.use(authenticate)
+router.use(withReportingScope)
+router.use(withReportFormat)
+router.use(requireModule('reports'))
 
 // GET /reports/dashboard
 router.get('/dashboard', async (req: Request, res: Response) => {
@@ -14,14 +25,14 @@ router.get('/dashboard', async (req: Request, res: Response) => {
   const orgId = req.user.organizationId
 
   const now = new Date()
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const today = todayInZone()
   const endOfToday = new Date(today)
-  endOfToday.setHours(23, 59, 59, 999)
+  endOfToday.setUTCHours(23, 59, 59, 999)
 
   const startOfWeek = new Date(today)
-  startOfWeek.setDate(today.getDate() - today.getDay())
+  startOfWeek.setUTCDate(today.getUTCDate() - today.getUTCDay())
 
-  const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1)
+  const startOfMonth = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1))
 
   const branchFilter = branchId ? { branchId } : {}
   const orgFilter = { organizationId: orgId }
@@ -188,7 +199,7 @@ router.get('/dashboard', async (req: Request, res: Response) => {
 })
 
 // GET /reports/financial
-router.get('/financial', async (req: Request, res: Response) => {
+router.get('/financial', requirePermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate } = req.query as Record<string, string>
   const orgId = req.user.organizationId
 
@@ -267,25 +278,25 @@ function getRangeBounds(range: DashboardRange, today: Date, endOfToday: Date): {
       return { start: today, end: endOfToday, label: 'Today' }
     case 'yesterday': {
       const start = new Date(today)
-      start.setDate(today.getDate() - 1)
+      start.setUTCDate(today.getUTCDate() - 1)
       const end = new Date(start)
-      end.setHours(23, 59, 59, 999)
+      end.setUTCHours(23, 59, 59, 999)
       return { start, end, label: 'Yesterday' }
     }
     case 'this_week': {
       const start = new Date(today)
-      start.setDate(today.getDate() - today.getDay())
+      start.setUTCDate(today.getUTCDate() - today.getUTCDay())
       return { start, end: endOfToday, label: 'This Week' }
     }
     case 'this_year': {
-      const start = new Date(today.getFullYear(), 0, 1)
+      const start = new Date(Date.UTC(today.getUTCFullYear(), 0, 1))
       return { start, end: endOfToday, label: 'This Year' }
     }
     case 'overall':
       return { start: null, end: endOfToday, label: 'Overall' }
     case 'this_month':
     default: {
-      const start = new Date(today.getFullYear(), today.getMonth(), 1)
+      const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1))
       return { start, end: endOfToday, label: 'This Month' }
     }
   }
@@ -297,39 +308,39 @@ function getPreviousRangeBounds(range: DashboardRange, today: Date): { start: Da
   switch (range) {
     case 'today': {
       const start = new Date(today)
-      start.setDate(today.getDate() - 1)
+      start.setUTCDate(today.getUTCDate() - 1)
       const end = new Date(start)
-      end.setHours(23, 59, 59, 999)
+      end.setUTCHours(23, 59, 59, 999)
       return { start, end }
     }
     case 'yesterday': {
       const start = new Date(today)
-      start.setDate(today.getDate() - 2)
+      start.setUTCDate(today.getUTCDate() - 2)
       const end = new Date(start)
-      end.setHours(23, 59, 59, 999)
+      end.setUTCHours(23, 59, 59, 999)
       return { start, end }
     }
     case 'this_week': {
       const currentStart = new Date(today)
-      currentStart.setDate(today.getDate() - today.getDay())
+      currentStart.setUTCDate(today.getUTCDate() - today.getUTCDay())
       const start = new Date(currentStart)
-      start.setDate(currentStart.getDate() - 7)
+      start.setUTCDate(currentStart.getUTCDate() - 7)
       const end = new Date(currentStart)
-      end.setDate(currentStart.getDate() - 1)
-      end.setHours(23, 59, 59, 999)
+      end.setUTCDate(currentStart.getUTCDate() - 1)
+      end.setUTCHours(23, 59, 59, 999)
       return { start, end }
     }
     case 'this_year': {
-      const start = new Date(today.getFullYear() - 1, 0, 1)
-      const end = new Date(today.getFullYear() - 1, 11, 31, 23, 59, 59, 999)
+      const start = new Date(Date.UTC(today.getUTCFullYear() - 1, 0, 1))
+      const end = new Date(Date.UTC(today.getUTCFullYear() - 1, 11, 31, 23, 59, 59, 999))
       return { start, end }
     }
     case 'overall':
       return null
     case 'this_month':
     default: {
-      const start = new Date(today.getFullYear(), today.getMonth() - 1, 1)
-      const end = new Date(today.getFullYear(), today.getMonth(), 0, 23, 59, 59, 999)
+      const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - 1, 1))
+      const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 0, 23, 59, 59, 999))
       return { start, end }
     }
   }
@@ -342,9 +353,9 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   const selectedRange = range as DashboardRange
 
   const now = new Date()
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const today = todayInZone()
   const endOfToday = new Date(today)
-  endOfToday.setHours(23, 59, 59, 999)
+  endOfToday.setUTCHours(23, 59, 59, 999)
 
   const { start: rangeStart, end: rangeEnd, label: rangeLabel } = getRangeBounds(selectedRange, today, endOfToday)
   const dateFilter = { ...(rangeStart && { gte: rangeStart }), lte: rangeEnd }
@@ -377,7 +388,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
   })
 
   const branchTargets = await prisma.branchTarget.findMany({
-    where: { ...orgFilter, year: today.getFullYear(), month: today.getMonth() + 1, ...(branchId ? { branchId } : {}) },
+    where: { ...orgFilter, year: today.getUTCFullYear(), month: today.getUTCMonth() + 1, ...(branchId ? { branchId } : {}) },
   })
   const targetMap: Record<string, number> = {}
   for (const t of branchTargets) targetMap[t.branchId] = t.salesTarget
@@ -389,7 +400,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     const spanDays = Math.floor((rangeEnd.getTime() - rangeStart.getTime()) / 86400000) + 1
     if (spanDays > MAX_TREND_DAYS) {
       trendStart = new Date(rangeEnd)
-      trendStart.setDate(rangeEnd.getDate() - MAX_TREND_DAYS + 1)
+      trendStart.setUTCDate(rangeEnd.getUTCDate() - MAX_TREND_DAYS + 1)
     } else {
       trendStart = rangeStart
     }
@@ -397,7 +408,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     // 'overall' has no lower bound for totals, but the trend chart shows a
     // recent trailing window rather than querying literally all-time rows.
     trendStart = new Date(rangeEnd)
-    trendStart.setDate(rangeEnd.getDate() - MAX_TREND_DAYS + 1)
+    trendStart.setUTCDate(rangeEnd.getUTCDate() - MAX_TREND_DAYS + 1)
   }
 
   const trendSales = await prisma.dailySale.findMany({
@@ -422,7 +433,7 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     branches.map(async (branch) => {
       const bf = { branchId: branch.id }
 
-      const [salesAgg, expAgg, billsAgg, prevSalesAgg] = await Promise.all([
+      const [salesAgg, expAgg, billsAgg, prevSalesAgg, recipeAgg] = await Promise.all([
         prisma.dailySale.aggregate({
           where: { ...orgFilter, ...bf, ...notVoid, saleDate: dateFilter },
           _sum: {
@@ -450,6 +461,11 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
               _sum: { netAmount: true },
             })
           : Promise.resolve({ _sum: { netAmount: 0 } }),
+        // Recipe cost of paid POS / QR orders (automatic "orders" daily sales)
+        prisma.dailySale.aggregate({
+          where: { ...orgFilter, ...bf, ...notVoid, source: 'orders', costOfSales: { gt: 0 }, saleDate: dateFilter },
+          _sum: { costOfSales: true, netAmount: true, vatAmount: true },
+        }),
       ])
 
       const totalSales = salesAgg._sum.netAmount ?? 0
@@ -457,7 +473,13 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
       const grossProfit = totalSales - totalExpenses
       const prevSales = prevSalesAgg._sum.netAmount ?? 0
       const salesGrowth = prevSales > 0 ? ((totalSales - prevSales) / prevSales) * 100 : 0
-      const foodCostPct = totalSales > 0 ? (totalExpenses / totalSales) * 100 : 0
+      // Food cost %: from recipes when dishes have them (recipe cost ÷ net
+      // food sales excl. tax); otherwise the purchases-based estimate
+      const recipeCost = recipeAgg._sum.costOfSales ?? 0
+      const recipeNetSales = (recipeAgg._sum.netAmount ?? 0) - (recipeAgg._sum.vatAmount ?? 0)
+      const foodCostPct = recipeCost > 0 && recipeNetSales > 0
+        ? (recipeCost / recipeNetSales) * 100
+        : totalSales > 0 ? (totalExpenses / totalSales) * 100 : 0
 
       return {
         branchId: branch.id,
@@ -470,6 +492,8 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
         prevPeriodSales: prevSales,
         salesGrowth: Math.round(salesGrowth * 10) / 10,
         foodCostPct: Math.round(foodCostPct * 10) / 10,
+        foodCostSource: recipeCost > 0 ? 'recipes' : 'purchases',
+        recipeFoodCost: regionalRoundMoney(recipeCost),
         avgPerDaySale: totalSales / daysInPeriod,
         saleCount: salesAgg._count,
         paymentBreakdown: {
@@ -589,21 +613,21 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
 
     if (compare === 'week') {
       currentStart = new Date(today)
-      currentStart.setDate(today.getDate() - 6)
+      currentStart.setUTCDate(today.getUTCDate() - 6)
       currentEnd = endOfToday
       previousStart = new Date(today)
-      previousStart.setDate(today.getDate() - 13)
+      previousStart.setUTCDate(today.getUTCDate() - 13)
       previousEnd = new Date(today)
-      previousEnd.setDate(today.getDate() - 7)
-      previousEnd.setHours(23, 59, 59, 999)
+      previousEnd.setUTCDate(today.getUTCDate() - 7)
+      previousEnd.setUTCHours(23, 59, 59, 999)
       currentLabel = 'This Week'
       previousLabel = 'Last Week'
     } else {
-      currentStart = new Date(today.getFullYear(), today.getMonth(), 1)
+      currentStart = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1))
       currentEnd = endOfToday
-      const daysElapsed = today.getDate() // 1-based day of month, e.g. 15
-      previousStart = new Date(today.getFullYear(), today.getMonth() - 1, 1)
-      previousEnd = new Date(today.getFullYear(), today.getMonth() - 1, daysElapsed, 23, 59, 59, 999)
+      const daysElapsed = today.getUTCDate() // 1-based day of month, e.g. 15
+      previousStart = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - 1, 1))
+      previousEnd = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - 1, daysElapsed, 23, 59, 59, 999))
       currentLabel = 'This Month (to date)'
       previousLabel = 'Last Month (same days)'
     }
@@ -634,14 +658,14 @@ router.get('/dashboard-v2', async (req: Request, res: Response) => {
     const trend = await Promise.all(
       Array.from({ length: periodLen }, (_, i) => i).map(async (i) => {
         const cDay = new Date(currentStart)
-        cDay.setDate(currentStart.getDate() + i)
+        cDay.setUTCDate(currentStart.getUTCDate() + i)
         const cDayEnd = new Date(cDay)
-        cDayEnd.setHours(23, 59, 59, 999)
+        cDayEnd.setUTCHours(23, 59, 59, 999)
 
         const pDay = new Date(previousStart)
-        pDay.setDate(previousStart.getDate() + i)
+        pDay.setUTCDate(previousStart.getUTCDate() + i)
         const pDayEnd = new Date(pDay)
-        pDayEnd.setHours(23, 59, 59, 999)
+        pDayEnd.setUTCHours(23, 59, 59, 999)
 
         const [curr, prev] = await Promise.all([
           sumSalesFor(cDay, cDayEnd, branchFilter),
@@ -695,9 +719,10 @@ router.get('/inventory-health', async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   const orgId = req.user.organizationId
   const now = new Date()
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1)
+  const businessToday = todayInZone()
+  const startOfMonth = new Date(Date.UTC(businessToday.getUTCFullYear(), businessToday.getUTCMonth(), 1))
   const last30Days = new Date(now)
-  last30Days.setDate(now.getDate() - 30)
+  last30Days.setUTCDate(now.getUTCDate() - 30)
 
   const branchFilter = branchId ? { branchId } : {}
 
@@ -865,98 +890,87 @@ router.get('/sales', async (req: Request, res: Response) => {
   })
 })
 
-// GET /reports/general-ledger — the full posted ledger (Assets, Liabilities,
-// Revenue, Expenses — Equity is excluded from GL reporting), viewable on
-// screen (format omitted/json) or exported as csv / excel / pdf for
-// printing and record-keeping.
-router.get('/general-ledger', async (req: Request, res: Response) => {
+// GET /reports/general-ledger — every posted line per account with its
+// opening balance, running balance and closing balance, in the same report
+// format (screen / PDF / Excel / CSV) as the rest of the catalogue.
+router.get('/general-ledger', requirePermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, accountId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
+  const day = (v?: string) => (v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? new Date(`${v}T00:00:00.000Z`) : undefined)
+  const from = day(fromDate)
+  const to = day(toDate)
 
-  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
-  if (branchId) entryWhere.branchId = branchId
-  if (fromDate || toDate) {
-    entryWhere.entryDate = {
-      ...(fromDate && { gte: new Date(fromDate) }),
-      ...(toDate && { lte: new Date(toDate) }),
-    }
-  }
-
-  const [accounts, branch] = await Promise.all([
-    prisma.account.findMany({
-      where: {
-        organizationId: orgId,
-        status: 'ACTIVE',
-        ...(accountId ? { id: accountId } : {}),
-      },
-      orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
-    }),
-    branchId ? prisma.branch.findUnique({ where: { id: branchId }, select: { name: true } }) : Promise.resolve(null),
+  const [accounts, opening] = await Promise.all([
+    prisma.account.findMany({ where: { organizationId: orgId, ...(accountId ? { id: accountId } : {}) }, orderBy: { code: 'asc' } }),
+    from ? netByAccount(orgId, { to: new Date(from.getTime() - 86_400_000) }, branchId || undefined) : Promise.resolve(new Map<string, { debit: number; credit: number }>()),
   ])
-
   const lines = await prisma.journalLine.findMany({
-    where: { accountId: { in: accounts.map((a) => a.id) }, journalEntry: entryWhere },
-    include: {
-      journalEntry: {
-        select: { entryNo: true, entryDate: true, description: true, branch: { select: { name: true } } },
-      },
+    where: {
+      accountId: { in: accounts.map((a) => a.id) },
+      journalEntry: { organizationId: orgId, status: 'posted', ...(branchId && { branchId }), ...((from || to) && { entryDate: { ...(from && { gte: from }), ...(to && { lt: new Date(to.getTime() + 86_400_000) }) } }) },
     },
+    include: { journalEntry: { select: { entryNo: true, entryDate: true, description: true, branch: { select: { name: true } } } } },
     orderBy: [{ journalEntry: { entryDate: 'asc' } }, { journalEntry: { createdAt: 'asc' } }],
   })
-
   const byAccount = new Map<string, typeof lines>()
   for (const l of lines) {
     if (!byAccount.has(l.accountId)) byAccount.set(l.accountId, [])
     byAccount.get(l.accountId)!.push(l)
   }
 
-  let grandDebit = 0
-  let grandCredit = 0
-
-  const accountSections: GLReportAccount[] = accounts
-    .map((acc) => {
-      const accLines = byAccount.get(acc.id) ?? []
-      let running = 0
-      const rows: GLReportLine[] = accLines.map((l) => {
-        const debit = Number(l.debitAmount)
-        const credit = Number(l.creditAmount)
-        running += acc.normalBalance === 'DEBIT' ? debit - credit : credit - debit
-        grandDebit += debit
-        grandCredit += credit
-        return {
-          date: l.journalEntry.entryDate,
-          entryNo: l.journalEntry.entryNo,
-          description: l.description || l.journalEntry.description,
-          branch: l.journalEntry.branch?.name ?? null,
-          debit,
-          credit,
-          balance: running,
-        }
-      })
-      return {
-        accountId: acc.id,
-        code: acc.code,
-        name: acc.name,
-        accountType: acc.accountClass,
-        lines: rows,
-        closingBalance: running,
-      }
-    })
-    .filter((s) => !!accountId || s.lines.length > 0)
-
-  const report: GLReportData = {
-    generatedAt: new Date().toISOString(),
-    branchName: branch?.name ?? null,
-    fromDate: fromDate || null,
-    toDate: toDate || null,
-    accounts: accountSections,
-    totals: { debit: grandDebit, credit: grandCredit },
+  const showBranch = !branchId && !res.locals.singleBranch
+  const rows: ReportRow[] = []
+  let grandDebit = 0, grandCredit = 0, shown = 0
+  const legacyAccounts: Record<string, unknown>[] = []
+  for (const acc of accounts) {
+    const accLines = byAccount.get(acc.id) ?? []
+    const o = opening.get(acc.id)
+    const sign = acc.normalBalance === 'DEBIT' ? 1 : -1
+    const openingBalance = round2(o ? sign * (o.debit - o.credit) : 0)
+    if (!accountId && accLines.length === 0 && Math.abs(openingBalance) < 0.005) continue
+    shown++
+    rows.push({ description: `${acc.code} — ${acc.name}`, _style: 'heading' })
+    rows.push({ description: 'Opening balance', balance: openingBalance, _style: 'indent' })
+    let running = openingBalance, accDebit = 0, accCredit = 0
+    const legacyLines = []
+    for (const l of accLines) {
+      const debit = Number(l.debitAmount), credit = Number(l.creditAmount)
+      running = round2(running + sign * (debit - credit))
+      accDebit += debit; accCredit += credit
+      rows.push({ date: l.journalEntry.entryDate, entryNo: l.journalEntry.entryNo, description: l.description || l.journalEntry.description, branch: l.journalEntry.branch?.name ?? '', debit, credit, balance: running })
+      legacyLines.push({ date: l.journalEntry.entryDate, entryNo: l.journalEntry.entryNo, description: l.description || l.journalEntry.description, branch: l.journalEntry.branch?.name ?? null, debit, credit, balance: running })
+    }
+    grandDebit += accDebit; grandCredit += accCredit
+    rows.push({ description: `Closing balance — ${acc.code} (period Dr ${formatMoney(accDebit)} · Cr ${formatMoney(accCredit)})`, balance: running, _style: 'subtotal' })
+    legacyAccounts.push({ accountId: acc.id, code: acc.code, name: acc.name, accountType: acc.accountClass, openingBalance, lines: legacyLines, closingBalance: running })
   }
 
-  if (format === 'csv') { sendGeneralLedgerCsv(res, report); return }
-  if (format === 'excel') { await sendGeneralLedgerExcel(res, report); return }
-  if (format === 'pdf') { sendGeneralLedgerPdf(res, report); return }
-  res.json(report)
+  const scope = await reportScope(prisma, orgId, branchId || undefined)
+  const period = periodLabelFor(fromDate, toDate)
+  const report: ProReport = {
+    key: 'general-ledger', eyebrow: 'General Ledger', headline: 'General ledger', ...scope, periodLabel: period, generatedAt: new Date().toISOString(),
+    summaryLine: `Period: ${period}  |  ${plural(shown, 'account')}  |  ${plural(lines.length, 'posting')}`,
+    kpis: [
+      { label: 'Accounts', value: shown, format: 'integer', hint: accountId ? 'Selected account' : 'With activity or a balance' },
+      { label: 'Postings', value: lines.length, format: 'integer', hint: 'Posted journal lines' },
+      { label: 'Total debits', value: round2(grandDebit), hint: 'In the period' },
+      { label: 'Total credits', value: round2(grandCredit), hint: Math.abs(grandDebit - grandCredit) < regionalMoneyTolerance() || accountId ? 'In the period' : 'Does not equal debits — check filters', tone: 'dark' },
+    ],
+    sections: [{
+      type: 'table', id: 'ledger', title: 'Ledger', subtitle: 'Each account opens with its balance at the start of the period; balances are on the account’s normal side', register: true, primary: true,
+      columns: [
+        { key: 'date', label: 'Date', format: 'date', width: 0.9 }, { key: 'entryNo', label: 'Entry no.', format: 'code', width: 1 },
+        { key: 'description', label: 'Description', width: 3 },
+        ...(showBranch ? [{ key: 'branch', label: 'Branch', width: 1.1 } as ReportColumn] : []),
+        { key: 'debit', label: 'Debit', format: 'money' }, { key: 'credit', label: 'Credit', format: 'money' },
+        { key: 'balance', label: 'Balance', format: 'money', sum: false },
+      ],
+      rows,
+      totals: { date: 'TOTAL', debit: round2(grandDebit), credit: round2(grandCredit) },
+      emptyMessage: 'No postings for the selected filters',
+    }],
+  }
+  await sendProReport(res, format, report, { generatedAt: report.generatedAt, branchName: branchId ? scope.scopeLabel : null, fromDate: fromDate || null, toDate: toDate || null, accounts: legacyAccounts, totals: { debit: grandDebit, credit: grandCredit } })
 })
 
 export default router

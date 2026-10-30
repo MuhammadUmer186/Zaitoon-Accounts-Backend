@@ -1,9 +1,11 @@
+import { updateSchema } from '../utils/updateSchema'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
 import { AppError } from '../middleware/error'
+import { validateUserAccess } from '../services/userAccess'
 import { getUserPermissions } from '../utils/permissions'
 
 const router = Router()
@@ -11,6 +13,19 @@ const router = Router()
 router.use(authenticate)
 router.use(['/roles', '/permissions'], requirePermission('can_manage_roles'))
 router.use('/users', requirePermission('can_manage_users'))
+// Every nested user operation resolves the tenant-owned parent first.
+router.param('userId', async (req, _res, next, id) => {
+  try {
+    if (!await prisma.user.count({ where: { id, organizationId: req.user.organizationId } })) throw new AppError('User not found', 404, 'NOT_FOUND')
+    next()
+  } catch (e) { next(e) }
+})
+router.param('accessId', async (req, _res, next, id) => {
+  try {
+    if (!await prisma.userBranchAccess.count({ where: { id, userId: req.params.userId, organizationId: req.user.organizationId, branch: { organizationId: req.user.organizationId } } })) throw new AppError('Branch access not found', 404, 'NOT_FOUND')
+    next()
+  } catch (e) { next(e) }
+})
 
 const roleSchema = z.object({
   name: z.string().min(1),
@@ -58,7 +73,7 @@ router.get('/roles/:id', async (req: Request, res: Response) => {
 // PUT /acl/roles/:id
 router.put('/roles/:id', async (req: Request, res: Response) => {
   const id = req.params['id'] as string
-  const body = roleSchema.partial().parse(req.body)
+  const body = updateSchema(roleSchema).parse(req.body)
 
   const role = await prisma.role.findFirst({
     where: { id, organizationId: req.user.organizationId },
@@ -98,18 +113,12 @@ router.put('/roles/:id/permissions', async (req: Request, res: Response) => {
   })
   if (!role) throw new AppError('Role not found', 404, 'NOT_FOUND')
 
-  await prisma.rolePermission.deleteMany({ where: { roleId: id } })
-
-  if (permissionIds.length > 0) {
-    await prisma.rolePermission.createMany({
-      data: permissionIds.map((permissionId) => ({ roleId: id, permissionId })),
-      skipDuplicates: true,
-    })
-  }
-
-  const updated = await prisma.role.findUnique({
-    where: { id },
-    include: { permissions: { include: { permission: true } } },
+  const updated = await prisma.$transaction(async tx => {
+    const ids = [...new Set(permissionIds)]
+    if (await tx.permission.count({ where: { id: { in: ids } } }) !== ids.length) throw new AppError('Unknown permission', 400, 'VALIDATION_ERROR')
+    await tx.rolePermission.deleteMany({ where: { roleId: id } })
+    if (ids.length) await tx.rolePermission.createMany({ data: ids.map(permissionId => ({ roleId: id, permissionId })) })
+    return tx.role.findUnique({ where: { id }, include: { permissions: { include: { permission: true } } } })
   })
   res.json(updated)
 })
@@ -133,7 +142,7 @@ router.get('/permissions', async (_req: Request, res: Response) => {
 router.get('/users/:userId/roles', async (req: Request, res: Response) => {
   const userId = req.params['userId'] as string
   const userRoles = await prisma.userRole.findMany({
-    where: { userId },
+    where: { userId, role: { organizationId: req.user.organizationId } },
     include: { role: { include: { permissions: { include: { permission: true } } } } },
   })
   const roleData: unknown[] = []
@@ -152,6 +161,9 @@ router.post('/users/:userId/roles', async (req: Request, res: Response) => {
   })
   if (!role) throw new AppError('Role not found', 404, 'NOT_FOUND')
 
+  const current = await prisma.userRole.findMany({ where: { userId }, select: { roleId: true } })
+  const access = await prisma.userBranchAccess.findMany({ where: { userId, organizationId: req.user.organizationId }, select: { branchId: true } })
+  await validateUserAccess(prisma, req.user.organizationId, [...current.map(r => r.roleId), role.id], access.map(a => a.branchId))
   await prisma.userRole.upsert({
     where: { userId_roleId: { userId, roleId: roleId as string } },
     create: { userId, roleId: roleId as string },
@@ -165,6 +177,7 @@ router.post('/users/:userId/roles', async (req: Request, res: Response) => {
 router.delete('/users/:userId/roles/:roleId', async (req: Request, res: Response) => {
   const userId = req.params['userId'] as string
   const roleId = req.params['roleId'] as string
+  if (!await prisma.role.count({ where: { id: roleId, organizationId: req.user.organizationId } })) throw new AppError('Role not found', 404, 'NOT_FOUND')
   await prisma.userRole.deleteMany({ where: { userId, roleId } })
   res.json({ message: 'Role removed' })
 })
@@ -190,6 +203,9 @@ router.post('/users/:userId/branches', async (req: Request, res: Response) => {
   })
   if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
 
+  const roles = await prisma.userRole.findMany({ where: { userId }, select: { roleId: true } })
+  const current = await prisma.userBranchAccess.findMany({ where: { userId, organizationId: req.user.organizationId }, select: { branchId: true } })
+  await validateUserAccess(prisma, req.user.organizationId, roles.map(r => r.roleId), [...current.map(a => a.branchId), branch.id])
   const access = await prisma.userBranchAccess.upsert({
     where: { userId_branchId: { userId, branchId: branchId as string } },
     create: {

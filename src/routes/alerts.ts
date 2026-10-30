@@ -1,11 +1,14 @@
+import { currencyDecimals } from '../utils/regions'
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requireModule } from '../middleware/authorize'
 import { getEverStockedKeys, isNeverStocked } from '../utils/stock'
 
 const router = Router()
 
 router.use(authenticate)
+router.use(requireModule('alerts'))
 
 type AlertLevel = 'critical' | 'warning' | 'good' | 'info'
 
@@ -31,8 +34,9 @@ router.get('/', async (req: Request, res: Response) => {
 
   const org = await prisma.organization.findUnique({
     where: { id: orgId },
-    select: { lowStockThreshold: true },
+    select: { lowStockThreshold: true, currency: true },
   })
+  const currency = org?.currency ?? 'PKR'
   const globalThreshold = org?.lowStockThreshold ?? null
 
   // ── Overdue supplier bills ────────────────────────────────────────────────
@@ -55,7 +59,7 @@ router.get('/', async (req: Request, res: Response) => {
       module: 'bills',
       branchId: bill.branch.id,
       branchName: bill.branch.name,
-      message: `${bill.supplier.name} bill ${bill.billNo} overdue by ${daysOverdue} day${daysOverdue !== 1 ? 's' : ''} — SAR ${bill.balanceDue.toFixed(2)}`,
+      message: `${bill.supplier.name} bill ${bill.billNo} overdue by ${daysOverdue} day${daysOverdue !== 1 ? 's' : ''} — ${currency} ${bill.balanceDue.toFixed(currencyDecimals(currency))}`,
       createdAt: bill.dueDate.toISOString(),
       link: '/suppliers',
     })
@@ -86,7 +90,7 @@ router.get('/', async (req: Request, res: Response) => {
       module: 'inventory',
       branchId: st.branch.id,
       branchName: st.branch.name,
-      message: `${st.item.name} at ${st.branch.name} is ${critical ? 'critically low' : 'below threshold'} — ${st.quantityOnHand} ${st.item.unit} remaining (alert threshold ${threshold})`,
+      message: `${st.item.name} at ${res.locals.singleBranch ? res.locals.restaurantName : st.branch.name} is ${critical ? 'critically low' : 'below threshold'} — ${st.quantityOnHand} ${st.item.unit} remaining (alert threshold ${threshold})`,
       createdAt: st.lastUpdated.toISOString(),
       link: '/inventory',
     })
@@ -114,7 +118,7 @@ router.get('/', async (req: Request, res: Response) => {
       module: 'cash_closing',
       branchId: c.branch.id,
       branchName: c.branch.name,
-      message: `Cash closing ${c.closingNo} at ${c.branch.name} is ${c.differenceType === 'short' ? 'short' : 'in excess'} by SAR ${Math.abs(c.difference).toFixed(2)}`,
+      message: `Cash closing ${c.closingNo} at ${res.locals.singleBranch ? res.locals.restaurantName : c.branch.name} is ${c.differenceType === 'short' ? 'short' : 'in excess'} by ${currency} ${Math.abs(c.difference).toFixed(currencyDecimals(currency))}`,
       createdAt: c.closingDate.toISOString(),
       link: '/cash-closing',
     })
@@ -135,7 +139,7 @@ router.get('/', async (req: Request, res: Response) => {
       module: 'purchase_orders',
       branchId: po.branch.id,
       branchName: po.branch.name,
-      message: `Purchase order ${po.poNo} (${po.items.length} item${po.items.length === 1 ? '' : 's'}) at ${po.branch.name} awaiting approval${ageDays > 0 ? ` (${ageDays}d)` : ''}`,
+      message: `Purchase order ${po.poNo} (${po.items.length} item${po.items.length === 1 ? '' : 's'}) at ${res.locals.singleBranch ? res.locals.restaurantName : po.branch.name} awaiting approval${ageDays > 0 ? ` (${ageDays}d)` : ''}`,
       createdAt: (po.submittedAt ?? po.createdAt).toISOString(),
       link: '/purchase-orders',
     })

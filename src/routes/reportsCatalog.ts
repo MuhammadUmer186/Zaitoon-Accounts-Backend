@@ -1,6 +1,14 @@
+import { moneyTolerance as regionalMoneyTolerance } from '../utils/money'
 import { Router, Request, Response } from 'express'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { withReportingScope } from '../middleware/reportScope'
+import { withReportFormat, momentRange, formatPercent, formatDate, formatMoney, formatNumber, tax, todayInZone } from '../utils/reportFormat'
+import {
+  StatementAccount, PnlGroup, PositionLine, CashFlowLine, statementAccounts, netByAccount, pnlGroup, priorPeriod, dayBefore,
+  financialPosition, cashFlows,
+} from '../services/financialStatements'
+import { requireModule, requirePermission } from '../middleware/authorize'
 import { fiscalYearStartFor } from '../utils/fiscalYear'
 import {
   ProReport, ReportRow, ReportSection, ReportColumn, sendProReport, reportScope, periodLabelFor,
@@ -20,16 +28,24 @@ import {
 
 const router = Router()
 router.use(authenticate)
+router.use(withReportingScope)
+router.use(withReportFormat)
+router.use(requireModule('reports'))
 
+// Calendar-date fields (sale date, expense date, entry date): inclusive of
+// the whole last day
 function dateRangeFilter(fromDate?: string, toDate?: string) {
   if (!fromDate && !toDate) return undefined
   return {
     ...(fromDate && { gte: new Date(fromDate) }),
-    ...(toDate && { lte: new Date(toDate) }),
+    ...(toDate && { lt: new Date(new Date(toDate).getTime() + 86_400_000) }),
   }
 }
 
 const asOfLabel = (toDate?: string) => (toDate ? toDate : new Date().toISOString().slice(0, 10))
+
+// an approved bill that has not been paid yet
+const BILL_STATUS = { approved: 'Unpaid' }
 
 const sum = <T>(rows: T[], pick: (r: T) => number) => round2(rows.reduce((s, r) => s + (pick(r) || 0), 0))
 
@@ -126,7 +142,7 @@ router.get('/daily-sales', async (req: Request, res: Response) => {
         { key: 'month', label: 'Month' }, { key: 'count', label: 'Sales', format: 'integer' },
         { key: 'cash', label: 'Cash', format: 'money' }, { key: 'card', label: 'Card', format: 'money' },
         { key: 'delivery', label: 'Delivery', format: 'money' }, { key: 'other', label: 'Transfer / Other', format: 'money' },
-        { key: 'vat', label: 'VAT', format: 'money' }, { key: 'net', label: 'Net sales', format: 'money' },
+        { key: 'vat', label: tax(), format: 'money' }, { key: 'net', label: 'Net sales', format: 'money' },
       ],
       rows: monthly,
       totals: totalsOf(monthly, 'TOTAL', ['count', ...moneyKeys], 'month'),
@@ -141,7 +157,7 @@ router.get('/daily-sales', async (req: Request, res: Response) => {
       type: 'table' as const, id: 'branches', title: 'Branch summary', subtitle: 'Ranked by net sales',
       columns: [
         { key: 'branch', label: 'Branch' }, { key: 'count', label: 'Sales', format: 'integer' as const },
-        { key: 'vat', label: 'VAT', format: 'money' as const }, { key: 'net', label: 'Net sales', format: 'money' as const },
+        { key: 'vat', label: tax(), format: 'money' as const }, { key: 'net', label: 'Net sales', format: 'money' as const },
         { key: 'share', label: 'Share', format: 'percent' as const },
       ],
       rows: branchRows,
@@ -154,8 +170,8 @@ router.get('/daily-sales', async (req: Request, res: Response) => {
         ...(branchCount > 1 || !branchId ? [{ key: 'branch', label: 'Branch' } as ReportColumn] : []),
         { key: 'cash', label: 'Cash', format: 'money' }, { key: 'card', label: 'Card', format: 'money' },
         { key: 'delivery', label: 'Delivery', format: 'money' }, { key: 'other', label: 'Transfer / Other', format: 'money' },
-        { key: 'vat', label: 'VAT', format: 'money' }, { key: 'net', label: 'Net sales', format: 'money' },
-        { key: 'status', label: 'Status', format: 'status' },
+        { key: 'vat', label: tax(), format: 'money' }, { key: 'net', label: 'Net sales', format: 'money' },
+        { key: 'status', label: 'Status', format: 'status', statusLabels: { approved: 'Posted' } },
       ],
       rows: register,
       totals: totalsOf(register, 'TOTAL', moneyKeys, 'saleNo'),
@@ -166,10 +182,10 @@ router.get('/daily-sales', async (req: Request, res: Response) => {
     ...(await baseReport(req, 'daily-sales', 'Sales Report', 'Sales at a glance', sales.map((s) => s.saleDate))),
     summaryLine: '',
     kpis: [
-      { label: 'Net sales', value: net, hint: `${plural(sales.length, 'sale')} over ${plural(days, 'day')}` },
-      { label: 'VAT collected', value: vat, hint: `${pct(vat, gross).toFixed(1)}% of gross sales` },
+      { label: 'Net sales', value: net, hint: `Incl. ${tax()} · ${plural(sales.length, 'sale')} over ${plural(days, 'day')}` },
+      { label: tax('collected'), value: vat, hint: `${formatPercent(pct(vat, gross))} of gross sales` },
       { label: 'Average per day', value: days > 0 ? round2(net / days) : 0, hint: 'Net sales ÷ trading days' },
-      { label: 'Gross sales', value: gross, hint: 'Including VAT', tone: 'dark' },
+      { label: 'Gross sales', value: gross, hint: `Including ${tax()}`, tone: 'dark' },
     ],
     sections,
   }
@@ -220,14 +236,14 @@ router.get('/branch-sales', async (req: Request, res: Response) => {
       { label: 'Total net sales', value: total, hint: `Across ${plural(rows.length, 'branch', 'branches')}` },
       { label: 'Sales count', value: sum(rows, (r) => r.saleCount), format: 'integer', hint: 'Recorded daily sales' },
       { label: 'Average per branch', value: rows.length ? round2(total / rows.length) : 0, hint: 'Net sales ÷ branches' },
-      { label: 'Top branch', value: top && top.totalSales > 0 ? top.branch : '—', format: 'text', hint: top && top.totalSales > 0 ? `${fmtMoney(top.totalSales)} · ${pct(top.totalSales, total).toFixed(1)}% share` : 'No sales in period', tone: 'dark' },
+      { label: 'Top branch', value: top && top.totalSales > 0 ? top.branch : '—', format: 'text', hint: top && top.totalSales > 0 ? `${fmtMoney(top.totalSales)} · ${formatPercent(pct(top.totalSales, total))} share` : 'No sales in period', tone: 'dark' },
     ],
     sections: [{
       type: 'table', id: 'branches', title: 'Branch ranking', subtitle: 'Ranked by net sales, highest first', primary: true,
       columns: [
         { key: 'rank', label: '#', format: 'integer', width: 0.4 }, { key: 'branch', label: 'Branch' },
         { key: 'saleCount', label: 'Sales', format: 'integer' }, { key: 'avgSaleValue', label: 'Avg sale', format: 'money' },
-        { key: 'totalVat', label: 'VAT', format: 'money' }, { key: 'grossSales', label: 'Gross sales', format: 'money' },
+        { key: 'totalVat', label: tax(), format: 'money' }, { key: 'grossSales', label: 'Gross sales', format: 'money' },
         { key: 'totalSales', label: 'Net sales', format: 'money' }, { key: 'share', label: 'Share', format: 'percent' },
       ],
       rows: ranked,
@@ -312,7 +328,7 @@ router.get('/branch-profit', async (req: Request, res: Response) => {
         rows,
         totals: { branch: 'TOTAL', totalSales: totSales, purchases: sum(rows, (r) => r.purchases), operatingExpenses: sum(rows, (r) => r.operatingExpenses), totalExpenses: totExp, profit: totProfit, profitMarginPct: totSales > 0 ? round2((totProfit / totSales) * 100) : 0 },
       },
-      { type: 'note', id: 'basis', title: 'Basis of preparation', text: 'Operational view: net sales from approved daily sales, minus supplier purchases (bills, including VAT) and operating expenses. Payments made against purchases are not counted again. For the accounting view use the Profit & Loss statement, which is built from posted journal entries.' },
+      { type: 'note', id: 'basis', title: 'Basis of preparation', text: 'Operational view: net sales from approved daily sales, minus supplier purchases (bills, including tax) and operating expenses. Payments made against purchases are not counted again. For the accounting view use the Profit & Loss statement, which is built from posted journal entries.' },
     ],
   }
   report.summaryLine = `Period: ${report.periodLabel}  |  ${plural(rows.length, 'branch', 'branches')}`
@@ -351,7 +367,7 @@ router.get('/cash-closing', async (req: Request, res: Response) => {
     summaryLine: '',
     kpis: [
       { label: 'Expected cash', value: expected, hint: plural(closings.length, 'closing') },
-      { label: 'Cash counted', value: counted, hint: `${pct(counted, expected).toFixed(1)}% of expected` },
+      { label: 'Cash counted', value: counted, hint: `${formatPercent(pct(counted, expected))} of expected` },
       { label: 'Shortages', value: sum(short, (c) => c.difference), hint: plural(short.length, 'short day'), tone: short.length ? 'negative' : 'default' },
       { label: 'Net difference', value: diff, hint: diff > 0.005 ? 'Cash over' : diff < -0.005 ? 'Cash short' : 'Fully balanced', tone: 'dark' },
     ],
@@ -397,14 +413,17 @@ router.get('/expenses', async (req: Request, res: Response) => {
     orderBy: { expenseDate: 'desc' },
   })
 
-  const manual = expenses.filter((e) => e.source !== 'purchasing')
+  // Maintenance (picked as the "vendor" on New Entry) is reported apart from other operating expenses
+  const manual = expenses.filter((e) => e.source !== 'purchasing' && e.source !== 'maintenance')
+  const maintenance = expenses.filter((e) => e.source === 'maintenance')
   const purchasePayments = expenses.filter((e) => e.source === 'purchasing')
   const total = sum(expenses, (e) => e.totalAmount)
   const vat = sum(expenses, (e) => e.vatAmount)
   const pending = expenses.filter((e) => e.status === 'draft' || e.status === 'submitted')
 
   const monthly = monthlyRows(expenses, (e) => e.expenseDate, {
-    operating: (e) => (e.source === 'purchasing' ? 0 : e.totalAmount),
+    operating: (e) => (e.source === 'purchasing' || e.source === 'maintenance' ? 0 : e.totalAmount),
+    maintenance: (e) => (e.source === 'maintenance' ? e.totalAmount : 0),
     purchasePayments: (e) => (e.source === 'purchasing' ? e.totalAmount : 0),
     vat: (e) => e.vatAmount,
     total: (e) => e.totalAmount,
@@ -422,7 +441,7 @@ router.get('/expenses', async (req: Request, res: Response) => {
 
   const register: ReportRow[] = expenses.map((e) => ({
     expenseNo: e.expenseNo, date: e.expenseDate.toISOString(), branch: e.branch.name, category: e.category.name,
-    description: e.description, type: e.source === 'purchasing' ? 'Purchase payment' : 'Manual',
+    description: e.description, type: e.source === 'purchasing' ? 'Purchase payment' : e.source === 'maintenance' ? 'Maintenance' : 'Manual',
     paymentMethod: e.paymentMethod.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()),
     amount: e.amount, vat: e.vatAmount, totalAmount: e.totalAmount, status: e.status,
   }))
@@ -431,21 +450,22 @@ router.get('/expenses', async (req: Request, res: Response) => {
     ...(await baseReport(req, 'expenses', 'Expense Report', 'Expenses at a glance', expenses.map((e) => e.expenseDate))),
     summaryLine: '',
     kpis: [
-      { label: 'Total expenses', value: total, hint: `Includes VAT · ${plural(expenses.length, 'entry', 'entries')}` },
-      { label: 'Operating expenses', value: sum(manual, (e) => e.totalAmount), hint: `${pct(sum(manual, (e) => e.totalAmount), total).toFixed(1)}% · manual entries` },
+      { label: 'Total expenses', value: total, hint: `Includes ${tax()} · ${plural(expenses.length, 'entry', 'entries')}` },
+      { label: 'Operating expenses', value: sum(manual, (e) => e.totalAmount), hint: `${formatPercent(pct(sum(manual, (e) => e.totalAmount), total))} · manual entries` },
+      { label: 'Maintenance', value: sum(maintenance, (e) => e.totalAmount), hint: `${formatPercent(pct(sum(maintenance, (e) => e.totalAmount), total))} · ${plural(maintenance.length, 'entry', 'entries')}` },
       { label: 'Purchase payments', value: sum(purchasePayments, (e) => e.totalAmount), hint: `${plural(purchasePayments.length, 'payment')} against purchases` },
-      { label: 'Top category', value: topCat ? String(topCat.category) : '—', format: 'text', hint: topCat ? `${fmtMoney(Number(topCat.total))} · ${Number(topCat.share).toFixed(1)}% of total` : 'No expenses in period', tone: 'dark' },
+      { label: 'Top category', value: topCat ? String(topCat.category) : '—', format: 'text', hint: topCat ? `${fmtMoney(Number(topCat.total))} · ${formatPercent(Number(topCat.share))} of total` : 'No expenses in period', tone: 'dark' },
     ],
     sections: [
       {
         type: 'table', id: 'monthly', title: 'Monthly expense summary',
         columns: [
           { key: 'month', label: 'Month' }, { key: 'count', label: 'Entries', format: 'integer' },
-          { key: 'operating', label: 'Operating', format: 'money' }, { key: 'purchasePayments', label: 'Purchase payments', format: 'money' },
-          { key: 'vat', label: 'VAT', format: 'money' }, { key: 'total', label: 'Total', format: 'money' },
+          { key: 'operating', label: 'Operating', format: 'money' }, { key: 'maintenance', label: 'Maintenance', format: 'money' }, { key: 'purchasePayments', label: 'Purchase payments', format: 'money' },
+          { key: 'vat', label: tax(), format: 'money' }, { key: 'total', label: 'Total', format: 'money' },
         ],
         rows: monthly,
-        totals: totalsOf(monthly, 'TOTAL', ['count', 'operating', 'purchasePayments', 'vat', 'total'], 'month'),
+        totals: totalsOf(monthly, 'TOTAL', ['count', 'operating', 'maintenance', 'purchasePayments', 'vat', 'total'], 'month'),
       },
       {
         type: 'stats', id: 'status', title: 'Approval status',
@@ -460,7 +480,7 @@ router.get('/expenses', async (req: Request, res: Response) => {
         type: 'table', id: 'categories', title: 'Category summary', subtitle: 'Ranked by total, highest first', newPage: true,
         columns: [
           { key: 'category', label: 'Category' }, { key: 'count', label: 'Entries', format: 'integer' },
-          { key: 'amount', label: 'Net amount', format: 'money' }, { key: 'vat', label: 'VAT', format: 'money' },
+          { key: 'amount', label: 'Net amount', format: 'money' }, { key: 'vat', label: tax(), format: 'money' },
           { key: 'total', label: 'Total', format: 'money' }, { key: 'share', label: 'Share', format: 'percent' },
         ],
         rows: catRows,
@@ -472,7 +492,7 @@ router.get('/expenses', async (req: Request, res: Response) => {
           { key: 'expenseNo', label: 'Expense no.', format: 'code' }, { key: 'date', label: 'Date', format: 'date' },
           { key: 'category', label: 'Category', width: 1.3 }, { key: 'description', label: 'Description', width: 2.2 },
           { key: 'type', label: 'Type', width: 1.1 }, { key: 'paymentMethod', label: 'Method', width: 1 },
-          { key: 'amount', label: 'Net', format: 'money' }, { key: 'vat', label: 'VAT', format: 'money' },
+          { key: 'amount', label: 'Net', format: 'money' }, { key: 'vat', label: tax(), format: 'money' },
           { key: 'totalAmount', label: 'Total', format: 'money' }, { key: 'status', label: 'Status', format: 'status' },
         ],
         rows: register,
@@ -534,16 +554,16 @@ router.get('/purchases', async (req: Request, res: Response) => {
   const unpaidCount = bills.filter((b) => b.status === 'approved').length
   const draftCount = bills.filter((b) => b.status === 'draft').length
 
-  // Reconciliation: every bill should satisfy subtotal + VAT − discount = total
+  // Reconciliation: every bill should satisfy subtotal + tax − discount = total
   // and total − paid = balance (to the cent).
   const mismatched = bills.filter((b) =>
-    Math.abs(b.subtotal + b.vatAmount - b.discountAmount - b.totalAmount) > 0.01 ||
-    Math.abs(b.totalAmount - b.paidAmount - b.balanceDue) > 0.01)
+    Math.abs(b.subtotal + b.vatAmount - b.discountAmount - b.totalAmount) > regionalMoneyTolerance() ||
+    Math.abs(b.totalAmount - b.paidAmount - b.balanceDue) > regionalMoneyTolerance())
   const paidWithResidue = bills.filter((b) => b.status === 'paid' && Math.abs(b.balanceDue) >= 0.005)
   const reconText = [
     mismatched.length === 0
-      ? `All ${plural(bills.length, 'purchase')} reconcile: subtotal + VAT = total, and total − paid = balance.`
-      : `${plural(mismatched.length, 'purchase')} do not reconcile (subtotal + VAT ≠ total, or total − paid ≠ balance): ${mismatched.slice(0, 8).map((b) => b.billNo).join(', ')}${mismatched.length > 8 ? '…' : ''}.`,
+      ? `All ${plural(bills.length, 'purchase')} reconcile: subtotal + ${tax()} = total, and total − paid = balance.`
+      : `${plural(mismatched.length, 'purchase')} do not reconcile (subtotal + ${tax()} ≠ total, or total − paid ≠ balance): ${mismatched.slice(0, 8).map((b) => b.billNo).join(', ')}${mismatched.length > 8 ? '…' : ''}.`,
     paidWithResidue.length ? `Marked paid with a residual balance: ${paidWithResidue.slice(0, 6).map((b) => `${b.billNo} (${fmtMoney(b.balanceDue)})`).join(', ')}.` : '',
     draftCount ? `${plural(draftCount, 'draft bill')} included — drafts are not yet posted to accounting.` : '',
   ].filter(Boolean).join(' ')
@@ -559,16 +579,16 @@ router.get('/purchases', async (req: Request, res: Response) => {
     ...(await baseReport(req, 'purchases', 'Purchase Report', 'Purchases at a glance', bills.map((b) => b.billDate))),
     summaryLine: '',
     kpis: [
-      { label: 'Total purchases', value: total, hint: `Includes VAT · ${plural(bills.length, 'purchase')}` },
-      { label: 'Amount paid', value: paid, hint: `${pct(paid, total).toFixed(1)}% of total purchase value` },
-      { label: 'Balance due', value: balance, hint: `${pct(balance, total).toFixed(1)}% of total purchase value`, tone: 'dark' },
+      { label: 'Total purchases', value: total, hint: `Includes ${tax()} · ${plural(bills.length, 'purchase')}` },
+      { label: 'Amount paid', value: paid, hint: `${formatPercent(pct(paid, total))} of total purchase value` },
+      { label: 'Balance due', value: balance, hint: `${formatPercent(pct(balance, total))} of total purchase value`, tone: 'dark' },
     ],
     sections: [
       {
         type: 'table', id: 'monthly', title: 'Monthly purchase summary',
         columns: [
           { key: 'month', label: 'Month' }, { key: 'count', label: 'Purchases', format: 'integer' },
-          { key: 'subtotal', label: 'Subtotal', format: 'money' }, { key: 'vat', label: 'VAT', format: 'money' },
+          { key: 'subtotal', label: 'Subtotal', format: 'money' }, { key: 'vat', label: tax(), format: 'money' },
           { key: 'total', label: 'Total amount', format: 'money' }, { key: 'paid', label: 'Paid amount', format: 'money' },
           { key: 'balance', label: 'Balance due', format: 'money' },
         ],
@@ -588,7 +608,7 @@ router.get('/purchases', async (req: Request, res: Response) => {
       { type: 'note', id: 'recon', title: 'Reconciliation note', text: reconText, tone: mismatched.length ? 'warning' : 'default' },
       {
         type: 'table', id: 'suppliers', title: 'Supplier summary', newPage: true,
-        subtitle: `All ${plural(supplierCount, 'supplier')}  |  Ranked by balance due, highest first  |  Amounts include VAT`,
+        subtitle: `All ${plural(supplierCount, 'supplier')}  |  Ranked by balance due, highest first  |  Amounts include ${tax()}`,
         columns: [
           { key: 'supplier', label: 'Supplier', width: 3 }, { key: 'bills', label: 'Bills', format: 'integer' },
           { key: 'total', label: 'Total amount', format: 'money' }, { key: 'paid', label: 'Paid amount', format: 'money' },
@@ -614,9 +634,9 @@ router.get('/purchases', async (req: Request, res: Response) => {
           { key: 'purchaseNo', label: 'Purchase no.', format: 'code' }, { key: 'date', label: 'Date', format: 'date' },
           { key: 'supplier', label: 'Supplier', width: 2.2 },
           ...(showBranch ? [{ key: 'branch', label: 'Branch', width: 1.3 } as ReportColumn] : []),
-          { key: 'subtotal', label: 'Subtotal', format: 'money' }, { key: 'vat', label: 'VAT', format: 'money', width: 1 },
+          { key: 'subtotal', label: 'Subtotal', format: 'money' }, { key: 'vat', label: tax(), format: 'money', width: 1 },
           { key: 'totalAmount', label: 'Total amount', format: 'money' }, { key: 'paidAmount', label: 'Paid amount', format: 'money' },
-          { key: 'balanceDue', label: 'Balance due', format: 'money' }, { key: 'status', label: 'Status', format: 'status' },
+          { key: 'balanceDue', label: 'Balance due', format: 'money' }, { key: 'status', label: 'Status', format: 'status', statusLabels: BILL_STATUS },
         ],
         rows: register,
         totals: totalsOf(register, 'TOTAL', ['subtotal', 'vat', 'totalAmount', 'paidAmount', 'balanceDue'], 'purchaseNo'),
@@ -685,8 +705,8 @@ router.get('/supplier-payable', async (req: Request, res: Response) => {
     summaryLine: '',
     kpis: [
       { label: 'Total outstanding', value: outstanding, hint: `${plural(rows.length, 'open bill')} · ${plural(bySupplier.size, 'supplier')}` },
-      { label: 'Not yet due', value: round2(outstanding - overdueAmt), hint: `${pct(outstanding - overdueAmt, outstanding).toFixed(1)}% of outstanding`, tone: 'positive' },
-      { label: 'Over 90 days', value: over90, hint: `${pct(over90, outstanding).toFixed(1)}% of outstanding`, tone: over90 > 0 ? 'negative' : 'default' },
+      { label: 'Not yet due', value: round2(outstanding - overdueAmt), hint: `${formatPercent(pct(outstanding - overdueAmt, outstanding))} of outstanding`, tone: 'positive' },
+      { label: 'Over 90 days', value: over90, hint: `${formatPercent(pct(over90, outstanding))} of outstanding`, tone: over90 > 0 ? 'negative' : 'default' },
       { label: 'Overdue', value: overdueAmt, hint: `${plural(overdue.length, 'bill')} past due date`, tone: 'dark' },
     ],
     sections: [
@@ -809,6 +829,141 @@ router.get('/inventory-stock', async (req: Request, res: Response) => {
   await sendProReport(res, format, report, { data: rows })
 })
 
+// ── Food cost (recipes) ─────────────────────────────────────────────────────
+// Dish-level food cost from recipes, for paid POS / QR orders: what each dish
+// earned (net of tax and order discounts) against the recipe cost recorded
+// when it was paid, plus the theoretical ingredient usage, compared with the
+// cost of sales actually booked in the ledger.
+
+router.get('/food-cost', async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+  const closedAt = momentRange(fromDate, toDate)
+
+  const orders = await prisma.customerOrder.findMany({
+    where: { organizationId: orgId, status: 'completed', ...(branchId && { branchId }), ...(closedAt && { closedAt }) },
+    include: {
+      items: {
+        where: { status: { not: 'cancelled' } },
+        include: { dish: { include: { category: { select: { name: true } }, ingredients: { include: { item: { select: { id: true, code: true, name: true, unit: true } } } } } } },
+      },
+    },
+  })
+  const org = await prisma.organization.findUnique({ where: { id: orgId }, select: { foodCostMethod: true } })
+
+  type DishRow = { dish: string; category: string; qty: number; sales: number; cost: number; hasRecipe: boolean }
+  const byDish = new Map<string, DishRow>()
+  const usage = new Map<string, { code: string; item: string; unit: string; quantity: number }>()
+  let uncostedSales = 0
+  for (const o of orders) {
+    // share of the order discount, then tax out of the tax-inclusive price
+    const discountFactor = o.itemsTotal > 0 ? 1 - (o.discountAmount + o.promotionAmount) / o.itemsTotal : 1
+    const taxFactor = o.vatRate > 0 ? 100 / (100 + o.vatRate) : 1
+    for (const i of o.items) {
+      const net = i.lineTotal * discountFactor * taxFactor
+      const row = byDish.get(i.dishId) ?? { dish: i.dishName, category: i.dish.category.name, qty: 0, sales: 0, cost: 0, hasRecipe: i.dish.ingredients.length > 0 }
+      row.qty += i.quantity
+      row.sales += net
+      row.cost += i.unitCost * i.quantity
+      byDish.set(i.dishId, row)
+      if (!i.dish.ingredients.length) uncostedSales += net
+      for (const g of i.dish.ingredients) {
+        const u = usage.get(g.itemId) ?? { code: g.item.code, item: g.item.name, unit: g.item.unit, quantity: 0 }
+        u.quantity += g.quantity * (1 + g.wastePct / 100) * i.quantity
+        usage.set(g.itemId, u)
+      }
+    }
+  }
+  const sales = sum([...byDish.values()], (d) => d.sales)
+  const cost = sum([...byDish.values()], (d) => d.cost)
+  const costPct = pct(cost, sales)
+
+  // Cost of sales actually booked in the ledger for the period
+  const entryDate = dateRangeFilter(fromDate, toDate)
+  const cogsAccounts = await prisma.accountingMapping.findMany({ where: { organizationId: orgId, key: 'COST_OF_SALES' }, select: { accountId: true } })
+  const ledger = cogsAccounts.length ? await prisma.journalLine.aggregate({
+    where: {
+      accountId: { in: cogsAccounts.map((m) => m.accountId) },
+      journalEntry: { organizationId: orgId, status: 'posted', ...(branchId && { branchId }), ...(entryDate && { entryDate }) },
+    },
+    _sum: { debitAmount: true, creditAmount: true },
+  }) : null
+  const actual = round2(Number(ledger?._sum.debitAmount ?? 0) - Number(ledger?._sum.creditAmount ?? 0))
+  const variance = round2(actual - cost)
+
+  const dishRows: ReportRow[] = [...byDish.values()].sort((a, b) => b.sales - a.sales).map((d) => ({
+    dish: d.hasRecipe ? d.dish : `${d.dish} (no recipe)`, category: d.category, qty: d.qty,
+    sales: round2(d.sales), cost: round2(d.cost), profit: round2(d.sales - d.cost),
+    costPct: d.hasRecipe ? pct(d.cost, d.sales) : 0, perPlate: d.qty ? round2((d.sales - d.cost) / d.qty) : 0,
+  }))
+  const byCategory = new Map<string, { sales: number; cost: number; qty: number }>()
+  for (const d of byDish.values()) {
+    const c = byCategory.get(d.category) ?? { sales: 0, cost: 0, qty: 0 }
+    c.sales += d.sales; c.cost += d.cost; c.qty += d.qty
+    byCategory.set(d.category, c)
+  }
+  const categoryRows: ReportRow[] = [...byCategory.entries()].sort((a, b) => b[1].sales - a[1].sales)
+    .map(([category, c]) => ({ category, qty: c.qty, sales: round2(c.sales), cost: round2(c.cost), profit: round2(c.sales - c.cost), costPct: pct(c.cost, c.sales) }))
+  const usageRows: ReportRow[] = [...usage.values()].sort((a, b) => b.quantity - a.quantity)
+    .map((u) => ({ code: u.code, item: u.item, quantity: round2(u.quantity), unit: u.unit }))
+
+  const worst = dishRows.filter((d) => !String(d.dish).endsWith('(no recipe)')).sort((a, b) => Number(b.costPct) - Number(a.costPct))[0]
+  const report: ProReport = {
+    ...(await baseReport(req, 'food-cost', 'Food Cost Report', 'Food cost by dish', orders.map((o) => o.closedAt ?? o.createdAt))),
+    summaryLine: `${plural(orders.length, 'paid order')} | ${plural(byDish.size, 'dish', 'dishes')} sold`,
+    kpis: [
+      { label: 'Net food sales', value: sales, hint: 'Paid orders, excl. tax and discounts' },
+      { label: 'Recipe food cost', value: cost, hint: `${formatPercent(costPct)} of net sales`, tone: costPct > 40 ? 'warning' : 'default' },
+      { label: 'Gross profit', value: round2(sales - cost), hint: `${formatPercent(pct(sales - cost, sales))} margin`, tone: 'positive' },
+      { label: 'Highest food cost %', value: worst ? String(worst.dish) : '—', format: 'text', hint: worst ? `${formatPercent(Number(worst.costPct))} of its net price` : 'No costed dishes sold', tone: 'dark' },
+    ],
+    sections: [
+      {
+        type: 'stats', id: 'reconcile', title: 'Recipe cost vs cost of sales booked',
+        items: [
+          { label: 'Recipe (theoretical) cost', value: fmtMoney(cost) },
+          { label: 'Cost of sales in the ledger', value: fmtMoney(actual) },
+          { label: 'Difference', value: fmtMoney(variance), tone: Math.abs(variance) < regionalMoneyTolerance() ? 'positive' : variance > 0 ? 'warning' : 'default' },
+          { label: 'Sales of dishes without a recipe', value: fmtMoney(round2(uncostedSales)), tone: uncostedSales > 0 ? 'warning' : 'positive' },
+        ],
+        note: org?.foodCostMethod === 'recipes'
+          ? 'Recipe mode: ingredients leave stock as dishes are sold and the cost is booked when each day is finalized. A difference means days not finalized yet, wastage, or stock issued another way.'
+          : 'Kitchen-issue mode: the ledger shows stock issued to the kitchen (Stock Out). A ledger cost above the recipe cost points to waste, over-portioning or unrecorded sales.',
+      },
+      {
+        type: 'table', id: 'dishes', title: 'Dishes', subtitle: 'Best sellers first · net sales exclude tax and discounts', primary: true,
+        columns: [
+          { key: 'dish', label: 'Dish', width: 2.2 }, { key: 'category', label: 'Category', width: 1.2 }, { key: 'qty', label: 'Sold', format: 'integer' },
+          { key: 'sales', label: 'Net sales', format: 'money' }, { key: 'cost', label: 'Food cost', format: 'money' }, { key: 'costPct', label: 'Cost %', format: 'percent' },
+          { key: 'profit', label: 'Gross profit', format: 'money' }, { key: 'perPlate', label: 'Profit / plate', format: 'money' },
+        ],
+        rows: dishRows,
+        totals: { dish: 'TOTAL', qty: dishRows.reduce((n, r) => n + Number(r.qty), 0), sales, cost, costPct, profit: round2(sales - cost) },
+        emptyMessage: 'No paid orders in this period',
+      },
+      {
+        type: 'table', id: 'categories', title: 'By category',
+        columns: [
+          { key: 'category', label: 'Category', width: 2 }, { key: 'qty', label: 'Sold', format: 'integer' }, { key: 'sales', label: 'Net sales', format: 'money' },
+          { key: 'cost', label: 'Food cost', format: 'money' }, { key: 'costPct', label: 'Cost %', format: 'percent' }, { key: 'profit', label: 'Gross profit', format: 'money' },
+        ],
+        rows: categoryRows,
+        totals: { category: 'TOTAL', sales, cost, costPct, profit: round2(sales - cost) },
+      },
+      {
+        type: 'table', id: 'usage', title: 'Ingredient usage (from recipes)', subtitle: 'What the dishes sold should have used, including the waste allowance',
+        columns: [
+          { key: 'code', label: 'Code', format: 'code', width: 0.9 }, { key: 'item', label: 'Ingredient', width: 2.2 },
+          { key: 'quantity', label: 'Quantity', format: 'number' }, { key: 'unit', label: 'Unit', width: 0.6 },
+        ],
+        rows: usageRows,
+        emptyMessage: 'No recipes on the dishes sold',
+      },
+    ],
+  }
+  await sendProReport(res, format, report, { data: dishRows })
+})
+
 // ── Wastage ─────────────────────────────────────────────────────────────────
 
 router.get('/wastage', async (req: Request, res: Response) => {
@@ -847,9 +1002,9 @@ router.get('/wastage', async (req: Request, res: Response) => {
     summaryLine: '',
     kpis: [
       { label: 'Wastage value', value, hint: `${plural(lines.length, 'line')} in ${plural(reports.length, 'report')}` },
-      { label: 'Approved & posted', value: approvedValue, hint: `${pct(approvedValue, value).toFixed(1)}% of wastage value`, tone: 'positive' },
+      { label: 'Approved & posted', value: approvedValue, hint: `${formatPercent(pct(approvedValue, value))} of wastage value`, tone: 'positive' },
       { label: 'Pending approval', value: round2(value - approvedValue), hint: plural(reports.filter((r) => r.status !== 'approved').length, 'report'), tone: value - approvedValue > 0.005 ? 'warning' : 'default' },
-      { label: 'Top item', value: itemRows[0] ? String(itemRows[0].item) : '—', format: 'text', hint: itemRows[0] ? `${fmtMoney(Number(itemRows[0].value))} · ${Number(itemRows[0].share).toFixed(1)}% of losses` : 'No wastage in period', tone: 'dark' },
+      { label: 'Top item', value: itemRows[0] ? String(itemRows[0].item) : '—', format: 'text', hint: itemRows[0] ? `${fmtMoney(Number(itemRows[0].value))} · ${formatPercent(Number(itemRows[0].share))} of losses` : 'No wastage in period', tone: 'dark' },
     ],
     sections: [
       {
@@ -884,10 +1039,10 @@ router.get('/wastage', async (req: Request, res: Response) => {
 
 // ── Audit Log ───────────────────────────────────────────────────────────────
 
-router.get('/audit-log', async (req: Request, res: Response) => {
+router.get('/audit-log', requirePermission('can_view_audit_logs'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
-  const createdAt = dateRangeFilter(fromDate, toDate)
+  const createdAt = momentRange(fromDate, toDate)
 
   const logs = await prisma.auditLog.findMany({
     where: { organizationId: orgId, ...(branchId && { branchId }), ...(createdAt && { createdAt }) },
@@ -932,383 +1087,388 @@ router.get('/audit-log', async (req: Request, res: Response) => {
   await sendProReport(res, format, report, { data: register })
 })
 
-// ── Profit & Loss ───────────────────────────────────────────────────────────
+// ── Financial statements ────────────────────────────────────────────────────
+// Presented the IFRS way (IAS 1 / IAS 7): expenses as negatives, comparative
+// figures, current / non-current classification, a single "Profit for the
+// period" line, sign-off block. Built entirely from posted journal lines so
+// they agree with the trial balance and the general ledger to the cent.
 
-// Expense reportingGroups that roll up into Cost of Sales rather than
-// Operating Expenses on the P&L — mirrors the standard 5xxx chart section.
-const COST_OF_SALES_GROUPS = new Set(['Cost of Sales', 'Wastage', 'Direct Costs'])
+const parseDay = (v?: string): Date | undefined => {
+  if (!v || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return undefined
+  const d = new Date(`${v}T00:00:00.000Z`)
+  return isNaN(d.getTime()) ? undefined : d
+}
+const shortRange = (from: Date, to: Date) => `${formatDate(from)} – ${formatDate(to)}`
+const changePct = (cur: number, prev: number | null | undefined) => (prev == null || Math.abs(prev) < 0.005 ? null : round2(((cur - prev) / Math.abs(prev)) * 100))
+const signedShare = (amount: number, revenue: number) => (Math.abs(revenue) < 0.005 ? null : round2((Math.abs(amount) / Math.abs(revenue)) * 100))
 
-// Built entirely from posted JournalLine data (never combined with
-// operational-table totals, which could double-count or diverge from what's
-// actually posted to the ledger).
-router.get('/profit-loss', async (req: Request, res: Response) => {
+async function orgFiscalYear(orgId: string) {
+  return (await prisma.organization.findUnique({ where: { id: orgId }, select: { fiscalYearStart: true } }))?.fiscalYearStart ?? '01-01'
+}
+
+// ── Statement of profit or loss ─────────────────────────────────────────────
+
+interface PnlTotals {
+  revenue: number; costOfSales: number; grossProfit: number; otherIncome: number; operating: number
+  operatingProfit: number; finance: number; profitBeforeTax: number; incomeTax: number; profit: number
+}
+
+// Amounts per account for a period, signed as presented: income positive,
+// expenses negative
+function pnlAmounts(accounts: StatementAccount[], sums: Map<string, { debit: number; credit: number }>) {
+  const lines = new Map<string, { a: StatementAccount; group: PnlGroup; amount: number }>()
+  for (const a of accounts) {
+    if (a.accountClass !== 'REVENUE' && a.accountClass !== 'EXPENSE') continue
+    const s = sums.get(a.id)
+    if (!s) continue
+    const amount = round2(s.credit - s.debit) // income +, expense −
+    if (Math.abs(amount) < 0.005) continue
+    lines.set(a.id, { a, group: pnlGroup(a), amount })
+  }
+  const g = (group: PnlGroup) => round2([...lines.values()].filter((l) => l.group === group).reduce((t, l) => t + l.amount, 0))
+  const revenue = round2(g('revenue') + g('discounts'))
+  const costOfSales = g('cost_of_sales')
+  const grossProfit = round2(revenue + costOfSales)
+  const otherIncome = g('other_income')
+  const operating = g('operating')
+  const operatingProfit = round2(grossProfit + otherIncome + operating)
+  const finance = g('finance')
+  const profitBeforeTax = round2(operatingProfit + finance)
+  const incomeTax = g('income_tax')
+  const totals: PnlTotals = { revenue, costOfSales, grossProfit, otherIncome, operating, operatingProfit, finance, profitBeforeTax, incomeTax, profit: round2(profitBeforeTax + incomeTax) }
+  return { lines, totals }
+}
+
+router.get('/profit-loss', requirePermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
+  const from = parseDay(fromDate)
+  const to = parseDay(toDate) ?? todayInZone()
+  const accounts = await statementAccounts(orgId)
+  const prior = from ? priorPeriod(from, to) : null
+  const [curSums, prevSums] = await Promise.all([
+    netByAccount(orgId, { from, to }, branchId || undefined),
+    prior ? netByAccount(orgId, prior, branchId || undefined) : Promise.resolve(null),
+  ])
+  const cur = pnlAmounts(accounts, curSums)
+  const prev = prevSums ? pnlAmounts(accounts, prevSums) : null
+  const R = cur.totals.revenue
+  const withPrior = !!prev
 
-  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
-  if (branchId) entryWhere.branchId = branchId
-  const entryDate = dateRangeFilter(fromDate, toDate)
-  if (entryDate) entryWhere.entryDate = entryDate
-
-  const accounts = await prisma.account.findMany({
-    where: { organizationId: orgId, status: 'ACTIVE', accountClass: { in: ['REVENUE', 'EXPENSE'] } },
-    select: { id: true, code: true, name: true, accountClass: true, reportingGroup: true, normalBalance: true },
-    orderBy: { code: 'asc' },
+  const row = (code: string, name: string, amount: number | null, prevAmount: number | null | undefined, style: ReportRow['_style']): ReportRow => ({
+    code, name, current: amount, share: amount == null ? null : signedShare(amount, R),
+    ...(withPrior && { prior: prevAmount ?? (amount == null ? null : 0), change: amount == null ? null : changePct(amount, prevAmount ?? 0) }),
+    _style: style,
   })
-  const lines = await prisma.journalLine.findMany({
-    where: { accountId: { in: accounts.map((a) => a.id) }, journalEntry: entryWhere },
-    select: { accountId: true, debitAmount: true, creditAmount: true },
-  })
-
-  const sums = new Map<string, { debit: number; credit: number }>()
-  for (const l of lines) {
-    const s = sums.get(l.accountId) ?? { debit: 0, credit: 0 }
-    s.debit += Number(l.debitAmount)
-    s.credit += Number(l.creditAmount)
-    sums.set(l.accountId, s)
+  const rows: ReportRow[] = []
+  const block = (title: string, groups: PnlGroup[], subtotalLabel?: string, subtotal?: (t: PnlTotals) => number) => {
+    const ids = new Set<string>()
+    for (const [id, l] of cur.lines) if (groups.includes(l.group)) ids.add(id)
+    if (prev) for (const [id, l] of prev.lines) if (groups.includes(l.group)) ids.add(id)
+    if (ids.size === 0) return
+    rows.push(row('', title, null, null, 'heading'))
+    const sorted = [...ids].map((id) => (cur.lines.get(id) ?? prev!.lines.get(id))!.a).sort((x, y) => x.code.localeCompare(y.code))
+    for (const a of sorted) rows.push(row(a.code, a.name, cur.lines.get(a.id)?.amount ?? 0, prev ? prev.lines.get(a.id)?.amount ?? 0 : undefined, 'indent'))
+    if (subtotalLabel && subtotal) rows.push(row('', subtotalLabel, subtotal(cur.totals), prev ? subtotal(prev.totals) : undefined, 'subtotal'))
   }
+  const result = (label: string, pick: (t: PnlTotals) => number, style: ReportRow['_style'] = 'subtotal') => {
+    rows.push(row('', label, pick(cur.totals), prev ? pick(prev.totals) : undefined, style))
+    rows.push({ _style: 'spacer' })
+  }
+  block('Revenue', ['revenue', 'discounts'], 'Total revenue', (t) => t.revenue)
+  block('Cost of sales', ['cost_of_sales'], 'Total cost of sales', (t) => t.costOfSales)
+  result('Gross profit', (t) => t.grossProfit)
+  block('Other income', ['other_income'], 'Total other income', (t) => t.otherIncome)
+  block('Operating expenses', ['operating'], 'Total operating expenses', (t) => t.operating)
+  result('Operating profit', (t) => t.operatingProfit)
+  if ([...cur.lines.values(), ...(prev?.lines.values() ?? [])].some((l) => l.group === 'finance')) {
+    block('Finance costs', ['finance'], 'Total finance costs', (t) => t.finance)
+    result('Profit before tax', (t) => t.profitBeforeTax)
+  }
+  if ([...cur.lines.values(), ...(prev?.lines.values() ?? [])].some((l) => l.group === 'income_tax')) block('Income tax', ['income_tax'], 'Income tax expense', (t) => t.incomeTax)
+  rows.push(row('', 'Profit for the period', cur.totals.profit, prev?.totals.profit, 'total'))
 
-  const rows = accounts
-    .map((a) => {
-      const s = sums.get(a.id) ?? { debit: 0, credit: 0 }
-      const balance = a.normalBalance === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
-      return { ...a, balance }
-    })
-    .filter((r) => Math.abs(r.balance) > 0.005)
-
-  const otherIncomeRows = rows.filter((r) => r.accountClass === 'REVENUE' && r.reportingGroup === 'Other Income')
-  const discountRows = rows.filter((r) => r.accountClass === 'REVENUE' && r.reportingGroup === 'Discounts')
-  const grossRevenueRows = rows.filter((r) => r.accountClass === 'REVENUE' && r.reportingGroup !== 'Other Income' && r.reportingGroup !== 'Discounts')
-  const costOfSalesRows = rows.filter((r) => r.accountClass === 'EXPENSE' && COST_OF_SALES_GROUPS.has(r.reportingGroup ?? ''))
-  const opexRows = rows.filter((r) => r.accountClass === 'EXPENSE' && !COST_OF_SALES_GROUPS.has(r.reportingGroup ?? ''))
-
-  const grossRevenue = grossRevenueRows.reduce((s, r) => s + r.balance, 0)
-  const discounts = discountRows.reduce((s, r) => s + r.balance, 0)
-  const netRevenue = grossRevenue - discounts
-  const costOfSales = costOfSalesRows.reduce((s, r) => s + r.balance, 0)
-  const grossProfit = netRevenue - costOfSales
-  const operatingExpenses = opexRows.reduce((s, r) => s + r.balance, 0)
-  const otherIncome = otherIncomeRows.reduce((s, r) => s + r.balance, 0)
-  const netProfit = grossProfit - operatingExpenses + otherIncome
-
-  const lines_ = [
-    { name: 'Revenue', amount: 0, type: 'header' as const },
-    ...grossRevenueRows.map((r) => ({ name: r.name, amount: r.balance, type: 'line' as const })),
-    ...(discounts > 0.005 ? [{ name: 'Sales Returns and Discounts', amount: -discounts, type: 'line' as const }] : []),
-    { name: 'Net Revenue', amount: netRevenue, type: 'subtotal' as const },
-    { name: 'Cost of Sales', amount: 0, type: 'header' as const },
-    ...costOfSalesRows.map((r) => ({ name: r.name, amount: r.balance, type: 'line' as const })),
-    { name: 'Gross Profit', amount: grossProfit, type: 'subtotal' as const },
-    { name: 'Operating Expenses', amount: 0, type: 'header' as const },
-    ...opexRows.map((r) => ({ name: r.name, amount: r.balance, type: 'line' as const })),
-    ...(Math.abs(otherIncome) > 0.005 ? [{ name: 'Other Income', amount: otherIncome, type: 'line' as const }] : []),
-    { name: 'Net Profit', amount: netProfit, type: 'subtotal' as const },
+  const periodText = from ? shortRange(from, to) : `Up to ${formatDate(to)}`
+  const vsPrior = (c: number, p?: number) => (p == null ? '' : ` · ${changePct(c, p) == null ? 'no prior figure' : `${changePct(c, p)! >= 0 ? '+' : ''}${formatPercent(changePct(c, p)!)} vs prior`}`)
+  const columns: ReportColumn[] = [
+    { key: 'code', label: 'Code', format: 'code', width: 0.6 }, { key: 'name', label: 'Line item', width: 2.8 },
+    { key: 'current', label: withPrior ? 'Current period' : 'Amount', format: 'money' }, { key: 'share', label: '% of revenue', format: 'percent', width: 1 },
+    ...(withPrior ? [{ key: 'prior', label: 'Prior period', format: 'money' } as ReportColumn, { key: 'change', label: 'Change', format: 'percent', width: 0.75 } as ReportColumn] : []),
   ]
-
-  const codeOf = new Map(rows.map((r) => [r.name, r.code]))
-  const statementRows: ReportRow[] = lines_.map((l) => ({
-    code: l.type === 'line' ? codeOf.get(l.name) ?? '' : '',
-    name: l.name,
-    amount: l.type === 'header' ? null : round2(l.amount),
-    share: l.type === 'header' ? null : pct(l.amount, netRevenue),
-    _style: l.type === 'header' ? 'heading' : l.type === 'subtotal' ? 'subtotal' : 'indent',
-  }))
-
   const report: ProReport = {
-    ...(await baseReport(req, 'profit-loss', 'Profit & Loss Statement', 'Profit & loss')),
-    summaryLine: '',
+    ...(await baseReport(req, 'profit-loss', 'Statement of Profit or Loss', 'Profit or loss')),
+    kind: 'statement',
+    periodLabel: periodText,
+    summaryLine: `For the period ${periodText}${prior ? `  |  Comparative: ${shortRange(prior.from, prior.to)}` : ''}  |  ${plural(cur.lines.size, 'account')} with activity`,
     kpis: [
-      { label: 'Net revenue', value: round2(netRevenue), hint: discounts > 0.005 ? `After ${fmtMoney(discounts)} discounts` : 'From posted journal entries' },
-      { label: 'Gross profit', value: round2(grossProfit), hint: `${pct(grossProfit, netRevenue).toFixed(1)}% gross margin`, tone: grossProfit >= 0 ? 'default' : 'negative' },
-      { label: 'Operating expenses', value: round2(operatingExpenses), hint: `${pct(operatingExpenses, netRevenue).toFixed(1)}% of revenue` },
-      { label: 'Net profit', value: round2(netProfit), hint: `${pct(netProfit, netRevenue).toFixed(1)}% net margin`, tone: 'dark' },
+      { label: 'Revenue', value: R, hint: `Net of discounts${vsPrior(R, prev?.totals.revenue)}` },
+      { label: 'Gross profit', value: cur.totals.grossProfit, hint: `${formatPercent(pct(cur.totals.grossProfit, R))} gross margin${vsPrior(cur.totals.grossProfit, prev?.totals.grossProfit)}`, tone: cur.totals.grossProfit >= 0 ? 'default' : 'negative' },
+      { label: 'Operating profit', value: cur.totals.operatingProfit, hint: `${formatPercent(pct(cur.totals.operatingProfit, R))} operating margin`, tone: cur.totals.operatingProfit >= 0 ? 'default' : 'negative' },
+      { label: 'Profit for the period', value: cur.totals.profit, hint: `${formatPercent(pct(cur.totals.profit, R))} net margin${vsPrior(cur.totals.profit, prev?.totals.profit)}`, tone: 'dark' },
     ],
     sections: [
-      {
-        type: 'table', id: 'statement', title: 'Statement', subtitle: 'Accounts with posted activity in the period', primary: true,
-        columns: [{ key: 'code', label: 'Account', format: 'code', width: 0.8 }, { key: 'name', label: 'Line item', width: 3.2 }, { key: 'amount', label: 'Amount', format: 'money' }, { key: 'share', label: '% of revenue', format: 'percent' }],
-        rows: statementRows,
-      },
-      { type: 'note', id: 'basis', title: 'Basis of preparation', text: 'Prepared from posted journal entries only — drafts and unapproved records are excluded. Cost of sales includes the Cost of Sales, Wastage and Direct Costs reporting groups.' },
+      { type: 'table', id: 'statement', title: 'Statement of profit or loss', subtitle: `For the period ${periodText}${prior ? `, with the preceding period of equal length (${shortRange(prior.from, prior.to)})` : ''}`, primary: true, columns, rows },
+      { type: 'note', id: 'basis', title: 'Basis of preparation', text: `Prepared from posted journal entries only; drafts and unapproved records are excluded. Expenses are classified by function (cost of sales, operating expenses, finance costs). Revenue is shown net of discounts and of ${tax()}, which is a liability to the tax authority. Amounts in brackets are deductions.` },
     ],
   }
-  report.summaryLine = `Period: ${report.periodLabel}  |  ${plural(rows.length, 'account')} with activity`
-  await sendProReport(res, format, report, { revenue: netRevenue, expenses: costOfSales + operatingExpenses, grossProfit, netProfit, lines: lines_ })
+  await sendProReport(res, format, report, { revenue: R, expenses: -(cur.totals.costOfSales + cur.totals.operating), grossProfit: cur.totals.grossProfit, netProfit: cur.totals.profit, totals: cur.totals, prior: prev?.totals ?? null })
 })
 
-// ── Trial Balance ───────────────────────────────────────────────────────────
+// ── Statement of financial position ─────────────────────────────────────────
 
-router.get('/trial-balance', async (req: Request, res: Response) => {
-  const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
-  const orgId = req.user.organizationId
-
-  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
-  if (branchId) entryWhere.branchId = branchId
-  const entryDate = dateRangeFilter(fromDate, toDate)
-  if (entryDate) entryWhere.entryDate = entryDate
-
-  const accounts = await prisma.account.findMany({
-    where: { organizationId: orgId, status: 'ACTIVE' },
-    orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
-  })
-  const lines = await prisma.journalLine.findMany({
-    where: { journalEntry: entryWhere },
-    select: { accountId: true, debitAmount: true, creditAmount: true },
-  })
-
-  const sums = new Map<string, { debit: number; credit: number }>()
-  for (const l of lines) {
-    const s = sums.get(l.accountId) ?? { debit: 0, credit: 0 }
-    s.debit += Number(l.debitAmount)
-    s.credit += Number(l.creditAmount)
-    sums.set(l.accountId, s)
-  }
-
-  const rows = accounts
-    .map((a) => {
-      const s = sums.get(a.id) ?? { debit: 0, credit: 0 }
-      return { code: a.code, name: a.name, accountClass: a.accountClass, debit: round2(s.debit), credit: round2(s.credit) }
-    })
-    .filter((r) => r.debit > 0 || r.credit > 0)
-    .sort((a, b) => a.code.localeCompare(b.code))
-
-  const totalDebit = sum(rows, (r) => r.debit)
-  const totalCredit = sum(rows, (r) => r.credit)
-  const diff = round2(totalDebit - totalCredit)
-  const classLabel: Record<string, string> = { ASSET: 'Asset', LIABILITY: 'Liability', EQUITY: 'Equity', REVENUE: 'Revenue', EXPENSE: 'Expense' }
-  const tableRows: ReportRow[] = rows.map((r) => ({ ...r, accountClass: classLabel[r.accountClass] ?? r.accountClass, net: round2(r.debit - r.credit) }))
-
-  const report: ProReport = {
-    ...(await baseReport(req, 'trial-balance', 'Trial Balance', 'Trial balance')),
-    summaryLine: '',
-    kpis: [
-      { label: 'Total debits', value: totalDebit, hint: plural(rows.length, 'account') },
-      { label: 'Total credits', value: totalCredit, hint: 'Posted entries only' },
-      { label: 'Difference', value: diff, hint: Math.abs(diff) < 0.01 ? 'Books are in balance' : 'Debits ≠ credits — investigate', tone: Math.abs(diff) < 0.01 ? 'positive' : 'negative' },
-      { label: 'Status', value: Math.abs(diff) < 0.01 ? 'Balanced' : 'Out of balance', format: 'text', hint: `As of ${asOfLabel(toDate)}`, tone: 'dark' },
-    ],
-    sections: [{
-      type: 'table', id: 'accounts', title: 'Account balances', subtitle: 'Ordered by account code', primary: true,
-      columns: [{ key: 'code', label: 'Code', format: 'code', width: 0.8 }, { key: 'name', label: 'Account', width: 2.8 }, { key: 'accountClass', label: 'Type', width: 1 }, { key: 'debit', label: 'Debit', format: 'money' }, { key: 'credit', label: 'Credit', format: 'money' }, { key: 'net', label: 'Net (Dr − Cr)', format: 'money' }],
-      rows: tableRows,
-      totals: { code: 'TOTAL', debit: totalDebit, credit: totalCredit, net: diff },
-    }],
-  }
-  report.summaryLine = `Period: ${report.periodLabel}  |  ${plural(rows.length, 'account')} with activity`
-  await sendProReport(res, format, report, { accounts: rows })
-})
-
-// ── Balance Sheet ───────────────────────────────────────────────────────────
-
-// Assets, Liabilities & Equity as of a date. Current Year Earnings is
-// computed live from Revenue − Expenses for the fiscal year to date rather
-// than stored, since there is no year-end closing-entry workflow yet; it is
-// reported here but excluded from the real Equity account list to avoid
-// double-counting if that account exists.
-router.get('/balance-sheet', async (req: Request, res: Response) => {
+router.get('/balance-sheet', requirePermission('can_view_financial_reports'), async (req: Request, res: Response) => {
   const { branchId, toDate, format } = req.query as Record<string, string>
   const orgId = req.user.organizationId
-  const asOf = toDate ? new Date(toDate) : new Date()
+  const asOf = parseDay(toDate) ?? todayInZone()
+  const [fy, accounts] = await Promise.all([orgFiscalYear(orgId), statementAccounts(orgId)])
+  const cur = await financialPosition(orgId, asOf, fy, accounts, branchId || undefined)
+  const priorDate = dayBefore(cur.fyStart)
+  const prev = await financialPosition(orgId, priorDate, fy, accounts, branchId || undefined)
 
-  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted', entryDate: { lte: asOf } }
-  if (branchId) entryWhere.branchId = branchId
-
-  const [org, accounts] = await Promise.all([
-    prisma.organization.findUnique({ where: { id: orgId }, select: { fiscalYearStart: true } }),
-    prisma.account.findMany({
-      where: { organizationId: orgId, status: 'ACTIVE', accountClass: { in: ['ASSET', 'LIABILITY', 'EQUITY'] } },
-      orderBy: [{ accountClass: 'asc' }, { code: 'asc' }],
-    }),
-  ])
-
-  const lines = await prisma.journalLine.findMany({
-    where: { journalEntry: entryWhere },
-    select: { accountId: true, debitAmount: true, creditAmount: true },
-  })
-
-  const sums = new Map<string, { debit: number; credit: number }>()
-  for (const l of lines) {
-    const s = sums.get(l.accountId) ?? { debit: 0, credit: 0 }
-    s.debit += Number(l.debitAmount)
-    s.credit += Number(l.creditAmount)
-    sums.set(l.accountId, s)
+  const rows: ReportRow[] = []
+  const key = (l: PositionLine) => `${l.code}|${l.name}`
+  const group = (title: string, a: PositionLine[], b: PositionLine[], totalLabel: string, ta: number, tb: number) => {
+    const keys = [...new Set([...a, ...b].map(key))]
+    if (keys.length === 0) return
+    rows.push({ code: '', name: title, _style: 'heading' })
+    const byA = new Map(a.map((l) => [key(l), l])), byB = new Map(b.map((l) => [key(l), l]))
+    for (const k of keys) {
+      const l = byA.get(k) ?? byB.get(k)!
+      rows.push({ code: l.code, name: l.name, current: byA.get(k)?.amount ?? 0, prior: byB.get(k)?.amount ?? 0, _style: 'indent' })
+    }
+    rows.push({ code: '', name: totalLabel, current: ta, prior: tb, _style: 'subtotal' })
   }
+  rows.push({ code: '', name: 'ASSETS', _style: 'heading' })
+  group('Non-current assets', cur.nonCurrentAssets, prev.nonCurrentAssets, 'Total non-current assets', cur.totals.nonCurrentAssets, prev.totals.nonCurrentAssets)
+  group('Current assets', cur.currentAssets, prev.currentAssets, 'Total current assets', cur.totals.currentAssets, prev.totals.currentAssets)
+  rows.push({ code: '', name: 'TOTAL ASSETS', current: cur.totals.assets, prior: prev.totals.assets, _style: 'total' }, { _style: 'spacer' })
+  rows.push({ code: '', name: 'EQUITY AND LIABILITIES', _style: 'heading' })
+  group('Equity', cur.equity, prev.equity, 'Total equity', cur.totals.equity, prev.totals.equity)
+  group('Non-current liabilities', cur.nonCurrentLiabilities, prev.nonCurrentLiabilities, 'Total non-current liabilities', cur.totals.nonCurrentLiabilities, prev.totals.nonCurrentLiabilities)
+  group('Current liabilities', cur.currentLiabilities, prev.currentLiabilities, 'Total current liabilities', cur.totals.currentLiabilities, prev.totals.currentLiabilities)
+  rows.push({ code: '', name: 'Total liabilities', current: cur.totals.liabilities, prior: prev.totals.liabilities, _style: 'subtotal' })
+  rows.push({ code: '', name: 'TOTAL EQUITY AND LIABILITIES', current: cur.totals.equityAndLiabilities, prior: prev.totals.equityAndLiabilities, _style: 'total' })
 
-  const rows = accounts.map((a) => {
-    const s = sums.get(a.id) ?? { debit: 0, credit: 0 }
-    const balance = a.normalBalance === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
-    return { code: a.code, name: a.name, accountType: a.accountClass, reportingGroup: a.reportingGroup, balance }
-  }).filter((r) => r.balance !== 0)
-
-  const assets = rows.filter((r) => r.accountType === 'ASSET')
-  const liabilities = rows.filter((r) => r.accountType === 'LIABILITY')
-  const equity = rows.filter((r) => r.accountType === 'EQUITY' && r.reportingGroup !== 'Current Year Earnings')
-
-  const fyStart = fiscalYearStartFor(asOf, org?.fiscalYearStart ?? '01-01')
-  const pnlEntryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted', entryDate: { gte: fyStart, lte: asOf } }
-  if (branchId) pnlEntryWhere.branchId = branchId
-
-  const pnlAccounts = await prisma.account.findMany({
-    where: { organizationId: orgId, status: 'ACTIVE', accountClass: { in: ['REVENUE', 'EXPENSE'] } },
-    select: { id: true, accountClass: true, normalBalance: true },
-  })
-  const pnlLines = await prisma.journalLine.findMany({
-    where: { journalEntry: pnlEntryWhere },
-    select: { accountId: true, debitAmount: true, creditAmount: true },
-  })
-  const pnlSums = new Map<string, { debit: number; credit: number }>()
-  for (const l of pnlLines) {
-    const s = pnlSums.get(l.accountId) ?? { debit: 0, credit: 0 }
-    s.debit += Number(l.debitAmount)
-    s.credit += Number(l.creditAmount)
-    pnlSums.set(l.accountId, s)
-  }
-  let revenueTotal = 0
-  let expenseTotal = 0
-  for (const a of pnlAccounts) {
-    const s = pnlSums.get(a.id) ?? { debit: 0, credit: 0 }
-    const balance = a.normalBalance === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
-    if (a.accountClass === 'REVENUE') revenueTotal += balance
-    else expenseTotal += balance
-  }
-  const currentYearEarnings = revenueTotal - expenseTotal
-
-  const totalAssets = assets.reduce((s, r) => s + r.balance, 0)
-  const totalLiabilities = liabilities.reduce((s, r) => s + r.balance, 0)
-  const totalEquity = equity.reduce((s, r) => s + r.balance, 0) + currentYearEarnings
-
-  const equityRows = [
-    ...equity.map(({ code, name, balance }) => ({ code, name, balance })),
-    { code: '3300', name: 'Current Year Earnings', balance: currentYearEarnings },
-  ]
-
-  const legacy = {
-    asOf: asOf.toISOString(),
-    assets: assets.map(({ code, name, balance }) => ({ code, name, balance })),
-    liabilities: liabilities.map(({ code, name, balance }) => ({ code, name, balance })),
-    equity: equityRows,
-    totalAssets,
-    totalLiabilities,
-    totalEquity,
-    netPosition: totalAssets - totalLiabilities,
-    // Assets = Liabilities + Equity
-    balanced: Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01,
-  }
-
-  const section = (id: string, title: string, list: { code: string; name: string; balance: number }[], total: number): ReportSection => ({
-    type: 'table', id, title,
-    columns: [{ key: 'code', label: 'Code', format: 'code', width: 0.8 }, { key: 'name', label: 'Account', width: 3.2 }, { key: 'balance', label: 'Balance', format: 'money' }],
-    rows: list.map((r) => ({ code: r.code, name: r.name, balance: round2(r.balance) })),
-    totals: { code: `TOTAL ${title.toUpperCase()}`, balance: round2(total) },
-    emptyMessage: 'No balances',
-  })
-
+  const difference = round2(cur.totals.assets - cur.totals.equityAndLiabilities)
+  const balanced = Math.abs(difference) < regionalMoneyTolerance()
+  const currentRatio = cur.totals.currentLiabilities > 0 ? round2(cur.totals.currentAssets / cur.totals.currentLiabilities) : null
   const report: ProReport = {
-    ...(await baseReport(req, 'balance-sheet', 'Balance Sheet', 'Financial position')),
-    periodLabel: `As of ${asOf.toISOString().slice(0, 10)}`,
-    summaryLine: '',
+    ...(await baseReport(req, 'balance-sheet', 'Statement of Financial Position', 'Financial position')),
+    kind: 'statement',
+    periodLabel: `As at ${formatDate(asOf)}`,
+    summaryLine: `As at ${formatDate(asOf)}  |  Comparative: as at ${formatDate(priorDate)} (end of the previous financial year)`,
     kpis: [
-      { label: 'Total assets', value: round2(totalAssets), hint: plural(assets.length, 'account') },
-      { label: 'Total liabilities', value: round2(totalLiabilities), hint: plural(liabilities.length, 'account') },
-      { label: 'Total equity', value: round2(totalEquity), hint: `Incl. ${fmtMoney(currentYearEarnings)} current-year earnings` },
-      { label: 'Assets = Liab. + Equity', value: legacy.balanced ? 'Balanced' : 'Out of balance', format: 'text', hint: legacy.balanced ? 'Books balance' : `Difference ${fmtMoney(totalAssets - totalLiabilities - totalEquity)}`, tone: 'dark' },
-    ],
-    sections: [
-      section('assets', 'Assets', legacy.assets, totalAssets),
-      section('liabilities', 'Liabilities', legacy.liabilities, totalLiabilities),
-      section('equity', 'Equity', equityRows, totalEquity),
-      { type: 'note', id: 'basis', title: 'Basis of preparation', text: `Balances from posted journal entries up to ${asOf.toISOString().slice(0, 10)}. Current Year Earnings is computed live as revenue minus expenses since the fiscal year start (${fyStart.toISOString().slice(0, 10)}).` },
-    ],
-  }
-  report.summaryLine = `As of ${asOf.toISOString().slice(0, 10)}  |  ${plural(rows.length, 'account')} with balances`
-  await sendProReport(res, format, report, legacy)
-})
-
-// ── VAT Summary ─────────────────────────────────────────────────────────────
-
-router.get('/vat-summary', async (req: Request, res: Response) => {
-  const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
-  const orgId = req.user.organizationId
-
-  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted' }
-  if (branchId) entryWhere.branchId = branchId
-  const entryDate = dateRangeFilter(fromDate, toDate)
-  if (entryDate) entryWhere.entryDate = entryDate
-
-  // Sourced from Output VAT / Input VAT account activity (captured at
-  // posting time) rather than raw vatAmount fields on operational records —
-  // changing an account's default tax rate later never alters these figures.
-  const [outputMapping, inputMapping] = await Promise.all([
-    prisma.accountingMapping.findUnique({ where: { organizationId_key: { organizationId: orgId, key: 'OUTPUT_VAT' } } }),
-    prisma.accountingMapping.findUnique({ where: { organizationId_key: { organizationId: orgId, key: 'INPUT_VAT' } } }),
-  ])
-
-  const [outputLines, inputLines] = await Promise.all([
-    outputMapping
-      ? prisma.journalLine.findMany({ where: { accountId: outputMapping.accountId, journalEntry: entryWhere }, select: { debitAmount: true, creditAmount: true } })
-      : Promise.resolve([]),
-    inputMapping
-      ? prisma.journalLine.findMany({
-          where: { accountId: inputMapping.accountId, journalEntry: entryWhere },
-          select: { debitAmount: true, creditAmount: true, journalEntry: { select: { sourceType: true } } },
-        })
-      : Promise.resolve([]),
-  ])
-
-  const vatCollected = outputLines.reduce((s, l) => s + Number(l.creditAmount) - Number(l.debitAmount), 0)
-
-  let vatPaidExpenses = 0
-  let vatPaidBills = 0
-  let vatPaidOther = 0
-  for (const l of inputLines) {
-    const net = Number(l.debitAmount) - Number(l.creditAmount)
-    if (l.journalEntry.sourceType === 'EXPENSE') vatPaidExpenses += net
-    else if (l.journalEntry.sourceType === 'BILL') vatPaidBills += net
-    else vatPaidOther += net
-  }
-  const vatPaid = vatPaidExpenses + vatPaidBills + vatPaidOther
-  const net = vatCollected - vatPaid
-
-  const legacy = {
-    fromDate: fromDate || null,
-    toDate: toDate || null,
-    vatCollected,
-    vatPaidExpenses,
-    vatPaidBills,
-    vatPaid,
-    netVatPayable: net,
-    configured: { outputVat: !!outputMapping, inputVat: !!inputMapping },
-  }
-
-  const breakdown: ReportRow[] = [
-    { line: 'Output VAT — collected on sales', amount: round2(vatCollected), _style: 'indent' },
-    { line: 'Input VAT — paid on expenses', amount: round2(-vatPaidExpenses), _style: 'indent' },
-    { line: 'Input VAT — paid on supplier purchases', amount: round2(-vatPaidBills), _style: 'indent' },
-    ...(Math.abs(vatPaidOther) > 0.005 ? [{ line: 'Input VAT — other', amount: round2(-vatPaidOther), _style: 'indent' as const }] : []),
-    { line: net >= 0 ? 'Net VAT payable to authority' : 'Net VAT refundable', amount: round2(net), _style: 'subtotal' },
-  ]
-
-  const report: ProReport = {
-    ...(await baseReport(req, 'vat-summary', 'VAT / Tax Summary', 'VAT position')),
-    summaryLine: '',
-    kpis: [
-      { label: 'Output VAT', value: round2(vatCollected), hint: 'Collected on sales' },
-      { label: 'Input VAT', value: round2(vatPaid), hint: 'Paid on expenses & purchases' },
-      { label: 'Recovery rate', value: pct(vatPaid, vatCollected), format: 'percent', hint: 'Input ÷ output VAT' },
-      { label: net >= 0 ? 'Net VAT payable' : 'Net VAT refundable', value: round2(Math.abs(net)), hint: 'Output − input VAT', tone: 'dark' },
+      { label: 'Total assets', value: cur.totals.assets, hint: `Non-current ${formatMoney(cur.totals.nonCurrentAssets)}` },
+      { label: 'Total liabilities', value: cur.totals.liabilities, hint: currentRatio != null ? `Current ratio ${formatNumber(currentRatio, 2)} : 1` : 'No current liabilities' },
+      { label: 'Total equity', value: cur.totals.equity, hint: `Incl. ${formatMoney(cur.profitThisYear)} profit this year` },
+      { label: 'Balance check', value: balanced ? 'Balanced' : 'Out of balance', format: 'text', hint: balanced ? 'Assets = equity + liabilities' : `Difference ${formatMoney(difference)}`, tone: 'dark' },
     ],
     sections: [
       {
-        type: 'table', id: 'breakdown', title: 'VAT computation', primary: true,
-        columns: [{ key: 'line', label: 'Line', width: 4 }, { key: 'amount', label: 'Amount', format: 'money' }],
-        rows: breakdown,
+        type: 'table', id: 'position', title: 'Statement of financial position', subtitle: `As at ${formatDate(asOf)} and ${formatDate(priorDate)}`, primary: true,
+        columns: [{ key: 'code', label: 'Code', format: 'code', width: 0.6 }, { key: 'name', label: 'Line item', width: 3 }, { key: 'current', label: formatDate(asOf), format: 'money' }, { key: 'prior', label: formatDate(priorDate), format: 'money' }],
+        rows,
       },
-      ...(!outputMapping || !inputMapping ? [{ type: 'note' as const, id: 'config', title: 'Configuration warning', tone: 'warning' as const, text: `${!outputMapping ? 'Output VAT' : ''}${!outputMapping && !inputMapping ? ' and ' : ''}${!inputMapping ? 'Input VAT' : ''} account mapping is not configured — those figures show as zero. Set it under Chart of Accounts → Settings.` }] : []),
-      { type: 'note', id: 'basis', title: 'Basis of preparation', text: 'Figures come from posted activity on the mapped Output VAT and Input VAT accounts, so they match the general ledger exactly.' },
+      ...(!balanced ? [{ type: 'note' as const, id: 'difference', title: 'Out of balance', tone: 'warning' as const, text: `Assets differ from equity and liabilities by ${formatMoney(difference)}. Check for unposted or one-sided journal entries.` }] : []),
+      { type: 'note', id: 'basis', title: 'Basis of preparation', text: `Balances from posted journal entries up to ${formatDate(asOf)}. Assets and liabilities are split into current and non-current (IAS 1). Profit for the year runs from the start of the financial year (${formatDate(cur.fyStart)}); profit of earlier years is shown in retained earnings. An overdrawn bank account is shown as a current liability.` },
     ],
   }
-  report.summaryLine = `Period: ${report.periodLabel}  |  ${report.scopeLabel}`
-  await sendProReport(res, format, report, legacy)
+  await sendProReport(res, format, report, {
+    asOf: asOf.toISOString(), totalAssets: cur.totals.assets, totalLiabilities: cur.totals.liabilities, totalEquity: cur.totals.equity,
+    netPosition: round2(cur.totals.assets - cur.totals.liabilities), balanced, position: cur, comparative: prev,
+  })
+})
+
+// ── Statement of cash flows (indirect method) ───────────────────────────────
+
+router.get('/cash-flow', requirePermission('can_view_financial_reports'), async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+  const to = parseDay(toDate) ?? todayInZone()
+  const [fy, accounts] = await Promise.all([orgFiscalYear(orgId), statementAccounts(orgId)])
+  const from = parseDay(fromDate) ?? fiscalYearStartFor(to, fy)
+  const cf = await cashFlows(orgId, from, to, accounts, branchId || undefined)
+
+  const rows: ReportRow[] = []
+  const lines = (l: CashFlowLine[]) => l.forEach((x) => rows.push({ code: x.code, name: x.name, amount: x.amount, _style: 'indent' }))
+  rows.push({ code: '', name: 'Cash flows from operating activities', _style: 'heading' })
+  rows.push({ code: '', name: 'Profit for the period', amount: cf.profit, _style: 'indent' })
+  if (cf.adjustments.length) { rows.push({ code: '', name: 'Adjustments for non-cash items', _style: 'heading' }); lines(cf.adjustments) }
+  if (cf.workingCapital.length) { rows.push({ code: '', name: 'Changes in working capital', _style: 'heading' }); lines(cf.workingCapital) }
+  rows.push({ code: '', name: 'Net cash from operating activities', amount: cf.operatingTotal, _style: 'subtotal' }, { _style: 'spacer' })
+  rows.push({ code: '', name: 'Cash flows from investing activities', _style: 'heading' })
+  lines(cf.investing)
+  rows.push({ code: '', name: 'Net cash used in investing activities', amount: cf.investingTotal, _style: 'subtotal' }, { _style: 'spacer' })
+  rows.push({ code: '', name: 'Cash flows from financing activities', _style: 'heading' })
+  lines(cf.financing)
+  rows.push({ code: '', name: 'Net cash from financing activities', amount: cf.financingTotal, _style: 'subtotal' }, { _style: 'spacer' })
+  rows.push({ code: '', name: 'Net increase / (decrease) in cash and cash equivalents', amount: cf.netChange, _style: 'subtotal' })
+  rows.push({ code: '', name: `Cash and cash equivalents at ${formatDate(from)}`, amount: cf.openingCash, _style: 'indent' })
+  rows.push({ code: '', name: `Cash and cash equivalents at ${formatDate(to)}`, amount: cf.closingCash, _style: 'total' })
+
+  const reconciled = Math.abs(round2(cf.openingCash + cf.netChange - cf.closingCash)) < regionalMoneyTolerance()
+  const periodText = shortRange(from, to)
+  const report: ProReport = {
+    ...(await baseReport(req, 'cash-flow', 'Statement of Cash Flows', 'Cash flows')),
+    kind: 'statement',
+    periodLabel: periodText,
+    summaryLine: `For the period ${periodText}  |  Indirect method`,
+    kpis: [
+      { label: 'Operating activities', value: cf.operatingTotal, hint: 'Cash generated by trading', tone: cf.operatingTotal >= 0 ? 'default' : 'negative' },
+      { label: 'Investing activities', value: cf.investingTotal, hint: 'Long-term assets' },
+      { label: 'Financing activities', value: cf.financingTotal, hint: 'Owners and lenders' },
+      { label: 'Closing cash', value: cf.closingCash, hint: `${cf.netChange >= 0 ? 'Up' : 'Down'} ${formatMoney(Math.abs(cf.netChange))} in the period`, tone: 'dark' },
+    ],
+    sections: [
+      { type: 'table', id: 'cash-flows', title: 'Statement of cash flows', subtitle: `For the period ${periodText}`, primary: true, columns: [{ key: 'code', label: 'Code', format: 'code', width: 0.6 }, { key: 'name', label: 'Line item', width: 3.6 }, { key: 'amount', label: 'Amount', format: 'money' }], rows },
+      ...(!reconciled ? [{ type: 'note' as const, id: 'difference', title: 'Does not reconcile', tone: 'warning' as const, text: 'Opening cash plus the net change does not equal closing cash. Check for one-sided journal entries.' }] : []),
+      { type: 'note', id: 'basis', title: 'Basis of preparation', text: 'Indirect method (IAS 7): profit for the period adjusted for non-cash items and changes in working capital. Cash and cash equivalents are the accounts in the Cash and Bank reporting groups (cash on hand, bank and card clearing). Amounts in brackets are cash outflows.' },
+    ],
+  }
+  await sendProReport(res, format, report, { ...cf, from: from.toISOString(), to: to.toISOString(), reconciled })
+})
+
+// ── Trial balance ───────────────────────────────────────────────────────────
+// Opening balance, movements in the period and closing balance for every
+// account with activity. Profit of earlier financial years is carried in one
+// retained-earnings line, so the opening and closing columns each balance.
+
+router.get('/trial-balance', requirePermission('can_view_financial_reports'), async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+  const from = parseDay(fromDate)
+  const to = parseDay(toDate) ?? todayInZone()
+  const [fy, accounts] = await Promise.all([orgFiscalYear(orgId), statementAccounts(orgId)])
+  const fyStart = fiscalYearStartFor(from ?? to, fy)
+  const branch = branchId || undefined
+  const [beforeFy, fyToFrom, movement] = await Promise.all([
+    from ? netByAccount(orgId, { to: dayBefore(fyStart) }, branch) : Promise.resolve(new Map()),
+    from && from > fyStart ? netByAccount(orgId, { from: fyStart, to: dayBefore(from) }, branch) : Promise.resolve(new Map()),
+    netByAccount(orgId, { from, to }, branch),
+  ])
+  const net = (m: Map<string, { debit: number; credit: number }>, id: string) => { const s = m.get(id); return s ? s.debit - s.credit : 0 }
+  const classLabel: Record<string, string> = { ASSET: 'Asset', LIABILITY: 'Liability', EQUITY: 'Equity', REVENUE: 'Revenue', EXPENSE: 'Expense' }
+  const split = (n: number) => ({ dr: n > 0.005 ? round2(n) : 0, cr: n < -0.005 ? round2(-n) : 0 })
+  let priorYearsProfit = 0
+  const rows: ReportRow[] = []
+  for (const a of accounts) {
+    const isPnl = a.accountClass === 'REVENUE' || a.accountClass === 'EXPENSE'
+    // P&L accounts open at zero each financial year; earlier years sit in retained earnings
+    let opening = net(fyToFrom, a.id) + (isPnl ? 0 : net(beforeFy, a.id))
+    if (isPnl) priorYearsProfit += -net(beforeFy, a.id)
+    const m = movement.get(a.id) ?? { debit: 0, credit: 0 }
+    opening = round2(opening)
+    const closing = round2(opening + m.debit - m.credit)
+    if (Math.abs(opening) < 0.005 && m.debit < 0.005 && m.credit < 0.005) continue
+    const o = split(opening), c = split(closing)
+    rows.push({ code: a.code, name: a.name, accountClass: classLabel[a.accountClass], openDr: o.dr, openCr: o.cr, debit: round2(m.debit), credit: round2(m.credit), closeDr: c.dr, closeCr: c.cr })
+  }
+  priorYearsProfit = round2(priorYearsProfit)
+  if (Math.abs(priorYearsProfit) >= 0.005) {
+    const s = split(-priorYearsProfit)
+    rows.push({ code: '', name: 'Retained earnings — profit of earlier years (not yet closed)', accountClass: 'Equity', openDr: s.dr, openCr: s.cr, debit: 0, credit: 0, closeDr: s.dr, closeCr: s.cr })
+  }
+  const keys = ['openDr', 'openCr', 'debit', 'credit', 'closeDr', 'closeCr']
+  const totals = totalsOf(rows, 'TOTAL', keys, 'code')
+  const diffClose = round2(Number(totals.closeDr) - Number(totals.closeCr))
+  const diffMove = round2(Number(totals.debit) - Number(totals.credit))
+  const balanced = Math.abs(diffClose) < regionalMoneyTolerance() && Math.abs(diffMove) < regionalMoneyTolerance()
+  const periodText = from ? shortRange(from, to) : `Up to ${formatDate(to)}`
+  const report: ProReport = {
+    ...(await baseReport(req, 'trial-balance', 'Trial Balance', 'Trial balance')),
+    periodLabel: periodText,
+    summaryLine: `For the period ${periodText}  |  Closing balances as at ${formatDate(to)}  |  ${plural(rows.length, 'account')}`,
+    kpis: [
+      { label: 'Period debits', value: Number(totals.debit), hint: 'Posted in the period' },
+      { label: 'Period credits', value: Number(totals.credit), hint: 'Posted in the period' },
+      { label: 'Closing balance', value: Number(totals.closeDr), hint: `Debits = credits as at ${formatDate(to)}` },
+      { label: 'Status', value: balanced ? 'Balanced' : 'Out of balance', format: 'text', hint: balanced ? 'Books are in balance' : `Difference ${formatMoney(diffClose || diffMove)}`, tone: 'dark' },
+    ],
+    sections: [{
+      type: 'table', id: 'accounts', title: 'Trial balance', subtitle: 'Opening balance, movements in the period and closing balance, by account code', primary: true,
+      columns: [
+        { key: 'code', label: 'Code', format: 'code', width: 0.6 }, { key: 'name', label: 'Account', width: 2.4 }, { key: 'accountClass', label: 'Type', width: 0.75 },
+        { key: 'openDr', label: 'Opening Dr', format: 'money' }, { key: 'openCr', label: 'Opening Cr', format: 'money' },
+        { key: 'debit', label: 'Period Dr', format: 'money' }, { key: 'credit', label: 'Period Cr', format: 'money' },
+        { key: 'closeDr', label: 'Closing Dr', format: 'money' }, { key: 'closeCr', label: 'Closing Cr', format: 'money' },
+      ],
+      rows,
+      totals,
+    }],
+  }
+  await sendProReport(res, format, report, { accounts: rows, balanced })
+})
+
+// ── Sales-tax / VAT / GST return summary ────────────────────────────────────
+
+router.get('/vat-summary', requirePermission('can_view_financial_reports'), async (req: Request, res: Response) => {
+  const { branchId, fromDate, toDate, format } = req.query as Record<string, string>
+  const orgId = req.user.organizationId
+  const from = parseDay(fromDate)
+  const to = parseDay(toDate) ?? todayInZone()
+  const entryWhere: Record<string, unknown> = { organizationId: orgId, status: 'posted', entryDate: { ...(from && { gte: from }), lt: new Date(to.getTime() + 86_400_000) } }
+  if (branchId) entryWhere.branchId = branchId
+
+  // From Output / Input tax account activity captured at posting time, so the
+  // figures match the general ledger exactly
+  const [outputMapping, inputMapping, accounts] = await Promise.all([
+    prisma.accountingMapping.findUnique({ where: { organizationId_key: { organizationId: orgId, key: 'OUTPUT_VAT' } } }),
+    prisma.accountingMapping.findUnique({ where: { organizationId_key: { organizationId: orgId, key: 'INPUT_VAT' } } }),
+    statementAccounts(orgId),
+  ])
+  const [outputLines, inputLines, sums] = await Promise.all([
+    outputMapping ? prisma.journalLine.findMany({ where: { accountId: outputMapping.accountId, journalEntry: entryWhere }, select: { debitAmount: true, creditAmount: true } }) : Promise.resolve([]),
+    inputMapping ? prisma.journalLine.findMany({ where: { accountId: inputMapping.accountId, journalEntry: entryWhere }, select: { debitAmount: true, creditAmount: true, journalEntry: { select: { sourceType: true } } } }) : Promise.resolve([]),
+    netByAccount(orgId, { from, to }, branchId || undefined),
+  ])
+  const outputTax = round2(outputLines.reduce((s, l) => s + Number(l.creditAmount) - Number(l.debitAmount), 0))
+  let onExpenses = 0, onPurchases = 0, other = 0
+  for (const l of inputLines) {
+    const n = Number(l.debitAmount) - Number(l.creditAmount)
+    if (l.journalEntry.sourceType === 'EXPENSE') onExpenses += n
+    else if (l.journalEntry.sourceType === 'BILL') onPurchases += n
+    else other += n
+  }
+  onExpenses = round2(onExpenses); onPurchases = round2(onPurchases); other = round2(other)
+  const inputTax = round2(onExpenses + onPurchases + other)
+  const net = round2(outputTax - inputTax)
+  const taxableSales = round2(accounts.filter((a) => a.accountClass === 'REVENUE' && pnlGroup(a) !== 'other_income').reduce((t, a) => { const s = sums.get(a.id); return t + (s ? s.credit - s.debit : 0) }, 0))
+  const T = tax()
+  const rows: ReportRow[] = [
+    { line: 'Sales and output tax', _style: 'heading' },
+    { line: `Taxable sales (excluding ${T})`, base: taxableSales, amount: null, _style: 'indent' },
+    { line: `Output ${T} charged on sales`, base: null, amount: outputTax, _style: 'indent' },
+    { line: 'Purchases and input tax', _style: 'heading' },
+    { line: `Input ${T} on expenses`, base: null, amount: -onExpenses, _style: 'indent' },
+    { line: `Input ${T} on supplier purchases`, base: null, amount: -onPurchases, _style: 'indent' },
+    ...(Math.abs(other) >= 0.005 ? [{ line: `Input ${T} — other`, base: null, amount: -other, _style: 'indent' as const }] : []),
+    { line: `Total input ${T}`, base: null, amount: -inputTax, _style: 'subtotal' },
+    { _style: 'spacer' },
+    { line: net >= 0 ? `Net ${T} payable to the tax authority` : `Net ${T} refundable / carried forward`, base: null, amount: net, _style: 'total' },
+  ]
+  const periodText = from ? shortRange(from, to) : `Up to ${formatDate(to)}`
+  const report: ProReport = {
+    ...(await baseReport(req, 'vat-summary', `${T} Return Summary`, `${T} position`)),
+    kind: 'statement',
+    periodLabel: periodText,
+    summaryLine: `Tax period ${periodText}  |  ${(await reportScope(prisma, orgId, branchId || undefined)).scopeLabel}`,
+    kpis: [
+      { label: `Output ${T}`, value: outputTax, hint: `Effective rate ${formatPercent(pct(outputTax, taxableSales))} of taxable sales` },
+      { label: `Input ${T}`, value: inputTax, hint: 'Paid on expenses and purchases' },
+      { label: 'Taxable sales', value: taxableSales, hint: `Excluding ${T}` },
+      { label: net >= 0 ? `Net ${T} payable` : `Net ${T} refundable`, value: Math.abs(net), hint: `Output − input ${T}`, tone: 'dark' },
+    ],
+    sections: [
+      {
+        type: 'table', id: 'computation', title: `${T} computation`, subtitle: `Tax period ${periodText}`, primary: true,
+        columns: [{ key: 'line', label: 'Description', width: 3.6 }, { key: 'base', label: 'Taxable value', format: 'money' }, { key: 'amount', label: T, format: 'money' }],
+        rows,
+      },
+      ...(!outputMapping || !inputMapping ? [{ type: 'note' as const, id: 'config', title: 'Configuration warning', tone: 'warning' as const, text: `The ${!outputMapping ? 'output' : 'input'} tax account mapping is not set, so those figures show as zero. Set it under Chart of Accounts → Settings.` }] : []),
+      { type: 'note', id: 'basis', title: 'Basis of preparation', text: `Figures come from posted activity on the mapped output and input ${T} accounts, so they agree with the general ledger. Use this summary to prepare the return; the official return form and filing deadlines are set by your tax authority.` },
+    ],
+  }
+  await sendProReport(res, format, report, { fromDate: fromDate || null, toDate: toDate || null, vatCollected: outputTax, vatPaidExpenses: onExpenses, vatPaidBills: onPurchases, vatPaid: inputTax, netVatPayable: net, taxableSales, configured: { outputVat: !!outputMapping, inputVat: !!inputMapping } })
 })
 
 export default router

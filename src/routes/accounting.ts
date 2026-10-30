@@ -1,13 +1,18 @@
+import { roundMoney } from '../utils/money'
+import { moneyTolerance as regionalMoneyTolerance } from '../utils/money'
+import { updateSchema } from '../utils/updateSchema'
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
+import { requireModule, requirePermission, requireAnyPermission } from '../middleware/authorize'
 import { paginate, paginatedResponse, parsePageParams } from '../utils/pagination'
 import { AppError } from '../middleware/error'
 
 const router = Router()
 
 router.use(authenticate)
+router.use(requireModule('accounting', 'accounts'))
 
 const accountSchema = z.object({
   code: z.string().min(1),
@@ -59,7 +64,7 @@ router.get('/accounts', async (req: Request, res: Response) => {
 })
 
 // POST /accounting/accounts
-router.post('/accounts', async (req: Request, res: Response) => {
+router.post('/accounts', requirePermission('can_manage_accounting'), async (req: Request, res: Response) => {
   const body = accountSchema.parse(req.body)
   const account = await prisma.account.create({
     data: { ...body, organizationId: req.user.organizationId },
@@ -81,19 +86,19 @@ router.get('/accounts/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /accounting/accounts/:id
-router.put('/accounts/:id', async (req: Request, res: Response) => {
+router.put('/accounts/:id', requirePermission('can_manage_accounting'), async (req: Request, res: Response) => {
   const account = await prisma.account.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!account) throw new AppError('Account not found', 404, 'NOT_FOUND')
 
-  const body = accountSchema.partial().parse(req.body)
+  const body = updateSchema(accountSchema).parse(req.body)
   const updated = await prisma.account.update({ where: { id: req.params.id }, data: { ...body } })
   res.json(updated)
 })
 
 // DELETE /accounting/accounts/:id
-router.delete('/accounts/:id', async (req: Request, res: Response) => {
+router.delete('/accounts/:id', requirePermission('can_manage_accounting'), async (req: Request, res: Response) => {
   const account = await prisma.account.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -144,8 +149,9 @@ router.get('/journals', async (req: Request, res: Response) => {
 })
 
 // POST /accounting/journals
-router.post('/journals', async (req: Request, res: Response) => {
+router.post('/journals', requireAnyPermission('can_manage_accounting', 'manual_journals_create'), async (req: Request, res: Response) => {
   const body = journalEntrySchema.parse(req.body)
+  body.lines = body.lines.map(line => ({ ...line, debitAmount: roundMoney(line.debitAmount), creditAmount: roundMoney(line.creditAmount) }))
 
   const branch = await prisma.branch.findFirst({
     where: { id: body.branchId, organizationId: req.user.organizationId },
@@ -154,7 +160,7 @@ router.post('/journals', async (req: Request, res: Response) => {
 
   const totalDebit = body.lines.reduce((s, l) => s + l.debitAmount, 0)
   const totalCredit = body.lines.reduce((s, l) => s + l.creditAmount, 0)
-  const isBalanced = Math.abs(totalDebit - totalCredit) < 0.01
+  const isBalanced = Math.abs(totalDebit - totalCredit) < regionalMoneyTolerance()
 
   const year = new Date().getFullYear()
   const jeCount = await prisma.journalEntry.count({
@@ -162,7 +168,8 @@ router.post('/journals', async (req: Request, res: Response) => {
   })
   const entryNo = `JE-${year}-${(jeCount + 1).toString().padStart(4, '0')}`
 
-  const { lines, ...entryData } = body
+  const { lines: rawLines, ...entryData } = body
+  const lines = rawLines?.map(line => ({ ...line, debitAmount: roundMoney(line.debitAmount), creditAmount: roundMoney(line.creditAmount) }))
 
   const entry = await prisma.journalEntry.create({
     data: {
@@ -199,14 +206,14 @@ router.get('/journals/:id', async (req: Request, res: Response) => {
 })
 
 // PUT /accounting/journals/:id
-router.put('/journals/:id', async (req: Request, res: Response) => {
+router.put('/journals/:id', requireAnyPermission('can_manage_accounting', 'manual_journals_create'), async (req: Request, res: Response) => {
   const entry = await prisma.journalEntry.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
   if (!entry) throw new AppError('Journal entry not found', 404, 'NOT_FOUND')
   if (entry.status !== 'draft') throw new AppError('Only draft entries can be edited', 400, 'INVALID_STATUS')
 
-  const body = journalEntrySchema.partial().parse(req.body)
+  const body = updateSchema(journalEntrySchema).parse(req.body)
   const { lines, ...entryData } = body
 
   if (lines !== undefined) {
@@ -220,7 +227,7 @@ router.put('/journals/:id', async (req: Request, res: Response) => {
         data: {
           totalDebit,
           totalCredit,
-          isBalanced: Math.abs(totalDebit - totalCredit) < 0.01,
+          isBalanced: Math.abs(totalDebit - totalCredit) < regionalMoneyTolerance(),
           lines: { create: lines },
         },
       })
@@ -240,7 +247,7 @@ router.put('/journals/:id', async (req: Request, res: Response) => {
 })
 
 // POST /accounting/journals/:id/post
-router.post('/journals/:id/post', async (req: Request, res: Response) => {
+router.post('/journals/:id/post', requireAnyPermission('can_post_journal', 'manual_journals_post'), async (req: Request, res: Response) => {
   const entry = await prisma.journalEntry.findFirst({
     where: { id: req.params.id, organizationId: req.user.organizationId },
   })
@@ -290,7 +297,7 @@ router.get('/trial-balance', async (req: Request, res: Response) => {
 
   const accountRows = accounts.map((a) => {
     const s = sums[a.id] ?? { debit: 0, credit: 0 }
-    const balance = a.normalBalance === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
+    const balance = a.normalBalance.toUpperCase() === 'DEBIT' ? s.debit - s.credit : s.credit - s.debit
     return {
       accountId: a.id,
       code: a.code,
@@ -363,7 +370,7 @@ router.get('/ledger', async (req: Request, res: Response) => {
   const rows = lines.map((l) => {
     const debitAmount = Number(l.debitAmount)
     const creditAmount = Number(l.creditAmount)
-    running += account.normalBalance === 'DEBIT' ? debitAmount - creditAmount : creditAmount - debitAmount
+    running += account.normalBalance.toUpperCase() === 'DEBIT' ? debitAmount - creditAmount : creditAmount - debitAmount
     return {
       id: l.id,
       entryNo: l.journalEntry.entryNo,
@@ -381,7 +388,7 @@ router.get('/ledger', async (req: Request, res: Response) => {
 })
 
 // POST /accounting/journals/:id/void
-router.post('/journals/:id/void', async (req: Request, res: Response) => {
+router.post('/journals/:id/void', requireAnyPermission('can_void_journal', 'journals_reverse'), async (req: Request, res: Response) => {
   const { voidReason } = req.body
   if (!voidReason) throw new AppError('Void reason is required', 400, 'VALIDATION_ERROR')
 

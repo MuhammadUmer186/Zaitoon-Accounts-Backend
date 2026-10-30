@@ -1,6 +1,14 @@
+import { currentFormat } from './reportFormat'
 import { Response } from 'express'
 import ExcelJS from 'exceljs'
 import PDFDocument from 'pdfkit'
+import { restaurantPresentation } from './restaurantPresentation'
+
+function displayRows(res: Response, rows: Record<string, unknown>[]) {
+  if (!res.locals.singleBranch) return rows
+  return (restaurantPresentation(rows, res.locals.restaurantName) as Record<string, unknown>[]).map(row =>
+    Object.fromEntries(Object.entries(row).map(([key, value]) => [key === 'branchName' || key === 'branch' ? 'restaurant' : key, value])))
+}
 
 // A generic tabular exporter shared by every simple "list" report (daily
 // sales, expenses, cash closings, wastage, audit log, ...). Structured
@@ -9,8 +17,9 @@ import PDFDocument from 'pdfkit'
 // its own CSV/Excel/PDF writer.
 
 function csvEscape(value: unknown): string {
-  const s = value == null ? '' : String(value)
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+  const text = value == null ? '' : String(value)
+  const s = typeof value === 'string' && /^[\s]*[=+@-]/.test(text) ? `'${text}` : text
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
   return s
 }
 
@@ -25,6 +34,7 @@ function humanize(key: string): string {
 const fileStamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
 
 export function sendRowsCsv(res: Response, rows: Record<string, unknown>[], reportName: string): void {
+  rows = displayRows(res, rows)
   res.setHeader('Content-Type', 'text/csv; charset=utf-8')
   res.setHeader('Content-Disposition', `attachment; filename="${reportName}-${fileStamp()}.csv"`)
 
@@ -39,8 +49,9 @@ export function sendRowsCsv(res: Response, rows: Record<string, unknown>[], repo
 }
 
 export async function sendRowsExcel(res: Response, rows: Record<string, unknown>[], reportName: string, sheetTitle?: string): Promise<void> {
+  rows = displayRows(res, rows)
   const wb = new ExcelJS.Workbook()
-  wb.creator = 'Zaitoon Accounts'
+  wb.creator = 'FoodSync'
   wb.created = new Date()
   const ws = wb.addWorksheet((sheetTitle ?? 'Report').slice(0, 31))
 
@@ -59,6 +70,7 @@ export async function sendRowsExcel(res: Response, rows: Record<string, unknown>
 }
 
 export function sendRowsPdf(res: Response, rows: Record<string, unknown>[], reportName: string, title: string): void {
+  rows = displayRows(res, rows)
   res.setHeader('Content-Type', 'application/pdf')
   res.setHeader('Content-Disposition', `attachment; filename="${reportName}-${fileStamp()}.pdf"`)
 
@@ -101,7 +113,7 @@ export function sendRowsPdf(res: Response, rows: Record<string, unknown>[], repo
     const y = doc.y
     cols.forEach((c, i) => {
       const v = r[c]
-      const text = typeof v === 'number' ? v.toFixed(2) : String(v ?? '')
+      const text = typeof v === 'number' ? v.toFixed(currentFormat().decimals) : String(v ?? '')
       doc.fontSize(7).text(text.slice(0, 45), startX + i * colWidth, y, { width: colWidth - 4 })
     })
     doc.moveDown(0.7)

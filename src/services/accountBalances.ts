@@ -50,7 +50,7 @@ export async function computeAccountBalances(
   for (const g of grouped) {
     const debit = Number(g._sum.debitAmount ?? 0)
     const credit = Number(g._sum.creditAmount ?? 0)
-    const balance = normalBalanceById.get(g.accountId) === 'DEBIT' ? debit - credit : credit - debit
+    const balance = normalBalanceById.get(g.accountId)?.toUpperCase() === 'DEBIT' ? debit - credit : credit - debit
     result.set(g.accountId, { debit, credit, balance })
   }
   return result

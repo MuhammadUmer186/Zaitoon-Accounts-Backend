@@ -1,5 +1,5 @@
 import { Request } from 'express'
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient, Prisma } from '@prisma/client'
 
 export interface LogAuditInput {
   req: Request
@@ -19,7 +19,7 @@ export interface LogAuditInput {
 // rates, mappings, periods, opening balances, journal reversals, imports).
 // Never pass full bank account numbers/IBANs in oldData/newData — only the
 // masked fields already stored on BankAccount.
-export async function logAudit(prisma: PrismaClient, input: LogAuditInput): Promise<void> {
+export async function logAudit(prisma: PrismaClient | Prisma.TransactionClient, input: LogAuditInput): Promise<void> {
   const user = await prisma.user.findUnique({
     where: { id: input.req.user.id },
     select: { email: true, firstName: true, lastName: true },

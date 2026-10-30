@@ -8,8 +8,17 @@ const prisma = new PrismaClient()
 // expense categories, item catalog, suppliers). Run with: npm run db:clear-data
 async function main() {
   console.log('Clearing transactional data (keeping users, branches, and reference data)...')
+  await prisma.hrPayrollPayment.deleteMany()
+  await prisma.hrPayrollLine.deleteMany()
+  await prisma.hrPayrollRun.deleteMany()
+  await prisma.hrLeaveRequest.deleteMany()
+  await prisma.hrAttendance.deleteMany()
+  await prisma.hrRecord.deleteMany({ where: { OR: [{ employeeId: { not: null } }, { kind: 'recruitment' }] } })
 
   await prisma.auditLog.deleteMany()
+  await prisma.orderReview.deleteMany()
+  await prisma.customerOrderItem.deleteMany()
+  await prisma.customerOrder.deleteMany()
   await prisma.notification.deleteMany()
   await prisma.document.deleteMany()
   await prisma.wastageItem.deleteMany()

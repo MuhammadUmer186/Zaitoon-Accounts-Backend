@@ -3,16 +3,33 @@ import bcrypt from 'bcryptjs'
 import { resolveScope } from '../utils/branchScope'
 import { z } from 'zod'
 import { prisma } from '../config'
-import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/jwt'
+import { signAccessToken, signPosAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/jwt'
+import { userForPin } from '../services/posSecurity'
+import { rateLimit } from '../middleware/rateLimit'
+import { loginRateLimit } from '../middleware/loginRateLimit'
 import { authenticate } from '../middleware/auth'
 import { AppError } from '../middleware/error'
 import { getUserPermissions } from '../utils/permissions'
 
 const router = Router()
 
+router.post('/pin-login', rateLimit('pin-login', 5, 60000), async (req, res) => {
+  const b = z.object({ branchId: z.string().min(1), pin: z.string().regex(/^\d{4,6}$/) }).parse(req.body)
+  const branch = await prisma.branch.findFirst({ where: { id: b.branchId, isActive: true, organization: { isActive: true } } })
+  if (!branch) throw new AppError('Invalid branch or PIN', 401, 'INVALID_PIN')
+  const u = await userForPin(branch.organizationId, branch.id, b.pin)
+  const matrix = await buildPermissionMatrix(u.id, u.organizationId)
+  if (!matrix.permissions.includes('can_use_pos')) throw new AppError('This PIN cannot use the POS', 403, 'FORBIDDEN')
+  const { passwordHash: _password, posPin: _pin, posPinLookup: _lookup, ...user } = u
+  const allowedModules = ['pos', 'orders', 'floor']
+  res.json({ user, tokens: { accessToken: signPosAccessToken(u.id, u.organizationId, u.email, branch.id), refreshToken: '', expiresIn: 900 },
+    permissionMatrix: { ...matrix, roles: ['pos_terminal'], moduleAccess: matrix.moduleAccess.filter((m) => allowedModules.includes(m)), branchIds: [branch.id] }, branches: [branch] })
+})
+
 const loginSchema = z.object({
   email: z.string().trim().email(),
   password: z.string().min(1),
+  organizationId: z.string().trim().min(1).max(100).optional(),
 })
 
 const updateMeSchema = z.object({
@@ -41,17 +58,19 @@ async function buildPermissionMatrix(userId: string, orgId: string) {
 }
 
 // POST /auth/login
-router.post('/login', async (req: Request, res: Response) => {
+router.post('/login', loginRateLimit, async (req: Request, res: Response) => {
   try {
     const body = loginSchema.parse(req.body)
 
-    // Find user by email across all orgs (email is unique per org, find any
-    // matching). Case-insensitive and trimmed — mobile keyboards capitalize
-    // the first letter and autofill can add a trailing space.
-    const user = await prisma.user.findFirst({
-      where: { email: { equals: body.email.trim(), mode: 'insensitive' }, isActive: true },
+    // Email is unique per organization. Shared emails require explicit tenant
+    // context so database row order can never select a different account.
+    const candidates = await prisma.user.findMany({
+      where: { email: { equals: body.email, mode: 'insensitive' }, isActive: true, organization: { isActive: true }, ...(body.organizationId && { organizationId: body.organizationId }) },
       include: { organization: true },
+      take: 2,
     })
+    if (candidates.length > 1) throw new AppError('Enter the organization ID provided by your administrator to select your account.', 409, 'ORGANIZATION_REQUIRED')
+    const user = candidates[0]
 
     if (!user) {
       throw new AppError('Invalid email or password', 401, 'INVALID_CREDENTIALS')
@@ -81,7 +100,7 @@ router.post('/login', async (req: Request, res: Response) => {
       }),
     ])
 
-    const { passwordHash: _ph, ...userWithoutPassword } = user
+    const { passwordHash: _ph, posPin: _pin, posPinLookup: _lookup, ...userWithoutPassword } = user
 
     res.json({
       user: userWithoutPassword,
@@ -92,7 +111,7 @@ router.post('/login', async (req: Request, res: Response) => {
   } catch (err) {
     if (err instanceof AppError) throw err
     if (err instanceof z.ZodError) {
-      res.status(400).json({ message: err.errors[0].message, code: 'VALIDATION_ERROR' })
+      res.status(400).json({ message: err.issues[0].message, code: 'VALIDATION_ERROR' })
       return
     }
     throw err
@@ -103,7 +122,7 @@ router.post('/login', async (req: Request, res: Response) => {
 router.post('/logout', authenticate, async (req: Request, res: Response) => {
   const { refreshToken } = req.body
   if (refreshToken) {
-    await prisma.refreshToken.deleteMany({ where: { token: refreshToken } })
+    await prisma.refreshToken.deleteMany({ where: { token: refreshToken, userId: req.user.id } })
   }
   res.json({ message: 'Logged out successfully' })
 })
@@ -120,10 +139,10 @@ router.post('/refresh', async (req: Request, res: Response) => {
 
     const storedToken = await prisma.refreshToken.findUnique({
       where: { token: refreshToken },
-      include: { user: true },
+      include: { user: { include: { organization: true } } },
     })
 
-    if (!storedToken || storedToken.expiresAt < new Date()) {
+    if (!storedToken || storedToken.expiresAt < new Date() || !storedToken.user.isActive || !storedToken.user.organization.isActive) {
       throw new AppError('Refresh token expired or invalid', 401, 'TOKEN_EXPIRED')
     }
 
@@ -132,7 +151,6 @@ router.post('/refresh', async (req: Request, res: Response) => {
     }
 
     // Rotate refresh token
-    await prisma.refreshToken.delete({ where: { id: storedToken.id } })
     const newAccessToken = signAccessToken(
       storedToken.user.id,
       storedToken.user.organizationId,
@@ -142,8 +160,10 @@ router.post('/refresh', async (req: Request, res: Response) => {
 
     const expiresAt = new Date()
     expiresAt.setDate(expiresAt.getDate() + 7)
-    await prisma.refreshToken.create({
-      data: { token: newRefreshToken, userId: storedToken.user.id, expiresAt },
+    await prisma.$transaction(async tx => {
+      const removed = await tx.refreshToken.deleteMany({ where: { id: storedToken.id } })
+      if (!removed.count) throw new AppError('Refresh token already used', 401, 'TOKEN_INVALID')
+      await tx.refreshToken.create({ data: { token: newRefreshToken, userId: storedToken.user.id, expiresAt } })
     })
 
     res.json({
@@ -169,14 +189,19 @@ router.get('/me', authenticate, async (req: Request, res: Response) => {
   }
 
   const permissionMatrix = await buildPermissionMatrix(user.id, user.organizationId)
+  if (req.user.posBranchId) {
+    permissionMatrix.roles = ['pos_terminal']
+    permissionMatrix.moduleAccess = permissionMatrix.moduleAccess.filter((m) => ['pos', 'orders', 'floor'].includes(m))
+    permissionMatrix.branchIds = [req.user.posBranchId]
+  }
   // Branch-scoped users (store keeper) only get their own branch
   const scope = await resolveScope(user.id, user.organizationId)
   const branches = await prisma.branch.findMany({
-    where: { organizationId: user.organizationId, isActive: true, ...(scope.restricted && { id: { in: scope.branchIds } }) },
+      where: { organizationId: user.organizationId, isActive: true, ...(req.user.posBranchId ? { id: req.user.posBranchId } : scope.restricted ? { id: { in: scope.branchIds } } : {}) },
     orderBy: { name: 'asc' },
   })
 
-  const { passwordHash: _ph, ...userWithoutPassword } = user
+  const { passwordHash: _ph, posPin: _pin, posPinLookup: _lookup, ...userWithoutPassword } = user
 
   res.json({
     user: userWithoutPassword,
@@ -194,7 +219,7 @@ router.put('/me', authenticate, async (req: Request, res: Response) => {
     data: body,
   })
 
-  const { passwordHash: _ph, ...userWithoutPassword } = updated
+  const { passwordHash: _ph, posPin: _pin, posPinLookup: _lookup, ...userWithoutPassword } = updated
   res.json({ user: userWithoutPassword })
 })
 
@@ -209,7 +234,10 @@ router.put('/me/password', authenticate, async (req: Request, res: Response) => 
   if (!valid) throw new AppError('Current password is incorrect', 400, 'WRONG_PASSWORD')
 
   const passwordHash = await bcrypt.hash(body.newPassword, 10)
-  await prisma.user.update({ where: { id: req.user.id }, data: { passwordHash } })
+  await prisma.$transaction(async tx => {
+    await tx.user.update({ where: { id: req.user.id }, data: { passwordHash } })
+    await tx.refreshToken.deleteMany({ where: { userId: req.user.id } })
+  })
 
   res.json({ message: 'Password updated successfully' })
 })

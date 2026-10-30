@@ -32,6 +32,7 @@ const cache = new WeakMap<Request, Promise<BranchScope>>()
 
 // Resolved once per request.
 export function getBranchScope(req: Request): Promise<BranchScope> {
+  if (req.user.posBranchId) return Promise.resolve({ restricted: true, branchIds: [req.user.posBranchId] })
   let p = cache.get(req)
   if (!p) {
     p = resolveScope(req.user.id, req.user.organizationId)
@@ -42,8 +43,8 @@ export function getBranchScope(req: Request): Promise<BranchScope> {
 
 export async function resolveScope(userId: string, organizationId: string): Promise<BranchScope> {
   const [userRoles, access] = await Promise.all([
-    prisma.userRole.findMany({ where: { userId }, include: { role: { select: { name: true, displayName: true } } } }),
-    prisma.userBranchAccess.findMany({ where: { userId, organizationId }, select: { branchId: true } }),
+    prisma.userRole.findMany({ where: { userId, role: { organizationId } }, include: { role: { select: { name: true, displayName: true } } } }),
+    prisma.userBranchAccess.findMany({ where: { userId, organizationId, branch: { organizationId } }, select: { branchId: true } }),
   ])
   const roles = userRoles.map((r) => r.role)
   if (roles.some(isUnscopedRole)) return { restricted: false, branchIds: [] }

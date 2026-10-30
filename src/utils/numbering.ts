@@ -1,36 +1,30 @@
-import { PrismaClient } from '@prisma/client'
+import { Prisma, PrismaClient } from '@prisma/client'
+import { branchNumberSeries } from './branchNumbering'
 
 export async function nextNumber(
-  prisma: PrismaClient,
+  prisma: PrismaClient | Prisma.TransactionClient,
   model: string,
   field: string,
   prefix: string,
   orgId: string
 ): Promise<string> {
   const year = new Date().getFullYear()
-  const yearPrefix = `${prefix}-${year}-`
+  // A branch PC numbers within its own series (SL-2026-P1-0001). The cloud's
+  // scan below ignores those rows because their suffix is not purely numeric.
+  const series = await branchNumberSeries(prisma)
+  const yearPrefix = `${prefix}-${year}-${series ? `${series}-` : ''}`
 
-  // Find the latest record for this org with this prefix
-  // We use a raw approach by querying the specific model
-  let count = 0
-
-  try {
-    const modelDelegate = (prisma as unknown as Record<string, unknown>)[model] as {
-      count: (args: { where: Record<string, unknown> }) => Promise<number>
-    }
-    if (modelDelegate && typeof modelDelegate.count === 'function') {
-      count = await modelDelegate.count({
-        where: {
-          organizationId: orgId,
-          [field]: { startsWith: yearPrefix },
-        },
-      })
-    }
-  } catch {
-    count = 0
+  // Deleted drafts leave gaps. Counting rows can reissue a number that is
+  // still in use, preventing the next paid order from reaching Daily Sales.
+  const delegate = (prisma as unknown as Record<string, unknown>)[model] as {
+    findMany: (args: unknown) => Promise<Record<string, unknown>[]>
   }
-
-  return `${yearPrefix}${(count + 1).toString().padStart(4, '0')}`
+  const rows = await delegate.findMany({ where: { organizationId: orgId, [field]: { startsWith: yearPrefix } }, select: { [field]: true } })
+  const highest = rows.reduce((max, row) => {
+    const suffix = String(row[field]).slice(yearPrefix.length)
+    return /^\d+$/.test(suffix) ? Math.max(max, Number(suffix)) : max
+  }, 0)
+  return `${yearPrefix}${(highest + 1).toString().padStart(4, '0')}`
 }
 
 export function formatNumber(prefix: string, count: number): string {
