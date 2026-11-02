@@ -36,6 +36,14 @@ async function tableByOrderToken(token: string) {
   return table
 }
 
+// A branch can switch table QR ordering off. Guests then can't add dishes;
+// an order already on the table can still be followed, cancelled and billed.
+function assertTableOrdering(branch: { tableOrderingEnabled: boolean }) {
+  if (!branch.tableOrderingEnabled) {
+    throw new AppError('Ordering from the table QR is switched off right now. Please ask our staff to take your order.', 403, 'TABLE_ORDERING_DISABLED')
+  }
+}
+
 router.use('/tables/:token', rateLimit('table-region', 180, 60_000), async (req, _res, next) => {
   const table = await tableByOrderToken(req.params.token)
   runWithCurrency(table.organization.currency, () => next())
@@ -159,6 +167,8 @@ router.get('/tables/:token/menu', rateLimit('menu', 120, 60_000), async (req: Re
     reviewToken: table.reviewToken,
     branch: { name: table.organization.multiBranch ? table.branch.name : table.organization.tradeName || table.organization.name },
     table: { name: table.name },
+    // false = the branch switched table QR ordering off (Settings → Table QR Ordering)
+    tableOrdering: table.branch.tableOrderingEnabled,
     vat: { enabled: table.branch.vatEnabled, rate: table.branch.vatRate },
     shift: shift && { id: shift.id, name: shift.name, startTime: shift.startTime, endTime: shift.endTime },
     nextShift: upcoming && { name: upcoming.name, startTime: upcoming.startTime, endTime: upcoming.endTime },
@@ -334,6 +344,7 @@ export async function priceGuestCart(organizationId: string, branchId: string, s
 router.post('/tables/:token/orders', rateLimit('order-place', 20, 60_000), async (req: Request, res: Response) => {
   const body = placeOrderSchema.parse(req.body)
   const table = await tableByOrderToken(req.params.token)
+  assertTableOrdering(table.branch)
   const org = table.organization
   const shifts = await ensureShifts(prisma, org.id)
   const shift = currentShift(shifts, org.timezone)

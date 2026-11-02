@@ -53,7 +53,7 @@ router.get('/', canView, async (req: Request, res: Response) => {
   const tables = await prisma.diningTable.findMany({
     where: { organizationId: req.user.organizationId, ...(branch && { branchId: branch }) },
     include: {
-      branch: { select: { id: true, name: true, code: true } },
+      branch: { select: { id: true, name: true, code: true, tableOrderingEnabled: true } },
       orders: { where: { status: 'open' }, select: { id: true, orderNo: true, totalAmount: true, createdAt: true, billRequestedAt: true } },
     },
   })

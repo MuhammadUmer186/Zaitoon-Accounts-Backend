@@ -5,6 +5,8 @@ import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
 import { requirePermission } from '../middleware/authorize'
 import { AppError } from '../middleware/error'
+import { logAudit } from '../utils/audit'
+import { publish } from '../utils/liveEvents'
 
 const router = Router()
 
@@ -90,6 +92,27 @@ router.put('/:id', requirePermission('can_create_branch'), async (req: Request, 
   if (body.code && body.code !== branch.code) await assertCodeFree(req.user.organizationId, body.code, id)
   if (body.isActive === true && !branch.isActive) await assertBranchSlot(req.user.organizationId, id)
   const updated = await prisma.branch.update({ where: { id }, data: body })
+  res.json(updated)
+})
+
+// PUT /branches/:id/table-ordering — { enabled } Settings → Table QR Ordering:
+// switches guest ordering from the branch's table QR codes on or off
+router.put('/:id/table-ordering', requirePermission('can_manage_settings'), async (req: Request, res: Response) => {
+  const id = req.params['id'] as string
+  const { enabled } = z.object({ enabled: z.boolean() }).parse(req.body)
+  const branch = await prisma.branch.findFirst({ where: { id, organizationId: req.user.organizationId } })
+  if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  if (branch.tableOrderingEnabled === enabled) {
+    res.json(branch)
+    return
+  }
+  const updated = await prisma.branch.update({ where: { id }, data: { tableOrderingEnabled: enabled } })
+  await logAudit(prisma, {
+    req, action: 'update', module: 'settings', resourceType: 'branch', resourceId: id, resourceRef: branch.name, branchId: id,
+    oldData: { tableOrderingEnabled: branch.tableOrderingEnabled }, newData: { tableOrderingEnabled: enabled },
+  })
+  // open guest screens of the branch reload their menu and see the change
+  publish({ topic: 'availability', action: 'table_ordering', organizationId: req.user.organizationId, branchId: id })
   res.json(updated)
 })
 
