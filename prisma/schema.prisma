@@ -324,8 +324,8 @@ model Branch {
   invoicePrefix     String             @default("INV")
   // secret link of the customer-facing "order ready" screen
   readyDisplayToken String?            @unique
-  // false = guests can no longer order from this branch's table QR codes
-  // (Settings → Table QR Ordering); staff still take dine-in orders at the POS
+  // false = the branch doesn't use tables (Settings → Table Service): dine-in
+  // orders have no table, no floor / waiter / table QR ordering (utils/tableService)
   tableOrderingEnabled Boolean         @default(true)
   salePrefix        String             @default("SL")
   expensePrefix     String             @default("EXP")

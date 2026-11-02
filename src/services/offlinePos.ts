@@ -29,7 +29,6 @@ export const offlineOrderSchema = z.object({
   expectedTotal: money, vatRate: z.number().min(0).max(100),
   payment: z.object({ paidAt: z.string().datetime(), payments: z.array(z.object({ method: z.enum(['cash', 'card', 'mada', 'bank_transfer', 'other']), amount: money })).min(1).max(6), amountTendered: money.optional().nullable() }).optional(),
 }).superRefine((b, ctx) => {
-  if (b.orderType === 'dine_in' && !b.tableId) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['tableId'], message: 'Choose a table' })
   if (b.orderType === 'delivery' && (b.deliveryAddress?.length ?? 0) < 5) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['deliveryAddress'], message: 'Enter the delivery address' })
   if (b.deliveryZoneId && (b.deliveryFeeVatRate == null || !b.deliveryFeeTaxCategory)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['deliveryFeeVatRate'], message: 'Record the delivery charge tax shown on the receipt' })
   if (b.expectedTotal > 0 && b.payment?.payments.some((p) => p.amount === 0)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['payment', 'payments'], message: 'Payment parts must be positive' })
@@ -99,8 +98,12 @@ export async function syncOfflineOrder(req: Request, input: OfflineOrderInput) {
           if (await tx.offlineOrderSync.findUnique({ where: { deviceId_sequence: { deviceId: device.id, sequence: input.sequence } } })) throw new AppError('This device order number is already in use', 409, 'OFFLINE_NUMBER_CONFLICT')
           const priced = await priceLines(tx, { organizationId: req.user.organizationId, branchId: device.branchId, items: input.items })
           if (priced.unavailable.length) throw new AppError('A dish is unavailable; review the queued order', 409, 'DISH_UNAVAILABLE')
-          if (input.orderType === 'dine_in') {
-            const table = await tx.diningTable.findFirst({ where: { id: input.tableId!, organizationId: req.user.organizationId, branchId: device.branchId, isActive: true } })
+          // a ticket saved while the branch used tables keeps its table only
+          // if table service is still on; with it off the dine-in order has none
+          const tableId = input.orderType === 'dine_in' && branch.tableOrderingEnabled ? input.tableId ?? null : null
+          if (input.orderType === 'dine_in' && branch.tableOrderingEnabled && !tableId) throw new AppError('Choose a table', 400, 'VALIDATION_ERROR')
+          if (tableId) {
+            const table = await tx.diningTable.findFirst({ where: { id: tableId, organizationId: req.user.organizationId, branchId: device.branchId, isActive: true } })
             if (!table) throw new AppError('This table is unavailable', 409, 'OFFLINE_TABLE_CONFLICT')
             await tx.$queryRaw`SELECT id FROM "DiningTable" WHERE id = ${table.id} FOR UPDATE`
             if (await tx.customerOrder.count({ where: { tableId: table.id, status: 'open' } })) throw new AppError('This table has another open order; review before syncing', 409, 'OFFLINE_TABLE_CONFLICT')
@@ -114,7 +117,7 @@ export async function syncOfflineOrder(req: Request, input: OfflineOrderInput) {
           const created = await tx.customerOrder.create({ data: {
             organizationId: org.id, branchId: device.branchId, counterCode: input.counterCode ?? 'main', orderNo: await nextOrderNo(tx, org.id, device.branchId), source: 'pos', orderType: input.orderType,
             ...delivery,
-            tableId: input.orderType === 'dine_in' ? input.tableId : null, shiftId: shift?.id, customerName: input.customerName, customerPhone: input.customerPhone, deliveryAddress: input.deliveryAddress,
+            tableId, shiftId: shift?.id, customerName: input.customerName, customerPhone: input.customerPhone, deliveryAddress: input.deliveryAddress,
             createdBy: req.user.id, createdAt: new Date(input.createdAt), offlineOrderNo: `D${device.number}-${String(input.sequence).padStart(6, '0')}`, offlineSyncedAt: new Date(),
             items: { create: priced.lines.map((l, i) => ({ ...l, course: input.items[i].course, held: input.items[i].course > Math.min(...input.items.map((x) => x.course)), createdAt: new Date(input.createdAt) })) },
           } })

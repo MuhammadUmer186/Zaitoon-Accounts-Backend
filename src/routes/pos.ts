@@ -10,6 +10,7 @@ import { ensureShifts, currentShift, nextOrderNo, recalcOrderTotals } from '../u
 import { dishImageUrl } from './menu'
 import { lineSelectionSchema, priceLines, loadDishOptions, menuOptionsPayload, resolveStations } from '../services/menuOptions'
 import { orderInclude, publishOrder, lockOrder, assertBillEditable } from './orders'
+import { assertTableService } from '../utils/tableService'
 import { makeReviewCode } from '../utils/reviewCode'
 import { deliveryQuote } from '../services/deliveryPricing'
 import { linkCustomer } from '../services/customers'
@@ -131,7 +132,9 @@ export async function sendPosOrder(req: Request, res: Response) {
   })
 
   let table: { id: string; name: string } | null = null
-  if (body.orderType === 'dine_in' && !body.orderId) {
+  // with table service off a dine-in order has no table
+  if (body.orderType === 'dine_in' && !body.orderId && body.tableId) assertTableService(branch)
+  if (body.orderType === 'dine_in' && !body.orderId && branch.tableOrderingEnabled) {
     if (!body.tableId) throw new AppError('Choose a table for a dine-in order', 400, 'VALIDATION_ERROR')
     table = await prisma.diningTable.findFirst({ where: { id: body.tableId, branchId: branch.id, isActive: true }, select: { id: true, name: true } })
     if (!table) throw new AppError('Table not found in this branch', 404, 'NOT_FOUND')

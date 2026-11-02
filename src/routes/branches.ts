@@ -95,8 +95,8 @@ router.put('/:id', requirePermission('can_create_branch'), async (req: Request, 
   res.json(updated)
 })
 
-// PUT /branches/:id/table-ordering — { enabled } Settings → Table QR Ordering:
-// switches guest ordering from the branch's table QR codes on or off
+// PUT /branches/:id/table-ordering — { enabled } Settings → Table Service:
+// switches the branch's whole table system on or off (see utils/tableService)
 router.put('/:id/table-ordering', requirePermission('can_manage_settings'), async (req: Request, res: Response) => {
   const id = req.params['id'] as string
   const { enabled } = z.object({ enabled: z.boolean() }).parse(req.body)
@@ -111,8 +111,10 @@ router.put('/:id/table-ordering', requirePermission('can_manage_settings'), asyn
     req, action: 'update', module: 'settings', resourceType: 'branch', resourceId: id, resourceRef: branch.name, branchId: id,
     oldData: { tableOrderingEnabled: branch.tableOrderingEnabled }, newData: { tableOrderingEnabled: enabled },
   })
-  // open guest screens of the branch reload their menu and see the change
+  // open guest screens of the branch reload their menu, staff screens
+  // (POS, floor, waiter) pick up the change
   publish({ topic: 'availability', action: 'table_ordering', organizationId: req.user.organizationId, branchId: id })
+  publish({ topic: 'table', action: 'service', organizationId: req.user.organizationId, branchId: id })
   res.json(updated)
 })
 

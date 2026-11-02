@@ -167,7 +167,7 @@ router.get('/tables/:token/menu', rateLimit('menu', 120, 60_000), async (req: Re
     reviewToken: table.reviewToken,
     branch: { name: table.organization.multiBranch ? table.branch.name : table.organization.tradeName || table.organization.name },
     table: { name: table.name },
-    // false = the branch switched table QR ordering off (Settings → Table QR Ordering)
+    // false = the branch switched table service off (Settings → Table Service)
     tableOrdering: table.branch.tableOrderingEnabled,
     vat: { enabled: table.branch.vatEnabled, rate: table.branch.vatRate },
     shift: shift && { id: shift.id, name: shift.name, startTime: shift.startTime, endTime: shift.endTime },

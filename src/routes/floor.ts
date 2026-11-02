@@ -12,6 +12,7 @@ import { payCheck, payCheckSchema, splitOrder, splitSchema, refundChecks } from 
 import { issueForOrder } from '../services/zatca'
 import { publish } from '../utils/liveEvents'
 import { tableStatus } from '../utils/tableStatus'
+import { assertTableService } from '../utils/tableService'
 import { posMenu, sendPosOrder } from './pos'
 import { formatContextFor, withReportFormat } from '../utils/reportFormat'
 import { getUserPermissions } from '../utils/permissions'
@@ -53,9 +54,11 @@ floorRouter.put('/layout', view, requirePermission('can_manage_menu'), async (re
 floorRouter.post('/tables/:id/:action', view, async (req: Request, res: Response) => {
   const action = z.enum(['seat', 'clear']).parse(req.params.action)
   const body = z.object({ guestCount: z.number().int().min(1).max(100).optional() }).parse(req.body ?? {})
-  const table = await prisma.diningTable.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId, isActive: true, branch: { isActive: true } } })
+  const table = await prisma.diningTable.findFirst({ where: { id: req.params.id, organizationId: req.user.organizationId, isActive: true, branch: { isActive: true } }, include: { branch: { select: { tableOrderingEnabled: true } } } })
   if (!table) throw new AppError('Table not found', 404, 'NOT_FOUND')
   await assertBranchAccess(req, table.branchId)
+  // clearing stays possible, so tables left seated can be tidied up
+  if (action === 'seat') assertTableService(table.branch)
   const result = await prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT id FROM "DiningTable" WHERE id = ${table.id} FOR UPDATE`
     const fresh = await tx.diningTable.findUniqueOrThrow({ where: { id: table.id } })
@@ -95,6 +98,7 @@ waiterRouter.use(authenticate, activeAccount, requirePermission('can_take_orders
 waiterRouter.get('/menu', posMenu)
 waiterRouter.post('/orders', async (req: Request, res: Response) => {
   if (req.body?.orderType !== 'dine_in' || req.body?.orderId) throw new AppError('Waiters take table orders only', 400, 'VALIDATION_ERROR')
+  if (!req.body?.tableId) throw new AppError('Choose a table', 400, 'VALIDATION_ERROR')
   return sendPosOrder(req, res)
 })
 waiterRouter.get('/orders/:id', async (req: Request, res: Response) => {
@@ -116,8 +120,9 @@ floorOrdersRouter.use(authenticate, activeAccount)
 floorOrdersRouter.post('/:id/transfer', cashier, async (req: Request, res: Response) => {
   const { tableId } = z.object({ tableId: z.string().min(1) }).parse(req.body)
   const order = await findOrder(req)
-  const table = await prisma.diningTable.findFirst({ where: { id: tableId, organizationId: req.user.organizationId, branchId: order.branchId, isActive: true } })
+  const table = await prisma.diningTable.findFirst({ where: { id: tableId, organizationId: req.user.organizationId, branchId: order.branchId, isActive: true }, include: { branch: { select: { tableOrderingEnabled: true } } } })
   if (!table) throw new AppError('Destination table not found in this branch', 404, 'NOT_FOUND')
+  assertTableService(table.branch)
   const result = await prisma.$transaction(async (tx) => {
     for (const id of [...new Set([order.tableId, tableId].filter((id): id is string => !!id))].sort()) await tx.$queryRaw`SELECT id FROM "DiningTable" WHERE id = ${id} FOR UPDATE`
     await lockOrder(tx, order)
