@@ -17,6 +17,7 @@ echo "[start] Applying database schema"
 npx prisma db push --skip-generate
 
 echo "[start] Database rules"
+npx prisma db execute --file prisma/additions/20261102-branch-menu.sql --schema prisma/schema.prisma
 npx prisma db execute --file prisma/post-push.sql --schema prisma/schema.prisma
 
 echo "[start] Branch ownership and durable sync rules"

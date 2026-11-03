@@ -27,7 +27,7 @@ const formBoolean = z.union([z.boolean(), z.enum(['true', 'false']).transform((v
 const expenseSchema = z.object({
   branchId: z.string(),
   expenseDate: z.string().or(z.date()),
-  categoryId: z.string(),
+  categoryId: z.string().min(1),
   description: z.string().min(1),
   amount: z.coerce.number().positive(),
   vatAmount: z.coerce.number().default(0),
@@ -44,7 +44,7 @@ const expenseSchema = z.object({
 // reported on its own (source "maintenance"). Without a category it files
 // under the organization's Maintenance category, created on first use.
 const createExpenseSchema = expenseSchema.extend({
-  categoryId: z.string().optional(),
+  categoryId: z.string().min(1).optional(),
   source: z.enum(['manual', 'maintenance']).default('manual'),
 }).refine((b) => b.categoryId || b.source === 'maintenance', { message: 'Category is required', path: ['categoryId'] })
 
@@ -224,7 +224,10 @@ async function createExpense(req: Request, receipt?: Express.Multer.File) {
   if (body.amount <= 0 || !Number.isFinite(new Date(body.expenseDate).getTime())) throw new AppError('Invalid amount or expense date', 400, 'VALIDATION_ERROR')
   // A maintenance entry is paid on the spot; a supplier would turn it into an
   // unpaid payable that nothing on the purchase side can settle.
-  if (body.source === 'maintenance') body.supplierId = undefined
+  if (body.source === 'maintenance') {
+    body.supplierId = undefined
+    body.categoryId = undefined
+  }
 
   const branch = await prisma.branch.findFirst({
     where: { id: body.branchId, organizationId: req.user.organizationId },
@@ -324,6 +327,7 @@ router.put('/:id', requirePermission('can_create_expense'), async (req: Request,
   if (expense.source === 'purchasing') throw new AppError('Purchasing payments cannot be edited — void and re-enter instead', 400, 'INVALID_STATUS')
 
   const { submitForApproval: _submit, ...body } = updateSchema(expenseSchema).parse(req.body)
+  if (expense.source === 'maintenance' && (body.supplierId || (body.categoryId && body.categoryId !== expense.categoryId))) throw new AppError('Maintenance classification cannot be changed; create another operating expense instead', 400, 'VALIDATION_ERROR')
   if (body.branchId) {
     const branch = await prisma.branch.findFirst({ where: { id: body.branchId, organizationId: req.user.organizationId } })
     if (!branch) throw new AppError('Branch not found', 404, 'NOT_FOUND')

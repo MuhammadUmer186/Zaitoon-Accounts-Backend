@@ -1,6 +1,7 @@
 import { moneyTolerance, validMoneyPrecision } from '../utils/money'
 import { roundMoney as regionalRoundMoney } from '../utils/money'
 import { estimatedReadyAfterPayment } from '../services/orderPaymentPolicy'
+import { kitchenTiming } from '../utils/kitchenTiming'
 import { assertCounter } from '../services/posCounters'
 import { recordPayment, orderPayments } from '../services/tills'
 import { authorizePos, resolveVoidReason } from '../services/posSecurity'
@@ -549,7 +550,7 @@ router.patch('/:id/items/:itemId', canItems, async (req: Request, res: Response)
     if (status === 'cancelled' && ['picked_up', 'delivered'].includes(fresh.deliveryStatus ?? '')) throw new AppError('A dispatched delivery cannot have its bill changed', 409, 'DELIVERY_LOCKED')
     if (status !== 'cancelled') {
       if (fresh.status !== 'completed') throw new AppError('Full payment is required before kitchen preparation', 409, 'PAYMENT_REQUIRED')
-      await tx.customerOrderItem.update({ where: { id: item.id }, data: { status } })
+      await tx.customerOrderItem.update({ where: { id: item.id }, data: { status, ...kitchenTiming(status, item) } })
       return
     }
     approvedBy = await authorizePos(tx, req, 'void', order.branchId, order.id, body.approvalToken)

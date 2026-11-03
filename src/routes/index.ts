@@ -1,5 +1,6 @@
 import offlinePosRouter from './offlinePos'
 import printerDeviceRouter from './printerDevice'
+import networkPrintersRouter, { networkAgentRouter } from './networkPrinters'
 import commerceSettingsRouter from './commerceSettings'
 import customersRouter from './customers'
 import paymentsRouter, { callbackRouter, publicPaymentsRouter } from './payments'
@@ -30,6 +31,7 @@ import accountingSettingsRouter from './accountingSettings'
 import accountingPeriodsRouter from './accountingPeriods'
 import reportsRouter from './reports'
 import reportsCatalogRouter from './reportsCatalog'
+import operationalReportsRouter from './operationalReports'
 import notificationsRouter from './notifications'
 import syncRouter from './sync'
 import branchOperationsRouter from './branchOperations'
@@ -59,6 +61,8 @@ import recurringJournalsRouter from './recurringJournals'
 
 const router = Router()
 router.use('/printer-device', printerDeviceRouter)
+router.use('/network-printer-agent', networkAgentRouter)
+router.use('/network-printers', networkPrintersRouter)
 router.use(branchPilotPolicy)
 router.use('/free-dish', freeDishRouter)
 router.use('/public/free-dish', publicFreeDishRouter)
@@ -86,6 +90,7 @@ router.use('/tax-rates', taxRatesRouter)
 router.use('/accounting-settings', accountingSettingsRouter)
 router.use('/accounting-periods', accountingPeriodsRouter)
 router.use('/reports', reportsRouter)
+router.use('/reports', operationalReportsRouter)
 router.use('/reports', reportsCatalogRouter)
 router.use('/notifications', notificationsRouter)
 router.use('/sync', syncRouter)

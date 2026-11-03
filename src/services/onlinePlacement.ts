@@ -1,4 +1,5 @@
 import { roundMoney, runWithCurrency } from '../utils/money'
+import { branchUnavailable } from './branchMenu'
 import { z } from 'zod'
 import { Prisma } from '@prisma/client'
 import { prisma } from '../config'
@@ -67,9 +68,10 @@ export async function placeOnlineOrder(branchId: string, body: OnlineOrderInput)
         } })
         const dishMap = new Map(dishes.map((d) => [d.id, d]))
         if (dishIds.some((dishId) => !dishMap.has(dishId))) throw new AppError('Some dishes are no longer available. Refresh the menu and update your cart.', 409, 'DISH_UNAVAILABLE')
-        const options = await loadDishOptions(tx, dishIds)
+        const { menu, off } = await branchUnavailable(tx, org.id, branch.id)
+        if (dishIds.some(dishId => off.has(dishId))) throw new AppError('Some dishes are no longer available at this branch. Refresh the menu.', 409, 'DISH_UNAVAILABLE')
+        const options = await loadDishOptions(tx, dishIds, branch.id)
         const stations = await resolveStations(tx, org.id, dishIds)
-        const off = new Set((await tx.dishOutOfStock.findMany({ where: { branchId: branch.id }, select: { dishId: true } })).map((o) => o.dishId))
         const delivery = await deliveryQuote(tx, org.id, branch, body.orderType, body.deliveryZoneId, body.deliveryArea)
         await tx.customerOrder.create({ data: {
           id, organizationId: org.id, branchId: branch.id, shiftId: shift.id,
@@ -84,7 +86,7 @@ export async function placeOnlineOrder(branchId: string, body: OnlineOrderInput)
           notes: body.notes || null,
           items: { create: body.items.map((i) => {
             const dish = dishMap.get(i.dishId)!
-            const { unitPrice, selection } = priceSelection(dish, options.get(dish.id), i, off)
+            const { unitPrice, selection } = priceSelection({ ...dish, price: menu.get(dish.id)!.price }, options.get(dish.id), i, off)
             return { dishId: dish.id, dishName: dish.name, unitPrice, quantity: i.quantity,
               lineTotal: roundMoney(unitPrice * i.quantity), notes: i.notes || null, selection: (selection ?? Prisma.JsonNull) as Prisma.InputJsonValue, stationId: stations.get(dish.id) ?? null }
           }) },

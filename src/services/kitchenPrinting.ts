@@ -4,6 +4,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { lockOrder } from '../routes/orders'
+import { sendRawPrinter } from './rawPrinter'
 
 const privateIp = (host: string) => net.isIP(host) === 4 && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)
 const printerSchema = z.object({
@@ -12,7 +13,7 @@ const printerSchema = z.object({
   port: z.number().int().min(1).max(65535).default(9100), key: z.string().min(32).max(128),
   enabledAt: z.string().datetime(),
 })
-export type KitchenPrinter = z.infer<typeof printerSchema>
+export type KitchenPrinter = z.infer<typeof printerSchema> & { protocol?: 'raw'; paperWidth?: number }
 export function readKitchenPrinters(): KitchenPrinter[] {
   const raw = process.env.KITCHEN_PRINTERS_FILE ? fs.readFileSync(process.env.KITCHEN_PRINTERS_FILE, 'utf8') : process.env.KITCHEN_PRINTERS_JSON
   if (!raw) return []
@@ -22,14 +23,15 @@ export function readKitchenPrinters(): KitchenPrinter[] {
 }
 
 type Line = { id: string; dishName: string; quantity: number; notes: string | null; selection: unknown; course: number }
-export function kitchenSlip(order: { orderNo: number; table: { name: string } | null; orderType: string; branch: { name: string }; notes: string | null; source?: string }, items: Line[], kind: string, station: string): Buffer {
+export function kitchenSlip(order: { orderNo: number; table: { name: string } | null; orderType: string; branch: { name: string }; notes: string | null; source?: string }, items: Line[], kind: string, station: string, paperWidth = 80): Buffer {
   const clean = (value: string) => {
     const text = value.replace(/[\x00-\x1f\x7f]/g, ' ').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
     if (/[^\x20-\x7e]/.test(text)) throw new Error('Non-Latin text needs a raster-capable print renderer; job held for review')
     return text
   }
-  const wrap = (text: string) => clean(text).match(/.{1,48}/g)?.join('\n') ?? ''
-  const out = ['\x1b@\x1ba\x01\x1bE\x01', kind === 'cancel' ? '*** CANCEL - DO NOT PREPARE ***' : 'KITCHEN ORDER', `ORDER #${order.orderNo}`, wrap(station), '\x1bE\x00\x1ba\x00', wrap(order.branch.name), wrap(order.table ? `Table: ${order.table.name}` : order.orderType), new Date().toISOString(), '-'.repeat(48)]
+  const columns = paperWidth === 58 ? 32 : 48
+  const wrap = (text: string) => clean(text).match(new RegExp(`.{1,${columns}}`, 'g'))?.join('\n') ?? ''
+  const out = ['\x1b@\x1ba\x01\x1bE\x01', kind === 'cancel' ? '*** CANCEL - DO NOT PREPARE ***' : kind === 'test' ? 'PRINTER TEST' : 'KITCHEN ORDER', `ORDER #${order.orderNo}`, wrap(station), '\x1bE\x00\x1ba\x00', wrap(order.branch.name), wrap(order.table ? `Table: ${order.table.name}` : order.orderType), new Date().toISOString(), '-'.repeat(columns)]
   for (const item of items) {
     out.push('\x1bE\x01' + wrap(`${item.quantity} x ${item.dishName}`) + '\x1bE\x00')
     if (item.course > 1) out.push(`Course ${item.course}`)
@@ -41,14 +43,14 @@ export function kitchenSlip(order: { orderNo: number; table: { name: string } | 
     out.push('')
   }
   if (order.notes && order.source !== 'online') out.push(wrap('Order note: ' + order.notes))
-  out.push('-'.repeat(48), '\n\n\n\x1dVB\x00')
+  out.push('-'.repeat(columns), '\n\n\n\x1dVB\x00')
   const payload = Buffer.from(out.join('\n'), 'ascii')
   if (payload.length > 16384) throw new Error('Kitchen slip exceeds printer transfer limit; job held for review')
   return payload
 }
 
 const cancellationScans = new Map<string, number>()
-export async function enqueueKitchenPrinter(p: Pick<KitchenPrinter, 'id' | 'organizationId' | 'branchId' | 'stationId' | 'enabledAt'>, mode: 'branch' | 'cloud' = 'branch') {
+export async function enqueueKitchenPrinter(p: Pick<KitchenPrinter, 'id' | 'organizationId' | 'branchId' | 'stationId' | 'enabledAt'> & { paperWidth?: number; nativeRender?: boolean }, mode: 'branch' | 'cloud' = 'branch') {
   const scanStarted = Date.now(), scanKey = `${p.organizationId}:${p.branchId}:${p.id}`
   const cancelledSince = new Date(cancellationScans.get(scanKey) ?? Date.parse(p.enabledAt))
   const runtime = await prisma.branchRuntime.findUnique({ where: { id: 'local' } })
@@ -64,14 +66,15 @@ export async function enqueueKitchenPrinter(p: Pick<KitchenPrinter, 'id' | 'orga
   if (p.stationId !== 'none' && !station) throw new Error('Invalid printer station')
   let cursor: string | undefined
   for (;;) {
-    const orders = await prisma.customerOrder.findMany({ where: { organizationId: p.organizationId, branchId: p.branchId, status: { in: ['completed', 'cancelled'] }, OR: [{ closedAt: { gte: new Date(p.enabledAt) } }, { items: { some: { firedAt: { gte: new Date(p.enabledAt) } } } }], items: { some: { stationId: station?.id ?? null, held: false, OR: [{ status: { in: ['pending', 'preparing', 'ready'] } }, { status: 'cancelled', updatedAt: { gte: cancelledSince } }] } } }, orderBy: { id: 'asc' }, take: 100, ...(cursor && { cursor: { id: cursor }, skip: 1 }) })
+    const orders = await prisma.customerOrder.findMany({ where: { organizationId: p.organizationId, branchId: p.branchId, status: { in: ['completed', 'cancelled', 'refunded'] }, OR: [{ closedAt: { gte: new Date(p.enabledAt) } }, { items: { some: { firedAt: { gte: new Date(p.enabledAt) } } } }, { items: { some: { status: 'cancelled', updatedAt: { gte: cancelledSince } } } }], items: { some: { stationId: station?.id ?? null, held: false, OR: [{ status: { in: ['pending', 'preparing', 'ready'] } }, { status: 'cancelled', updatedAt: { gte: cancelledSince } }] } } }, orderBy: { id: 'asc' }, take: 100, ...(cursor && { cursor: { id: cursor }, skip: 1 }) })
     for (const found of orders) await prisma.$transaction(async tx => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`print-enqueue:${p.organizationId}:${p.branchId}:${p.id}`}))`
+      if (await tx.networkKitchenPrinter.count({ where: { organizationId: p.organizationId, branchId: p.branchId, stationId: p.stationId, id: { not: p.id } } })) return
       await lockOrder(tx, found)
       const order = await tx.customerOrder.findUniqueOrThrow({ where: { id: found.id }, include: { items: true, table: { select: { name: true } }, branch: { select: { name: true } } } })
       const previous = await tx.kitchenPrintJob.findMany({ where: { organizationId: p.organizationId, branchId: p.branchId, printerId: p.id, orderId: order.id, state: { not: 'suppressed' } } })
       const ids = (kind: string) => new Set(previous.filter(j => j.kind === kind).flatMap(j => j.itemIds as string[]))
-      const sent = new Set(previous.filter(j => j.kind === 'new' && ['sending', 'usb_complete', 'uncertain'].includes(j.state)).flatMap(j => j.itemIds as string[]))
+      const sent = new Set(previous.filter(j => j.kind === 'new' && ['sending', 'usb_complete', 'network_sent', 'uncertain'].includes(j.state)).flatMap(j => j.itemIds as string[]))
       for (const kind of ['new', 'cancel']) {
         const claimed = ids(kind)
         const lines = order.items.filter(i => !i.held && i.stationId === (station?.id ?? null) && !claimed.has(i.id) && (kind === 'new' ? order.status === 'completed' && ['pending', 'preparing', 'ready'].includes(i.status) && ((order.closedAt?.getTime() ?? 0) >= Date.parse(p.enabledAt) || (i.firedAt?.getTime() ?? 0) >= Date.parse(p.enabledAt)) : i.status === 'cancelled' && sent.has(i.id)))
@@ -79,7 +82,13 @@ export async function enqueueKitchenPrinter(p: Pick<KitchenPrinter, 'id' | 'orga
         const itemIds = lines.map(i => i.id).sort()
         const eventKey = createHash('sha256').update(JSON.stringify([p.organizationId, p.branchId, p.id, order.id, kind, itemIds])).digest('hex')
         let payload = '', state = 'queued', lastError: string | null = null
-        try { payload = kitchenSlip(order, lines, kind, station?.name ?? 'Kitchen').toString('base64') } catch (e) { state = 'blocked'; lastError = (e as Error).message }
+        try {
+          payload = p.nativeRender ? Buffer.from(JSON.stringify({
+            kind, stationName: station?.name ?? 'Kitchen', printedAt: new Date().toISOString(),
+            order: { orderNo: order.orderNo, offlineOrderNo: order.offlineOrderNo, orderType: order.orderType, status: order.status, source: order.source, table: order.table, branch: order.branch, estimatedReadyAt: order.estimatedReadyAt, notes: order.notes },
+            items: lines.map(i => ({ id: i.id, dishName: i.dishName, quantity: i.quantity, notes: i.notes, selection: i.selection, course: i.course })),
+          }), 'utf8').toString('base64') : kitchenSlip(order, lines, kind, station?.name ?? 'Kitchen', p.paperWidth).toString('base64')
+        } catch (e) { state = 'blocked'; lastError = (e as Error).message }
         await tx.kitchenPrintJob.upsert({ where: { eventKey }, create: { organizationId: p.organizationId, branchId: p.branchId, orderId: order.id, printerId: p.id, kind, itemIds, eventKey, payload, state, lastError }, update: { payload, state, lastError } })
       }
     })
@@ -91,7 +100,7 @@ export async function enqueueKitchenPrinter(p: Pick<KitchenPrinter, 'id' | 'orga
   cancellationScans.set(scanKey, scanStarted - 60000)
 }
 
-type Delivery = 'usb_complete' | 'queued' | 'blocked' | 'uncertain'
+type Delivery = 'usb_complete' | 'network_sent' | 'queued' | 'blocked' | 'uncertain'
 export function sendKitchenBytes(p: Pick<KitchenPrinter, 'host' | 'port' | 'key'>, job: { id: string; sequence: bigint; payload: string }, timeout = 20000): Promise<Delivery> {
   const bytes = Buffer.from(job.payload, 'base64'), digest = createHash('sha256').update(bytes).digest('hex')
   const signed = `${job.sequence}:${job.id}:${bytes.length}:${digest}`
@@ -117,11 +126,15 @@ export function sendKitchenBytes(p: Pick<KitchenPrinter, 'host' | 'port' | 'key'
   })
 }
 
-export async function deliverKitchenPrinter(p: KitchenPrinter, send = sendKitchenBytes) {
+export async function deliverKitchenPrinter(p: KitchenPrinter, send = (target: KitchenPrinter, job: { id: string; sequence: bigint; payload: string }): Promise<Delivery> => target.protocol === 'raw' ? sendRawPrinter(target, Buffer.from(job.payload, 'base64')) : sendKitchenBytes(target, job)) {
   const runtime = await prisma.branchRuntime.findUnique({ where: { id: 'local' } })
   if (!runtime || runtime.organizationId !== p.organizationId || runtime.branchId !== p.branchId || runtime.writesFrozen) return
   const job = await prisma.$transaction(async tx => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`print-deliver:${p.organizationId}:${p.branchId}:${p.id}`}))`
+    if (p.protocol === 'raw') {
+      const fresh = await tx.networkKitchenPrinter.findUnique({ where: { id: p.id } })
+      if (!fresh?.enabled || fresh.deliveryMode !== 'branch' || fresh.host !== p.host || fresh.port !== p.port) return null
+    } else if (await tx.networkKitchenPrinter.count({ where: { organizationId: p.organizationId, branchId: p.branchId, stationId: p.stationId } })) return null
     const scope = { organizationId: p.organizationId, branchId: p.branchId, printerId: p.id }
     await tx.kitchenPrintJob.updateMany({ where: { ...scope, state: 'sending', updatedAt: { lt: new Date(Date.now() - 60000) } }, data: { state: 'uncertain', lastError: 'Worker interrupted during delivery; check the physical printer' } })
     // Renderer-blocked tickets never touched USB. Keep their warning visible,
@@ -139,29 +152,47 @@ export async function deliverKitchenPrinter(p: KitchenPrinter, send = sendKitche
   if (!job) return
   let state: Delivery
   try { state = await send(p, job) } catch { state = 'uncertain' }
-  await prisma.kitchenPrintJob.update({ where: { id: job.id }, data: { state, lastError: state === 'usb_complete' ? null : state === 'queued' ? 'Printer unavailable; queued for retry' : 'Check printer before resolving this job; automatic resend stopped' } })
+  await prisma.kitchenPrintJob.update({ where: { id: job.id }, data: { state, lastError: state === 'usb_complete' ? null : state === 'network_sent' ? 'Sent to printer connection; paper output is not confirmed' : state === 'queued' ? 'Printer unavailable; queued for retry' : 'Check printer before resolving this job; automatic resend stopped' } })
 }
 
 let runningPrinters: KitchenPrinter[] = []
 export async function automaticKitchenStations(organizationId: string, branchId: string, printers = runningPrinters) {
+  const { networkPrinters } = await import('./networkKitchenPrinting')
   const runtime = await prisma.branchRuntime.findUnique({ where: { id: 'local' } })
   if (!runtime && process.env.FOODSYNC_DEPLOYMENT_MODE !== 'branch') {
     const { cloudKitchenStations } = await import('./cloudKitchenPrinting')
-    return cloudKitchenStations(organizationId, branchId)
+    const legacy = await cloudKitchenStations(organizationId, branchId)
+    const network = (await networkPrinters(organizationId, branchId)).filter(p => p.deliveryMode === 'agent' || p.deliveryMode === 'ipad')
+    if (network.length && !await prisma.branchSyncNode.count({ where: { organizationId, branchId, ownsWrites: true } })) return [...new Set([...legacy, ...network.filter(p => p.stationId !== 'cashier').map(p => p.stationId)])]
+    return legacy
   }
   if (!runtime || runtime.organizationId !== organizationId || runtime.branchId !== branchId || runtime.writesFrozen) return []
-  return printers.filter(p => p.organizationId === organizationId && p.branchId === branchId).map(p => p.stationId)
+  const managed = await prisma.networkKitchenPrinter.findMany({ where: { organizationId, branchId } })
+  return [...new Set([...printers.filter(p => !p.protocol && p.organizationId === organizationId && p.branchId === branchId && !managed.some(m => m.stationId === p.stationId)).map(p => p.stationId), ...managed.filter(p => p.enabled && ['branch', 'ipad'].includes(p.deliveryMode) && p.stationId !== 'cashier').map(p => p.stationId)])]
 }
 export function startKitchenPrintWorker() {
   if (process.env.FOODSYNC_DEPLOYMENT_MODE !== 'branch') return
-  let printers: KitchenPrinter[]
-  try { printers = readKitchenPrinters() } catch { console.error('[kitchen-print] Invalid printer configuration; automatic printing disabled'); return }
-  runningPrinters = printers
   const busy = new Set<string>()
-  const tick = () => printers.forEach(p => {
+  let polling = false
+  const tick = async () => {
+    if (polling) return
+    polling = true
+    try {
+      const { networkPrinters, asKitchenPrinter } = await import('./networkKitchenPrinting')
+      const runtime = await prisma.branchRuntime.findUnique({ where: { id: 'local' } })
+      let legacy: KitchenPrinter[] = []
+      try { legacy = readKitchenPrinters() } catch { console.error('[kitchen-print] Legacy printer configuration invalid') }
+      const overrides = runtime ? await prisma.networkKitchenPrinter.findMany({ where: { organizationId: runtime.organizationId, branchId: runtime.branchId } }) : []
+      const managed = overrides.filter(p => p.enabled && p.deliveryMode === 'branch').map(asKitchenPrinter)
+      runningPrinters = [...legacy, ...managed]
+      // Prefer managed settings if an old environment entry routes the same station.
+      const printers = runningPrinters.filter(p => p.protocol === 'raw' || !overrides.some(m => m.organizationId === p.organizationId && m.branchId === p.branchId && m.stationId === p.stationId))
+      printers.forEach(p => {
     if (busy.has(p.id)) return
     busy.add(p.id)
     void (async () => { await enqueueKitchenPrinter(p); await deliverKitchenPrinter(p) })().catch(() => console.error(`[kitchen-print] ${p.id}: queue check failed`)).finally(() => busy.delete(p.id))
-  })
-  if (printers.length) { tick(); setInterval(tick, 3000).unref() }
+      })
+    } catch { console.error('[kitchen-print] Printer settings could not be loaded') } finally { polling = false }
+  }
+  void tick(); setInterval(() => void tick(), 3000).unref()
 }

@@ -81,6 +81,14 @@ async function run(tx) {
     await require('./hr.cjs')({ tx, api, org, branch, signAccessToken, check, base })
     return
   }
+  await tx.$executeRawUnsafe('SAVEPOINT branch_menu_regression')
+  try {
+    await require('./branch-menu.cjs')({ tx, db, api, base, token, org, org2, branch, dish, shift, table, user, signAccessToken, check })
+  } finally {
+    await tx.$executeRawUnsafe('ROLLBACK TO SAVEPOINT branch_menu_regression')
+    await tx.$executeRawUnsafe('RELEASE SAVEPOINT branch_menu_regression')
+  }
+  if (process.env.TEST_BRANCH_MENU_ONLY === '1') return
   await require('./module-visibility.cjs')({ tx, api, org, branch, signAccessToken, check })
   await require('./acceptance-payment.cjs')({ tx, api, org, branch, dish, check })
   if (process.env.TEST_PAYMENT_FIRST === '1') {

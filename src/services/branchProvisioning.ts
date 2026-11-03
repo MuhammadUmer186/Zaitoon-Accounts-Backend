@@ -8,19 +8,20 @@ import { getUserPermissions } from '../utils/permissions'
 import { assertTransferPublicKey, wrapForPc } from '../utils/fiscalTransfer'
 import { unseal } from './zatca/crypto'
 import { prepareMedia } from './branchMedia'
+import { ensureBranchMenu } from './branchMenu'
 
 const shared = new Set(['Organization', 'Role', 'Permission', 'RolePermission', 'Account', 'BankAccount', 'TaxRate', 'AccountingMapping', 'AccountingPeriod', 'ExpenseCategory', 'Supplier', 'ItemCategory', 'Item', 'MenuCategory', 'MenuShift', 'Dish', 'ModifierGroup', 'KitchenStation', 'VoidReason', 'FreeDishItem'])
 // Synchronization machinery for routing, leases and receipts. These rows describe
 // the cloud/PC relationship itself and never enter a branch seed or an import.
 // Keep in step with the exclusions in 20261026-branch-ownership.sql.
-export const branchControlPlaneModels = new Set(['KitchenPrintJob', 'BranchRuntime', 'BranchOutbox', 'BranchSyncNode', 'BranchSyncEvent', 'BranchSyncProjection', 'BranchReplicaSession', 'BranchReplicaPart', 'BranchRemoteCommand', 'BranchChangeLog', 'BranchWalletReservation', 'BranchWalletReceipt', 'BranchStockTransfer', 'BranchTransferReceipt'])
+export const branchControlPlaneModels = new Set(['NetworkKitchenPrinter', 'KitchenPrintJob', 'BranchRuntime', 'BranchOutbox', 'BranchSyncNode', 'BranchSyncEvent', 'BranchSyncProjection', 'BranchReplicaSession', 'BranchReplicaPart', 'BranchRemoteCommand', 'BranchChangeLog', 'BranchWalletReservation', 'BranchWalletReceipt', 'BranchStockTransfer', 'BranchTransferReceipt'])
 export const branchExcludedModels = new Set([...branchControlPlaneModels, 'AuthAttemptBucket', 'RefreshToken', 'FreeDishRateLimit', 'FreeDishQr', 'FreeDishSubmission', 'Notification', 'AuditLog', 'CommerceSettings', 'PaymentIntent', 'PaymentEvent', 'CheckoutDevice', 'GiftCard', 'GiftCardTransaction', 'LoyaltyTransaction', 'HouseAccountTransaction', 'PosApproval', 'PosOfflineDevice', 'OfflineOrderSync'])
 const excluded = branchExcludedModels
 // Fiscal devices move to a PC only with a transfer key (see below), never via configuration.
 const fiscalModels = new Set(['ZatcaDevice', 'ZatcaDocument'])
 const models = Prisma.dmmf.datamodel.models
 const delegate = (name: string) => name[0].toLowerCase() + name.slice(1)
-export const branchConfigurationModels = new Set([...shared, 'Branch', 'User', 'UserRole', 'UserBranchAccess', 'DishIngredient', 'DishShift', 'DishSize', 'ModifierOption', 'DishModifierGroup', 'ComboGroup', 'ComboOption'])
+export const branchConfigurationModels = new Set([...shared, 'Branch', 'BranchMenuItem', 'User', 'UserRole', 'UserBranchAccess', 'DishIngredient', 'DishShift', 'DishSize', 'ModifierOption', 'DishModifierGroup', 'ComboGroup', 'ComboOption'])
 export const branchSchemaFingerprint = createHash('sha256').update(JSON.stringify(models.map(m => [m.name, m.fields.filter(f => f.kind !== 'object').map(f => [f.name, f.type, f.isRequired])]))).digest('hex')
 
 // Bootstrap is deliberately distinct from ongoing synchronization. No plaintext passwords,
@@ -37,6 +38,7 @@ export async function exportBranch(req: Request, branchId: string, includeHr = f
   const organizationId = req.user.organizationId
   const branch = await prisma.branch.findFirst({ where: { id: branchId, organizationId, isActive: true } })
   if (!branch) throw new AppError('Active branch not found', 404, 'NOT_FOUND')
+  await ensureBranchMenu(prisma, organizationId, branchId)
   return prisma.$transaction(async tx => {
     const tables: Record<string, Record<string, unknown>[]> = {}
     const selected = new Map<string, Set<string>>()

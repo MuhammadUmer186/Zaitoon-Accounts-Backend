@@ -1,5 +1,6 @@
 import { updateSchema } from '../utils/updateSchema'
 import { Router, Request, Response } from 'express'
+import { ensureBranchMenu } from '../services/branchMenu'
 import { z } from 'zod'
 import { prisma } from '../config'
 import { authenticate } from '../middleware/auth'
@@ -64,8 +65,12 @@ router.post('/', requirePermission('can_create_branch'), async (req: Request, re
   const defaults = (await import('../utils/regions')).regionFor(org.country)
   await assertCodeFree(req.user.organizationId, body.code)
   await assertBranchSlot(req.user.organizationId)
-  const branch = await prisma.branch.create({
-    data: { vatRate: defaults?.taxRate ?? 0, vatEnabled: (defaults?.taxRate ?? 0) > 0, ...body, organizationId: req.user.organizationId },
+  const branch = await prisma.$transaction(async tx => {
+    const created = await tx.branch.create({
+      data: { vatRate: defaults?.taxRate ?? 0, vatEnabled: (defaults?.taxRate ?? 0) > 0, ...body, organizationId: req.user.organizationId },
+    })
+    await ensureBranchMenu(tx, req.user.organizationId, created.id)
+    return tx.branch.findUniqueOrThrow({ where: { id: created.id } })
   })
   res.status(201).json(branch)
 })

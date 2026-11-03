@@ -15,13 +15,26 @@ import multer from 'multer'
 import { Prisma, PrismaClient } from '@prisma/client'
 import { applyMenuImport, createMenuTemplate, dishKey, parseMenuWorkbook } from '../services/menuImport'
 import { pictureKey, readMenuPackage, storeMenuPictures } from '../services/menuPackage'
+import { assertBranchAccess, getBranchScope } from '../utils/branchScope'
+import { branchMenu, catalogPrices, ensureOrganizationMenus, optionPrices } from '../services/branchMenu'
 
 const router = Router()
-
-router.use(authenticate)
-
 const canView = requireAnyPermission('can_manage_menu', 'can_manage_kitchen', 'can_manage_orders')
 const canManage = requirePermission('can_manage_menu')
+
+router.use(authenticate)
+router.use((req, res, next) => {
+  if (req.method !== 'GET' && !req.path.startsWith('/branches/') && req.path !== '/import') return canManage(req, res, next)
+  next()
+})
+router.use(async (req, _res, next) => {
+  if (req.method !== 'GET' && !req.path.startsWith('/branches/') && req.path !== '/import') {
+    if ((await getBranchScope(req)).restricted) throw new AppError('Shared catalog changes require organization-wide access. Edit your branch menu instead.', 403, 'BRANCH_FORBIDDEN')
+    await ensureOrganizationMenus(prisma, req.user.organizationId)
+  }
+  next()
+})
+
 // the workbook (.xlsx), or a .zip with the workbook and pictures, plus any
 // pictures chosen next to the workbook
 const menuUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024, files: 501 } })
@@ -44,6 +57,11 @@ router.get('/import/template', canManage, async (_req: Request, res: Response) =
 })
 
 router.post('/import', canManage, menuUpload.fields([{ name: 'file', maxCount: 1 }, { name: 'images', maxCount: 500 }]), async (req: Request, res: Response) => {
+  const branchId = z.string().min(1).optional().parse(req.body.branchId)
+  if (branchId) {
+    await assertBranchAccess(req, branchId)
+    if (!await prisma.branch.findFirst({ where: { id: branchId, organizationId: req.user.organizationId } })) throw new AppError('Branch not found', 404, 'NOT_FOUND')
+  } else if ((await getBranchScope(req)).restricted) throw new AppError('Select your branch before importing', 403, 'BRANCH_FORBIDDEN')
   const files = req.files as Record<string, Express.Multer.File[]> | undefined
   const main = files?.file?.[0]
   if (!main) throw new AppError('Upload an .xlsx menu workbook, or a .zip with the workbook and pictures.', 400, 'INVALID_MENU_IMPORT')
@@ -59,7 +77,7 @@ router.post('/import', canManage, menuUpload.fields([{ name: 'file', maxCount: 1
   let result
   try {
     result = await prisma.$transaction(async tx => {
-      const summary = await applyMenuImport(tx, req.user.organizationId, data, stored, replaced)
+      const summary = await applyMenuImport(tx, req.user.organizationId, data, stored, replaced, branchId)
       await logAudit(tx as PrismaClient, { req, action: 'menu_imported', module: 'menu', resourceType: 'menu_import', newData: summary })
       return summary
     }, { timeout: 120000, maxWait: 10000 })
@@ -76,9 +94,54 @@ export const dishImageUrl = (dish: { id: string; imagePath: string | null; updat
   dish.imagePath ? `/public/dishes/${dish.id}/image?v=${dish.updatedAt.getTime()}` : null
 
 const dishInclude = {
-  category: { select: { id: true, name: true } },
+  category: { select: { id: true, name: true, isActive: true } },
   shifts: { include: { shift: { select: { id: true, name: true } } } },
 }
+
+router.get('/branches/:branchId/dishes', canView, async (req, res) => {
+  await assertBranchAccess(req, req.params.branchId)
+  const menu = await branchMenu(prisma, req.user.organizationId, req.params.branchId)
+  const dishes = await prisma.dish.findMany({ where: { organizationId: req.user.organizationId }, include: {
+    ...dishInclude, sizes: true, modifierLinks: { include: { group: { include: { options: true } } } }, comboGroups: { include: { options: { include: { dish: { select: { name: true } } } } } },
+    outOfStock: { where: { branchId: req.params.branchId } },
+  }, orderBy: [{ category: { sortOrder: 'asc' } }, { sortOrder: 'asc' }, { name: 'asc' }] })
+  res.json({ data: dishes.map(d => {
+    const row = menu.get(d.id), prices = row ? optionPrices(row.optionPrices) : { sizes: {}, modifiers: {}, combo: {} }
+    return { ...serializeDish(d), catalogActive: d.isActive, categoryActive: d.category.isActive,
+      price: row?.price ?? d.price, isActive: row?.isActive ?? false, outOfStock: !!d.outOfStock.length,
+      optionPrices: prices, priceOptions: {
+        sizes: d.sizes.map(s => ({ id: s.id, name: s.name, price: prices.sizes[s.id] ?? s.price })),
+        modifiers: d.modifierLinks.flatMap(l => l.group.options.map(o => ({ id: o.id, name: `${l.group.name}: ${o.name}`, price: prices.modifiers[o.id] ?? o.price }))),
+        combo: d.comboGroups.flatMap(g => g.options.map(o => ({ id: o.id, name: `${g.name}: ${o.dish.name}`, price: prices.combo[o.id] ?? o.priceDelta }))),
+      },
+    }
+  }) })
+})
+
+const branchPricesSchema = z.object({
+  price: z.number().finite().min(0).max(1e9), isActive: z.boolean(),
+  optionPrices: z.object({ sizes: z.record(z.string(), z.number().finite().min(0).max(1e9)), modifiers: z.record(z.string(), z.number().finite().min(0).max(1e9)), combo: z.record(z.string(), z.number().finite().min(-1e9).max(1e9)) }),
+})
+router.put('/branches/:branchId/dishes/:dishId', canManage, async (req, res) => {
+  await assertBranchAccess(req, req.params.branchId)
+  const body = branchPricesSchema.parse(req.body)
+  const result = await prisma.$transaction(async tx => {
+    await branchMenu(tx, req.user.organizationId, req.params.branchId)
+    const defaults = await catalogPrices(tx, req.user.organizationId, req.params.dishId)
+    for (const key of ['sizes', 'modifiers', 'combo'] as const) {
+      if (Object.keys(body.optionPrices[key]).some(id => defaults[key][id] === undefined)) throw new AppError('An option does not belong to this dish. Reload the menu.', 400, 'INVALID_SELECTION')
+      // Save all current option prices explicitly, including newly added sizes.
+      if (Object.keys(defaults[key]).some(id => body.optionPrices[key][id] === undefined)) throw new AppError('Include all option prices for this dish', 400, 'INVALID_SELECTION')
+    }
+    const where = { branchId_dishId: { branchId: req.params.branchId, dishId: req.params.dishId } }
+    const old = await tx.branchMenuItem.findUnique({ where })
+    const saved = await tx.branchMenuItem.upsert({ where, create: { ...body, organizationId: req.user.organizationId, branchId: req.params.branchId, dishId: req.params.dishId }, update: body })
+    await logAudit(tx as PrismaClient, { req, action: 'update', module: 'menu', resourceType: 'branch_menu', resourceId: saved.id, oldData: old, newData: saved })
+    return saved
+  })
+  publish({ topic: 'menu', action: 'branch_menu_updated', organizationId: req.user.organizationId, branchId: req.params.branchId })
+  res.json(result)
+})
 
 type DishWithRelations = Awaited<ReturnType<typeof findDish>>
 const findDish = (id: string, organizationId: string) =>
@@ -371,6 +434,7 @@ router.put('/dishes/:id/options', canManage, async (req: Request, res: Response)
   const dish = await prisma.dish.findFirst({ where: { id: req.params.id, organizationId: orgId } })
   if (!dish) throw new AppError('Dish not found', 404, 'NOT_FOUND')
   const body = dishOptionsSchema.parse(req.body)
+  if (new Set(body.comboGroups.map(g => g.name.toLowerCase())).size !== body.comboGroups.length) throw new AppError('Combo group names must be unique', 400, 'VALIDATION_ERROR')
   const groupIds = body.modifierGroups.map((g) => g.groupId)
   if (new Set(groupIds).size !== groupIds.length) throw new AppError('A modifier group is linked twice', 400, 'VALIDATION_ERROR')
   if (groupIds.length && (await prisma.modifierGroup.count({ where: { id: { in: groupIds }, organizationId: orgId } })) !== groupIds.length) throw new AppError('Unknown modifier group', 400, 'VALIDATION_ERROR')
@@ -406,10 +470,24 @@ router.put('/dishes/:id/options', canManage, async (req: Request, res: Response)
     }
     await tx.dishModifierGroup.deleteMany({ where: { dishId: dish.id } })
     for (const [sortOrder, l] of body.modifierGroups.entries()) await tx.dishModifierGroup.create({ data: { ...l, dishId: dish.id, sortOrder } })
-    await tx.comboGroup.deleteMany({ where: { dishId: dish.id } })
+    // Branch price snapshots and saved carts require stable combo option IDs.
+    const oldGroups = await tx.comboGroup.findMany({ where: { dishId: dish.id }, include: { options: true } })
+    const keptGroups: string[] = []
     for (const [sortOrder, g] of body.comboGroups.entries()) {
-      await tx.comboGroup.create({ data: { dishId: dish.id, name: g.name, minSelect: g.minSelect, maxSelect: g.maxSelect, sortOrder, options: { create: g.options.map((o, i) => ({ dishId: o.dishId, sizeId: o.sizeId || null, priceDelta: o.priceDelta, isDefault: o.isDefault, sortOrder: i })) } } })
+      const old = oldGroups.find(x => x.name.toLowerCase() === g.name.toLowerCase())
+      const data = { dishId: dish.id, name: g.name, minSelect: g.minSelect, maxSelect: g.maxSelect, sortOrder }
+      const group = old ? await tx.comboGroup.update({ where: { id: old.id }, data }) : await tx.comboGroup.create({ data })
+      keptGroups.push(group.id)
+      const keptOptions: string[] = []
+      for (const [i, o] of g.options.entries()) {
+        const previous = old?.options.find(x => !keptOptions.includes(x.id) && x.dishId === o.dishId && x.sizeId === (o.sizeId || null))
+        const fields = { groupId: group.id, dishId: o.dishId, sizeId: o.sizeId || null, priceDelta: o.priceDelta, isDefault: o.isDefault, sortOrder: i }
+        const option = previous ? await tx.comboOption.update({ where: { id: previous.id }, data: fields }) : await tx.comboOption.create({ data: fields })
+        keptOptions.push(option.id)
+      }
+      await tx.comboOption.deleteMany({ where: { groupId: group.id, id: { notIn: keptOptions } } })
     }
+    await tx.comboGroup.deleteMany({ where: { dishId: dish.id, id: { notIn: keptGroups } } })
     await tx.dish.update({ where: { id: dish.id }, data: { isCombo: body.isCombo } })
   })
   await logAudit(prisma, { req, action: 'update', module: 'menu', resourceType: 'dish_options', resourceId: dish.id, resourceRef: dish.name, newData: body })

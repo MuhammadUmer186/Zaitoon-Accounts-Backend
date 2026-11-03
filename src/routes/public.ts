@@ -16,6 +16,7 @@ import { dishImageUrl } from './menu'
 import { brandingLogoUrl } from './orgs'
 import { publish, openStream } from '../utils/liveEvents'
 import { parseReviewCode } from '../utils/reviewCode'
+import { branchUnavailable } from '../services/branchMenu'
 
 // Unauthenticated endpoints behind the table QR codes. A table is identified
 // only by its unguessable token; nothing here takes an organization, branch
@@ -266,6 +267,7 @@ export const placeOrderSchema = z.object({
 
 // The dishes guests can order now at a branch (table QR and kiosk)
 export async function guestMenuCategories(organizationId: string, branchId: string, shiftId: string) {
+  const { menu, off: hidden } = await branchUnavailable(prisma, organizationId, branchId)
   const [dishes, outOfStock] = await Promise.all([
     prisma.dish.findMany({
       where: {
@@ -279,8 +281,8 @@ export async function guestMenuCategories(organizationId: string, branchId: stri
     }),
     prisma.dishOutOfStock.findMany({ where: { branchId }, select: { dishId: true } }),
   ])
-  const hidden = new Set(outOfStock.map((o) => o.dishId))
-  const options = await loadDishOptions(prisma, dishes.map((d) => d.id))
+  for (const o of outOfStock) hidden.add(o.dishId)
+  const options = await loadDishOptions(prisma, dishes.map((d) => d.id), branchId)
   const byCategory = new Map<string, { id: string; name: string; description: string | null; dishes: unknown[] }>()
   for (const d of dishes) {
     if (hidden.has(d.id)) continue
@@ -289,7 +291,7 @@ export async function guestMenuCategories(organizationId: string, branchId: stri
       cat = { id: d.category.id, name: d.category.name, description: d.category.description, dishes: [] }
       byCategory.set(d.categoryId, cat)
     }
-    cat.dishes.push({ id: d.id, name: d.name, description: d.description, price: d.price, imageUrl: dishImageUrl(d), ...menuOptionsPayload(options.get(d.id), hidden) })
+    cat.dishes.push({ id: d.id, name: d.name, description: d.description, price: menu.get(d.id)!.price, imageUrl: dishImageUrl(d), ...menuOptionsPayload(options.get(d.id), hidden) })
   }
   return [...byCategory.values()]
 }
@@ -299,6 +301,7 @@ export class DishesUnavailable extends Error { constructor(message: string, publ
 // Price a guest cart on the server (table QR and kiosk): every dish must be
 // active, in stock at the branch and on the current shift.
 export async function priceGuestCart(organizationId: string, branchId: string, shiftId: string, items: z.infer<typeof placeOrderSchema>['items'], guestName: string | null, status: string) {
+  const { menu, off: unavailable } = await branchUnavailable(prisma, organizationId, branchId)
   const dishIds = [...new Set(items.map((i) => i.dishId))]
   const [dishes, outOfStock] = await Promise.all([
     prisma.dish.findMany({
@@ -308,7 +311,7 @@ export async function priceGuestCart(organizationId: string, branchId: string, s
     // Include combo components, which need not be top-level cart dishes.
     prisma.dishOutOfStock.findMany({ where: { branchId }, select: { dishId: true } }),
   ])
-  const unavailable = new Set(outOfStock.map((o) => o.dishId))
+  for (const o of outOfStock) unavailable.add(o.dishId)
   const dishMap = new Map(dishes.map((d) => [d.id, d]))
   const rejectedIds = dishIds.filter((id) => {
     const d = dishMap.get(id)
@@ -318,10 +321,10 @@ export async function priceGuestCart(organizationId: string, branchId: string, s
     const names = rejectedIds.map((id) => dishMap.get(id)?.name ?? 'an item')
     throw new DishesUnavailable(`Sorry, ${names.join(', ')} ${names.length === 1 ? 'is' : 'are'} not available right now. Please update your cart.`, rejectedIds)
   }
-  const [options, stations] = await Promise.all([loadDishOptions(prisma, dishIds), resolveStations(prisma, organizationId, dishIds)])
+  const [options, stations] = await Promise.all([loadDishOptions(prisma, dishIds, branchId), resolveStations(prisma, organizationId, dishIds)])
   return items.map((i) => {
     const d = dishMap.get(i.dishId)!
-    const { unitPrice, selection } = priceSelection(d, options.get(d.id), i, unavailable)
+    const { unitPrice, selection } = priceSelection({ ...d, price: menu.get(d.id)!.price }, options.get(d.id), i, unavailable)
     return {
       dishId: d.id,
       dishName: d.name,

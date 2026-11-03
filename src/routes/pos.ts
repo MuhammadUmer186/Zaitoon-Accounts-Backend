@@ -14,6 +14,7 @@ import { assertTableService } from '../utils/tableService'
 import { makeReviewCode } from '../utils/reviewCode'
 import { deliveryQuote } from '../services/deliveryPricing'
 import { linkCustomer } from '../services/customers'
+import { branchUnavailable } from '../services/branchMenu'
 
 // Point of sale: the cashier takes dine-in (table), takeaway and delivery
 // (e.g. phone) orders at the counter. Orders go to the same kitchen board and order list as QR orders,
@@ -32,6 +33,7 @@ export async function posMenu(req: Request, res: Response) {
   const org = await prisma.organization.findUniqueOrThrow({ where: { id: req.user.organizationId } })
   const shifts = await ensureShifts(prisma, org.id)
   const shift = currentShift(shifts, org.timezone)
+  const { menu, off } = await branchUnavailable(prisma, org.id, branchId)
 
   const [categories, outOfStock] = await Promise.all([
     prisma.menuCategory.findMany({
@@ -47,8 +49,9 @@ export async function posMenu(req: Request, res: Response) {
     }),
     prisma.dishOutOfStock.findMany({ where: { branchId }, select: { dishId: true } }),
   ])
-  const off = new Set(outOfStock.map((o) => o.dishId))
-  const options = await loadDishOptions(prisma, categories.flatMap((c) => c.dishes.map((d) => d.id)))
+  for (const c of categories) c.dishes = c.dishes.filter(d => menu.get(d.id)?.isActive)
+  for (const o of outOfStock) off.add(o.dishId)
+  const options = await loadDishOptions(prisma, categories.flatMap((c) => c.dishes.map((d) => d.id)), branchId)
   const stationIds = await resolveStations(prisma, org.id, categories.flatMap((c) => c.dishes.map((d) => d.id)))
   const stations = new Map((await prisma.kitchenStation.findMany({ where: { organizationId: org.id, isActive: true }, select: { id: true, name: true, printerName: true } })).map((x) => [x.id, x]))
 
@@ -64,7 +67,7 @@ export async function posMenu(req: Request, res: Response) {
         dishes: c.dishes.map((d) => ({
           id: d.id,
           name: d.name,
-          price: d.price,
+          price: menu.get(d.id)!.price,
           imageUrl: dishImageUrl(d),
           available: !off.has(d.id),
           inCurrentShift: !!shift && d.shifts.some((s) => s.shiftId === shift.id),

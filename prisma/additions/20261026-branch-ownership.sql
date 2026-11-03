@@ -58,7 +58,7 @@ DO $$ DECLARE item RECORD; BEGIN
   WHERE table_schema=current_schema() AND column_name='branchId'
    -- Control-plane tables carry branchId for routing only; the cloud must be
    -- able to queue work for a branch it does not own (see 20261027 repair).
-   AND table_name NOT IN ('KitchenPrintJob','BranchRuntime','BranchOutbox','BranchSyncNode','BranchSyncProjection','BranchRemoteCommand','BranchWalletReservation','BranchWalletReceipt','BranchTransferReceipt','UserBranchAccess','BranchTarget','AuditLog','PaymentIntent','FreeDishQr','FreeDishSubmission')
+   AND table_name NOT IN ('BranchMenuItem','NetworkKitchenPrinter','KitchenPrintJob','BranchRuntime','BranchOutbox','BranchSyncNode','BranchSyncProjection','BranchRemoteCommand','BranchWalletReservation','BranchWalletReceipt','BranchTransferReceipt','UserBranchAccess','BranchTarget','AuditLog','PaymentIntent','FreeDishQr','FreeDishSubmission')
   UNION SELECT name FROM unnest(ARRAY['Branch','JournalLine','CustomerOrderItem','BillItem','DeliveryBreakdown','WastageItem','PurchaseOrderItem','TillMovement','DeliveryEvent','HrPayrollLine','HrPayrollPayment','OfflineOrderSync']) name
  LOOP
   EXECUTE format('DROP TRIGGER IF EXISTS foodsync_branch_ownership ON %I',item.table_name);

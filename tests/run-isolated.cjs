@@ -12,9 +12,10 @@ const name = `fs_qa_${process.pid}_${Date.now()}`;
 const original = new URL(process.env.DATABASE_URL), adminUrl = new URL(original), scratch = new URL(original);
 adminUrl.pathname = '/postgres'; scratch.pathname = '/' + name;
 if (!/^fs_qa_[0-9]+_[0-9]+$/.test(name) || scratch.pathname === original.pathname) throw new Error('Unsafe QA target');
-const env = { ...process.env, DATABASE_URL: scratch.toString(), LOGIN_RATE_LIMIT: '30', ZATCA_SANDBOX: '', UI_TEST_HOLD: '', TEST_HR_ONLY: '', TEST_PAYMENT_FIRST: '', UI_TEST_PORT: '0' };
+const env = { ...process.env, DATABASE_URL: scratch.toString(), LOGIN_RATE_LIMIT: '30', ZATCA_SANDBOX: '', UI_TEST_HOLD: '', TEST_HR_ONLY: '', TEST_PAYMENT_FIRST: '', TEST_BRANCH_MENU_ONLY: process.argv.includes('--branch-menu-only') ? '1' : '', UI_TEST_PORT: '0' };
 async function run(label, file, args = [], timeout = 240000) {
-  if (process.argv.includes('--ordering-only') && path.dirname(file) === path.join(backend, 'tests') && label !== 'existing-ordering-finance') return;
+  if ((process.argv.includes('--ordering-only') || process.argv.includes('--branch-menu-only')) && path.dirname(file) === path.join(backend, 'tests') && label !== 'existing-ordering-finance') return;
+  if (process.argv.includes('--branch-runtime-only') && path.dirname(file) === path.join(backend, 'tests') && label !== 'branch-runtime') return;
   const log = path.join(outputDir, label + '.log'), fd = fs.openSync(log, 'w'), t = Date.now();
   console.log('RUN', label);
   const outcome = await new Promise(resolve => {
@@ -42,6 +43,7 @@ async function run(label, file, args = [], timeout = 240000) {
     await run('post-push', cli, ['db','execute','--file',path.join(backend,'prisma/post-push.sql'),'--schema',path.join(backend,'prisma/schema.prisma')]);
     await run('rate-limit-addition', cli, ['db','execute','--file',path.join(backend,'prisma/additions/20261026-auth-rate-limit.sql'),'--schema',path.join(backend,'prisma/schema.prisma')]);
     await run('branch-runtime-addition', cli, ['db','execute','--file',path.join(backend,'prisma/additions/20261026-branch-runtime.sql'),'--schema',path.join(backend,'prisma/schema.prisma')]);
+    await run('branch-menu-addition', cli, ['db','execute','--file',path.join(backend,'prisma/additions/20261102-branch-menu.sql'),'--schema',path.join(backend,'prisma/schema.prisma')]);
     await run('branch-ownership-addition', cli, ['db','execute','--file',path.join(backend,'prisma/additions/20261026-branch-ownership.sql'),'--schema',path.join(backend,'prisma/schema.prisma')]);
     await run('branch-replica-addition', cli, ['db','execute','--file',path.join(backend,'prisma/additions/20261026-branch-replica.sql'),'--schema',path.join(backend,'prisma/schema.prisma')]);
     await run('branch-sync-safety-addition', cli, ['db','execute','--file',path.join(backend,'prisma/additions/20261027-branch-sync-safety.sql'),'--schema',path.join(backend,'prisma/schema.prisma')]);

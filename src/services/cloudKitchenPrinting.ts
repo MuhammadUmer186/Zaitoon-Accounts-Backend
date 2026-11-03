@@ -39,7 +39,8 @@ async function assertCloudBranch(p: CloudKitchenPrinter) {
 }
 
 export async function cloudKitchenStations(organizationId: string, branchId: string) {
-  const printers = readCloudKitchenPrinters().filter(p => p.organizationId === organizationId && p.branchId === branchId)
+  const managed = await prisma.networkKitchenPrinter.findMany({ where: { organizationId, branchId }, select: { stationId: true } })
+  const printers = readCloudKitchenPrinters().filter(p => p.organizationId === organizationId && p.branchId === branchId && !managed.some(m => m.stationId === p.stationId))
   if (!printers.length) return []
   await assertCloudBranch(printers[0])
   return printers.map(p => p.stationId)
@@ -48,6 +49,7 @@ export async function cloudKitchenStations(organizationId: string, branchId: str
 const scope = (p: CloudKitchenPrinter) => ({ organizationId: p.organizationId, branchId: p.branchId, printerId: p.id })
 export async function pollCloudKitchenPrinter(p: CloudKitchenPrinter): Promise<Buffer | null> {
   await assertCloudBranch(p)
+  if (await prisma.networkKitchenPrinter.count({ where: { organizationId: p.organizationId, branchId: p.branchId, stationId: p.stationId } })) throw new AppError('This station now uses the IP printer configured in Settings', 409, 'PRINTER_REPLACED')
   // Reuse paid-order selection, station routing, held courses, cancellation and rendering.
   await enqueueKitchenPrinter(p, 'cloud')
   return prisma.$transaction(async tx => {

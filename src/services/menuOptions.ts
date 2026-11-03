@@ -3,6 +3,7 @@ import { Prisma, PrismaClient } from '@prisma/client'
 import { z } from 'zod'
 import { AppError } from '../middleware/error'
 import type { RecipeLine } from './foodCost'
+import { branchUnavailable, optionPrices } from './branchMenu'
 
 type Db = PrismaClient | Prisma.TransactionClient
 
@@ -32,7 +33,7 @@ export interface DishOptions {
 }
 
 // Effective options of dishes, as the POS / guest menus show them
-export async function loadDishOptions(db: Db, dishIds: string[]): Promise<Map<string, DishOptions>> {
+export async function loadDishOptions(db: Db, dishIds: string[], branchId?: string): Promise<Map<string, DishOptions>> {
   const ids = [...new Set(dishIds)]
   const out = new Map<string, DishOptions>()
   if (ids.length === 0) return out
@@ -45,23 +46,26 @@ export async function loadDishOptions(db: Db, dishIds: string[]): Promise<Map<st
       comboGroups: { orderBy: { sortOrder: 'asc' }, include: { options: { orderBy: { sortOrder: 'asc' }, include: { dish: { select: { name: true, isActive: true, sizes: true } } } } } },
     },
   })
+  const branchRows = branchId ? await db.branchMenuItem.findMany({ where: { branchId, dishId: { in: ids } } }) : []
+  const prices = new Map(branchRows.map(r => [r.dishId, optionPrices(r.optionPrices)]))
   for (const d of dishes) {
+    const p = prices.get(d.id)
     out.set(d.id, {
       isCombo: d.isCombo,
-      sizes: d.sizes.map((s) => ({ id: s.id, name: s.name, price: s.price, factor: s.recipeFactor, isDefault: s.isDefault })),
+      sizes: d.sizes.filter(s => !branchId || p?.sizes[s.id] !== undefined).map((s) => ({ id: s.id, name: s.name, price: p?.sizes[s.id] ?? s.price, factor: s.recipeFactor, isDefault: s.isDefault })),
       groups: d.modifierLinks.filter((l) => l.group.isActive).map((l) => {
-        const options = l.group.options.filter((o) => !l.excludedOptionIds.includes(o.id))
+        const options = l.group.options.filter((o) => !l.excludedOptionIds.includes(o.id) && (!branchId || p?.modifiers[o.id] !== undefined))
         const max = Math.max(1, Math.min(l.maxSelect ?? l.group.maxSelect, options.length || 1))
         return {
           id: l.group.id, name: l.group.name, min: Math.min(l.minSelect ?? l.group.minSelect, max), max, free: l.freeCount,
-          options: options.map((o) => ({ id: o.id, name: o.name, price: o.price, isDefault: o.isDefault, itemId: o.itemId, itemQuantity: o.itemQuantity })),
+          options: options.map((o) => ({ id: o.id, name: o.name, price: p?.modifiers[o.id] ?? o.price, isDefault: o.isDefault, itemId: o.itemId, itemQuantity: o.itemQuantity })),
         }
       }),
       combo: d.comboGroups.map((g) => ({
         id: g.id, name: g.name, min: g.minSelect, max: Math.max(1, g.maxSelect),
-        options: g.options.filter((o) => o.dish.isActive).map((o) => {
+        options: g.options.filter((o) => o.dish.isActive && (!branchId || p?.combo[o.id] !== undefined)).map((o) => {
           const size = o.sizeId ? o.dish.sizes.find((s) => s.id === o.sizeId) : undefined
-          return { id: o.id, dishId: o.dishId, name: o.dish.name, sizeId: size?.id ?? null, sizeName: size?.name ?? null, factor: size?.recipeFactor ?? 1, priceDelta: o.priceDelta, isDefault: o.isDefault }
+          return { id: o.id, dishId: o.dishId, name: o.dish.name, sizeId: size?.id ?? null, sizeName: size?.name ?? null, factor: size?.recipeFactor ?? 1, priceDelta: p?.combo[o.id] ?? o.priceDelta, isDefault: o.isDefault }
         }),
       })),
     })
@@ -186,7 +190,8 @@ export async function priceLines(
   input: { organizationId: string; branchId: string; items: ({ dishId: string; quantity: number; notes?: string | null } & LineSelectionInput)[] },
 ) {
   const dishIds = [...new Set(input.items.map((i) => i.dishId))]
-  const opts = await loadDishOptions(db, dishIds)
+  const { menu, off } = await branchUnavailable(db, input.organizationId, input.branchId)
+  const opts = await loadDishOptions(db, dishIds, input.branchId)
   const componentIds = [...opts.values()].flatMap((o) => o.combo.flatMap((g) => g.options.map((x) => x.dishId)))
   const allIds = [...new Set([...dishIds, ...componentIds])]
   const [dishes, outOfStock] = await Promise.all([
@@ -194,13 +199,13 @@ export async function priceLines(
     db.dishOutOfStock.findMany({ where: { branchId: input.branchId, dishId: { in: allIds } }, select: { dishId: true } }),
   ])
   const byId = new Map(dishes.map((d) => [d.id, d]))
-  const off = new Set(outOfStock.map((o) => o.dishId))
+  for (const o of outOfStock) off.add(o.dishId)
   const stations = await resolveStations(db, input.organizationId, dishIds)
-  const unavailable = dishIds.filter((id) => { const d = byId.get(id); return !d || !d.isActive || !d.category.isActive || off.has(id) })
+  const unavailable = dishIds.filter((id) => { const d = byId.get(id); return !d || !menu.get(id)?.isActive || !d.isActive || !d.category.isActive || off.has(id) })
   if (unavailable.length) return { unavailable, lines: [] as never[] }
   const lines = input.items.map((i) => {
     const d = byId.get(i.dishId)!
-    const { unitPrice, selection } = priceSelection(d, opts.get(d.id), i, off)
+    const { unitPrice, selection } = priceSelection({ ...d, price: menu.get(d.id)!.price }, opts.get(d.id), i, off)
     return { dishId: d.id, dishName: d.name, unitPrice, quantity: i.quantity, lineTotal: r2(unitPrice * i.quantity), notes: i.notes || null, selection: (selection ?? Prisma.JsonNull) as Prisma.InputJsonValue | typeof Prisma.JsonNull, stationId: stations.get(d.id) ?? null }
   })
   return { unavailable: [] as string[], lines }

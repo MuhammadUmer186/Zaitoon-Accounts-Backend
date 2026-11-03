@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { AppError } from '../middleware/error'
 import { HHMM, isValidTimezone } from '../utils/menu'
+import { catalogPrices, ensureOrganizationMenus } from './branchMenu'
 
 export const menuColumns = {
   Dishes: ['category', 'name', 'description', 'price', 'shifts', 'sortOrder', 'isActive', 'recipeMode', 'image'],
@@ -81,9 +82,14 @@ export async function parseMenuWorkbook(buffer: Buffer): Promise<MenuImport> {
 
 // pictures: stored picture path per dish key (see menuPackage); the old
 // picture paths of those dishes are returned for removal after commit
-export async function applyMenuImport(tx: Prisma.TransactionClient, organizationId: string, data: MenuImport, pictures: Map<string, string> = new Map(), replaced: string[] = []) {
+export async function applyMenuImport(tx: Prisma.TransactionClient, organizationId: string, data: MenuImport, pictures: Map<string, string> = new Map(), replaced: string[] = [], branchId?: string) {
   // Serializes repeated/concurrent imports, including retries after a lost response.
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${organizationId}), hashtext('menu-import'))`
+  await ensureOrganizationMenus(tx, organizationId)
+  if (branchId) {
+    if (!await tx.branch.findFirst({ where: { id: branchId, organizationId } })) fail('Branch not found in this organization.')
+    if (data.Settings.length || data.Recipes.length || data.Dishes.some(d => d.recipeMode === 'replace')) fail('Branch imports set prices and availability. Leave Settings and Recipes empty and use recipeMode Keep. Edit shared recipes/settings from the catalog.')
+  }
   const categories = await tx.menuCategory.findMany({ where: { organizationId } })
   const shifts = await tx.menuShift.findMany({ where: { organizationId } })
   const dishes = await tx.dish.findMany({ where: { organizationId }, include: { category: true } })
@@ -116,12 +122,12 @@ export async function applyMenuImport(tx: Prisma.TransactionClient, organization
   let created = 0, updated = 0, recipes = 0
   for (const { row, ...c } of data.Categories) {
     const existing = categoryMap.get(key(c.name))
-    const record = existing ? await tx.menuCategory.update({ where: { id: existing.id }, data: c }) : await tx.menuCategory.create({ data: { ...c, organizationId } })
+    const record = existing ? (branchId ? existing : await tx.menuCategory.update({ where: { id: existing.id }, data: c })) : await tx.menuCategory.create({ data: { ...c, organizationId } })
     categoryMap.set(key(c.name), record)
   }
   for (const { row, ...s } of data.Shifts) {
     const existing = shiftMap.get(key(s.name))
-    const record = existing ? await tx.menuShift.update({ where: { id: existing.id }, data: s }) : await tx.menuShift.create({ data: { ...s, organizationId } })
+    const record = existing ? (branchId ? existing : await tx.menuShift.update({ where: { id: existing.id }, data: s })) : await tx.menuShift.create({ data: { ...s, organizationId } })
     shiftMap.set(key(s.name), record)
   }
   for (const { row, category, shifts: names, recipeMode, ...d } of data.Dishes) {
@@ -132,10 +138,20 @@ export async function applyMenuImport(tx: Prisma.TransactionClient, organization
     const { image: _image, ...fields } = d
     const imagePath = pictures.get(id)
     if (imagePath && existing?.imagePath) replaced.push(existing.imagePath)
-    const dish = existing ? await tx.dish.update({ where: { id: existing.id }, data: { ...fields, categoryId: c.id, ...(imagePath && { imagePath }) } }) : await tx.dish.create({ data: { ...fields, organizationId, categoryId: c.id, ...(imagePath && { imagePath }) } })
+    const dish = existing ? await tx.dish.update({ where: { id: existing.id }, data: { ...(!branchId && { ...fields, categoryId: c.id }), ...(imagePath && { imagePath }) } }) : await tx.dish.create({ data: { ...fields, ...(branchId && { isActive: true }), organizationId, categoryId: c.id, ...(imagePath && { imagePath }) } })
+    if (branchId) {
+      const where = { branchId_dishId: { branchId, dishId: dish.id } }
+      const current = await tx.branchMenuItem.findUnique({ where })
+      await tx.branchMenuItem.upsert({ where,
+        create: { organizationId, branchId, dishId: dish.id, price: d.price, isActive: d.isActive, optionPrices: await catalogPrices(tx, organizationId, dish.id) as unknown as Prisma.InputJsonValue },
+        update: { price: d.price, isActive: d.isActive, ...(current ? {} : { optionPrices: await catalogPrices(tx, organizationId, dish.id) as unknown as Prisma.InputJsonValue }) },
+      })
+    }
     existing ? updated++ : created++
-    await tx.dishShift.deleteMany({ where: { dishId: dish.id } })
-    await tx.dishShift.createMany({ data: [...new Set(names.map(n => shiftMap.get(key(n))!.id))].map(shiftId => ({ dishId: dish.id, shiftId })) })
+    if (!branchId || !existing) {
+      await tx.dishShift.deleteMany({ where: { dishId: dish.id } })
+      await tx.dishShift.createMany({ data: [...new Set(names.map(n => shiftMap.get(key(n))!.id))].map(shiftId => ({ dishId: dish.id, shiftId })) })
+    }
     if (recipeMode === 'replace') {
       await tx.dishIngredient.deleteMany({ where: { dishId: dish.id } })
       const lines = recipeGroups.get(id) || []
@@ -167,7 +183,7 @@ export function createMenuTemplate() {
   const instructions = wb.addWorksheet('Instructions')
   instructions.columns = [{ width: 27 }, { width: 110 }]
   const guidance = [
-    ['FoodSync menu import', 'Fill Dishes, then upload this .xlsx (or a .zip with it and the pictures) in Menu > Import Excel. Other sheets are optional. Maximum 5 MB workbook and 5,000 data rows.'],
+    ['FoodSync menu import', 'Select Menu > Branch menus > a branch, then upload this .xlsx (or a .zip with pictures). Branch imports set prices and availability for that branch only. Use Keep and leave Recipes and Settings empty. Maximum 5 MB workbook and 5,000 data rows.'],
     ['Required dish fields', 'category, name, price (VAT-inclusive), shifts. Separate shift names with |, for example Lunch|Dinner. Existing shifts can be referenced, or define them in Shifts.'],
     ['Defaults', 'Blank description clears it; blank sortOrder means 0; blank isActive means TRUE. Blank image keeps the dish’s current picture.'],
     ['Pictures', 'Optional: put the picture file name in image, e.g. chicken-karahi.jpg. Upload a .zip with this workbook and the pictures (any folder), or choose the workbook and the pictures together. JPG, PNG or WEBP, up to 5 MB each; names match ignoring case and folders.'],
@@ -180,7 +196,7 @@ export function createMenuTemplate() {
     ['Example dish (not imported)', 'Dishes: Main Course | Chicken Rice | Served with salad | 650 | Lunch|Dinner | 1 | TRUE | Keep | chicken-rice.jpg'],
     ['Example recipe (not imported)', 'Recipes: Main Course | Chicken Rice | RICE-001 | 0.15 | 5 | 1. Set that dish to Replace and use your actual inventory code.'],
     ['Validation', 'Keep sheet names and column headers unchanged. Use values, not formulas. Duplicate dishes/ingredients, unknown inventory codes or invalid values stop the whole import. Fix the indicated sheet/row and retry.'],
-    ['One import', 'Choose the completed file and click Import menu. Every sheet is saved together or nothing is saved. This affects the organization menu across all branches.'],
+    ['One import', 'Choose the destination branch and click Import menu. Branch prices and availability save together or nothing is saved. Existing shared descriptions and shift links are preserved. Pictures update the shared catalog wherever the dish is used. Recipes/settings below are for shared catalog API maintenance only.'],
   ]
   for (const values of guidance) { const row = instructions.addRow(values); row.height = 48; row.alignment = { vertical: 'middle', wrapText: true }; row.getCell(1).font = { bold: true } }
   instructions.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF096B56' } }

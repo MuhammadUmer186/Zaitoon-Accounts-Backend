@@ -441,7 +441,7 @@ router.get('/expenses', async (req: Request, res: Response) => {
 
   const register: ReportRow[] = expenses.map((e) => ({
     expenseNo: e.expenseNo, date: e.expenseDate.toISOString(), branch: e.branch.name, category: e.category.name,
-    description: e.description, type: e.source === 'purchasing' ? 'Purchase payment' : e.source === 'maintenance' ? 'Maintenance' : 'Manual',
+    description: e.description, type: e.source === 'purchasing' ? 'Purchase payment' : e.source === 'maintenance' ? 'Maintenance' : 'Operating expense',
     paymentMethod: e.paymentMethod.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()),
     amount: e.amount, vat: e.vatAmount, totalAmount: e.totalAmount, status: e.status,
   }))
@@ -451,7 +451,7 @@ router.get('/expenses', async (req: Request, res: Response) => {
     summaryLine: '',
     kpis: [
       { label: 'Total expenses', value: total, hint: `Includes ${tax()} · ${plural(expenses.length, 'entry', 'entries')}` },
-      { label: 'Operating expenses', value: sum(manual, (e) => e.totalAmount), hint: `${formatPercent(pct(sum(manual, (e) => e.totalAmount), total))} · manual entries` },
+      { label: 'Other operating expenses', value: sum(manual, (e) => e.totalAmount), hint: `${formatPercent(pct(sum(manual, (e) => e.totalAmount), total))} · manual entries` },
       { label: 'Maintenance', value: sum(maintenance, (e) => e.totalAmount), hint: `${formatPercent(pct(sum(maintenance, (e) => e.totalAmount), total))} · ${plural(maintenance.length, 'entry', 'entries')}` },
       { label: 'Purchase payments', value: sum(purchasePayments, (e) => e.totalAmount), hint: `${plural(purchasePayments.length, 'payment')} against purchases` },
       { label: 'Top category', value: topCat ? String(topCat.category) : '—', format: 'text', hint: topCat ? `${fmtMoney(Number(topCat.total))} · ${formatPercent(Number(topCat.share))} of total` : 'No expenses in period', tone: 'dark' },
@@ -461,7 +461,7 @@ router.get('/expenses', async (req: Request, res: Response) => {
         type: 'table', id: 'monthly', title: 'Monthly expense summary',
         columns: [
           { key: 'month', label: 'Month' }, { key: 'count', label: 'Entries', format: 'integer' },
-          { key: 'operating', label: 'Operating', format: 'money' }, { key: 'maintenance', label: 'Maintenance', format: 'money' }, { key: 'purchasePayments', label: 'Purchase payments', format: 'money' },
+          { key: 'operating', label: 'Other operating', format: 'money' }, { key: 'maintenance', label: 'Maintenance', format: 'money' }, { key: 'purchasePayments', label: 'Purchase payments', format: 'money' },
           { key: 'vat', label: tax(), format: 'money' }, { key: 'total', label: 'Total', format: 'money' },
         ],
         rows: monthly,

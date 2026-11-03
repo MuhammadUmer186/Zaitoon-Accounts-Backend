@@ -57,6 +57,12 @@ module.exports = async function menuOptionsTests({ tx, api, signAccessToken, che
   check('a combo cannot contain another combo', () => assert.equal(r.status, 400))
 
   // ── menu payloads
+  const { catalogPrices } = require('../dist/services/branchMenu')
+  for (const d of [pizza, pepsi, deal, mega]) await tx.branchMenuItem.upsert({
+    where: { branchId_dishId: { branchId: branch.id, dishId: d.id } },
+    create: { organizationId: org.id, branchId: branch.id, dishId: d.id, price: d.price, isActive: true, optionPrices: await catalogPrices(tx, org.id, d.id) },
+    update: { optionPrices: await catalogPrices(tx, org.id, d.id) },
+  })
   r = await api('GET', `/pos/menu?branchId=${branch.id}`, undefined, t)
   const posPizza = r.data.categories[0].dishes.find((d) => d.id === pizza.id)
   check('the POS menu carries sizes and modifier rules', () => {
@@ -148,6 +154,9 @@ module.exports = async function menuOptionsTests({ tx, api, signAccessToken, che
   r = await send([{ dishId: deal.id, quantity: 1, combo: [...selectedCombo, selectedCombo[0]] }])
   check('repeated combo option IDs are refused', () => { assert.equal(r.status, 400); assert.match(r.data.message, /twice/) })
   await tx.comboOption.update({ where: { id: dealGroups[0].options[0].id }, data: { priceDelta: -2000 } })
+  const branchDeal = await tx.branchMenuItem.findUniqueOrThrow({ where: { branchId_dishId: { branchId: branch.id, dishId: deal.id } } })
+  branchDeal.optionPrices.combo[dealGroups[0].options[0].id] = -2000
+  await tx.branchMenuItem.update({ where: { id: branchDeal.id }, data: { optionPrices: branchDeal.optionPrices } })
   r = await send([{ dishId: deal.id, quantity: 1, combo: selectedCombo }])
   check('combo discounts cannot produce negative line prices', () => { assert.equal(r.status, 400); assert.match(r.data.message, /negative/) })
   await tx.branch.update({ where: { id: branch.id }, data: { isActive: false } })

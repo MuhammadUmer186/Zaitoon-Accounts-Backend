@@ -30,7 +30,7 @@ router.get('/', async (req: Request, res: Response) => {
   if (Object.values(dates).some(d => !Number.isFinite(d.getTime()))) throw new AppError('Invalid date filter', 400, 'VALIDATION_ERROR')
   const hasDates = Object.keys(dates).length > 0
   // Maintenance entries are operating expenses; the "maintenance" filter narrows to just them.
-  const expenseWhere: Prisma.ExpenseWhereInput = { ...base, source: q.kind === 'maintenance' ? 'maintenance' : { not: 'purchasing' }, ...(hasDates && { expenseDate: dates }), ...(q.categoryId && { categoryId: q.categoryId }) }
+  const expenseWhere: Prisma.ExpenseWhereInput = { ...base, source: { not: 'purchasing' }, ...(hasDates && { expenseDate: dates }), ...(q.categoryId && { categoryId: q.categoryId }) }
   const billWhere: Prisma.BillWhereInput = { ...base, source: 'purchasing', ...(hasDates && { billDate: dates }), ...(q.categoryId && { categoryId: q.categoryId }) }
   if (q.status === 'void') { expenseWhere.status = 'void'; billWhere.status = 'void' }
   else { expenseWhere.status = { not: 'void' }; billWhere.status = { not: 'void' } }
@@ -44,6 +44,7 @@ router.get('/', async (req: Request, res: Response) => {
   const summary = spendSummary({ total: billTotals._sum.totalAmount ?? 0, paid: billTotals._sum.paidAmount ?? 0, due: billTotals._sum.balanceDue ?? 0 },
     { total: expenseTotals._sum.totalAmount ?? 0, paid: paidExpenseTotals._sum.totalAmount ?? 0, due: dueExpenseTotals._sum.totalAmount ?? 0 },
     maintenanceTotals._sum.totalAmount ?? 0)
+  if (q.kind === 'maintenance') expenseWhere.source = 'maintenance'
   const take = page * limit
   if (q.kind === 'payment') {
     const voidReceipts = await prisma.expense.findMany({ where: { ...base, source: 'purchasing', status: 'void', paymentId: { not: null } }, select: { paymentId: true } })

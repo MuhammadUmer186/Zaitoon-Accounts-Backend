@@ -9,7 +9,7 @@ import { assertBranchAccess, branchFilter } from '../utils/branchScope'
 import { logAudit } from '../utils/audit'
 import { ensureShifts, currentShift } from '../utils/menu'
 import { dishImageUrl } from './menu'
-import { orderInclude, publishOrder } from './orders'
+import { orderInclude, publishOrder, lockOrder } from './orders'
 import { publish } from '../utils/liveEvents'
 import crypto from 'node:crypto'
 import { readKitchenPrinters, automaticKitchenStations } from '../services/kitchenPrinting'
@@ -35,20 +35,24 @@ router.get('/print-routing', async (req: Request, res: Response) => {
 
 router.get('/printers', canBoard, async (req: Request, res: Response) => {
   const branch = await branchFilter(req, String(req.query.branchId ?? '') || undefined)
+  const managed = await prisma.networkKitchenPrinter.findMany({ where: { organizationId: req.user.organizationId, ...(branch && { branchId: branch }) }, select: { id: true, stationId: true, branchId: true, enabled: true } })
+  await prisma.kitchenPrintJob.updateMany({ where: { organizationId: req.user.organizationId, ...(branch && { branchId: branch }), state: 'sending', updatedAt: { lt: new Date(Date.now() - 60000) } }, data: { state: 'uncertain', lastError: 'Print connection interrupted; check paper output before reviewing this job' } })
   const jobs = await prisma.kitchenPrintJob.findMany({ where: { organizationId: req.user.organizationId, ...(branch && { branchId: branch }) }, orderBy: { sequence: 'desc' }, take: 100, select: { id: true, sequence: true, branchId: true, printerId: true, orderId: true, kind: true, state: true, attempts: true, lastError: true, createdAt: true } })
   const scope = { organizationId: req.user.organizationId, ...(branch && { branchId: branch }) }
   const held = await prisma.kitchenPrintJob.findMany({ where: { ...scope, state: { in: ['uncertain', 'blocked'] } }, take: 20, orderBy: { sequence: 'asc' }, select: { id: true, printerId: true, state: true, lastError: true } })
   const queued = await prisma.kitchenPrintJob.count({ where: { ...scope, state: 'queued' } })
   const runtime = await prisma.branchRuntime.findUnique({ where: { id: 'local' } })
-  let configured: { id: string; stationId: string }[] = []
+  let configured: { id: string; stationId: string; branchId: string }[] = []
   let configurationError = false
-  try { configured = readKitchenPrinters().filter(p => p.organizationId === req.user.organizationId && p.branchId === runtime?.branchId && (!branch || (typeof branch === 'string' ? p.branchId === branch : branch.in.includes(p.branchId)))).map(p => ({ id: p.id, stationId: p.stationId })) } catch { configurationError = true }
+  try { configured = readKitchenPrinters().filter(p => p.organizationId === req.user.organizationId && p.branchId === runtime?.branchId && (!branch || (typeof branch === 'string' ? p.branchId === branch : branch.in.includes(p.branchId)))).map(p => ({ id: p.id, stationId: p.stationId, branchId: p.branchId })) } catch { configurationError = true }
   if (!runtime && process.env.FOODSYNC_DEPLOYMENT_MODE !== 'branch') {
-    try { configured = readCloudKitchenPrinters().filter(p => p.organizationId === req.user.organizationId && (!branch || (typeof branch === 'string' ? p.branchId === branch : branch.in.includes(p.branchId)))).map(p => ({ id: p.id, stationId: p.stationId })) } catch { configurationError = true }
+    try { configured = readCloudKitchenPrinters().filter(p => p.organizationId === req.user.organizationId && (!branch || (typeof branch === 'string' ? p.branchId === branch : branch.in.includes(p.branchId)))).map(p => ({ id: p.id, stationId: p.stationId, branchId: p.branchId })) } catch { configurationError = true }
   }
+  configured = configured.filter(p => !managed.some(m => m.branchId === p.branchId && m.stationId === p.stationId))
+  configured.push(...managed.filter(p => p.enabled).map(p => ({ id: p.id, stationId: p.stationId, branchId: p.branchId })))
   if (configured.length) {
     const stations = await prisma.kitchenStation.findMany({ where: { organizationId: req.user.organizationId, id: { in: configured.map(p => p.stationId).filter(id => id !== 'none') }, isActive: true }, select: { id: true } })
-    if (configured.some(p => p.stationId !== 'none' && !stations.some(s => s.id === p.stationId))) configurationError = true
+    if (configured.some(p => !['none', 'cashier'].includes(p.stationId) && !stations.some(s => s.id === p.stationId))) configurationError = true
   }
   res.json({ configured, configurationError, held, queued, jobs: jobs.map(j => ({ ...j, sequence: j.sequence.toString() })) })
 })
@@ -77,7 +81,7 @@ router.post('/printers/jobs/:id/resolve', requirePermission('can_manage_settings
   res.json(result)
 })
 
-// GET /kitchen/orders?branchId=&stationId= — open orders that still have
+// GET /kitchen/orders?branchId=&stationId= â€” open orders that still have
 // something for the kitchen (held courses don't count until fired). With a
 // station, only orders with work for that station.
 router.get('/orders', canBoard, async (req: Request, res: Response) => {
@@ -103,7 +107,7 @@ router.get('/orders', canBoard, async (req: Request, res: Response) => {
   })
 })
 
-// ── Stations and routing ─────────────────────────────────────────────────
+// â”€â”€ Stations and routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const stationSchema = z.object({
   name: z.string().trim().min(1).max(40),
@@ -152,7 +156,7 @@ router.delete('/stations/:id', canRoute, async (req: Request, res: Response) => 
   res.json({ deleted: true })
 })
 
-// GET /kitchen/routing — stations, categories and dishes with their routing
+// GET /kitchen/routing â€” stations, categories and dishes with their routing
 router.get('/routing', canRoute, async (req: Request, res: Response) => {
   const orgId = req.user.organizationId
   const [stations, categories, dishes] = await Promise.all([
@@ -163,7 +167,7 @@ router.get('/routing', canRoute, async (req: Request, res: Response) => {
   res.json({ stations, categories, dishes })
 })
 
-// PUT /kitchen/routing — categories → station; dish override and prep time
+// PUT /kitchen/routing â€” categories â†’ station; dish override and prep time
 router.put('/routing', canRoute, async (req: Request, res: Response) => {
   const orgId = req.user.organizationId
   const body = z.object({
@@ -183,9 +187,9 @@ router.put('/routing', canRoute, async (req: Request, res: Response) => {
   res.json({ saved: true })
 })
 
-// ── Customer "order ready" screen ────────────────────────────────────────
+// â”€â”€ Customer "order ready" screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-// GET /kitchen/ready-display?branchId= — the screen's secret link (if made)
+// GET /kitchen/ready-display?branchId= â€” the screen's secret link (if made)
 router.get('/ready-display', canBoard, async (req: Request, res: Response) => {
   const branchId = String(req.query.branchId || '')
   await assertBranchAccess(req, branchId)
@@ -194,7 +198,7 @@ router.get('/ready-display', canBoard, async (req: Request, res: Response) => {
   res.json({ token: branch.readyDisplayToken })
 })
 
-// POST /kitchen/ready-display { branchId } — create or replace the link
+// POST /kitchen/ready-display { branchId } â€” create or replace the link
 // (replacing it disconnects screens using the old one)
 router.post('/ready-display', canRoute, async (req: Request, res: Response) => {
   const { branchId } = z.object({ branchId: z.string().min(1) }).parse(req.body)
@@ -206,7 +210,7 @@ router.post('/ready-display', canRoute, async (req: Request, res: Response) => {
   res.json({ token: updated.readyDisplayToken })
 })
 
-// POST /kitchen/orders/:id/advance — move every item in one status to the next
+// POST /kitchen/orders/:id/advance â€” move every item in one status to the next
 // ("Start all new", "All ready", "All served")
 router.post('/orders/:id/advance', canBoard, async (req: Request, res: Response) => {
   const { from, stationId } = z.object({ from: z.enum(['pending', 'preparing', 'ready']), stationId: z.string().optional() }).parse(req.body)
@@ -217,15 +221,21 @@ router.post('/orders/:id/advance', canBoard, async (req: Request, res: Response)
   if (order.status !== 'completed') throw new AppError('Full payment is required before sending an order to the kitchen', 409, 'PAYMENT_REQUIRED')
 
   // a station bumps only its own lines; held courses are never bumped
-  const result = await prisma.customerOrderItem.updateMany({
-    where: { orderId: order.id, order: { status: 'completed' }, status: from, held: false, ...(stationId && { stationId: stationId === 'none' ? null : stationId }) },
-    data: { status: KITCHEN_FLOW[from] },
+  const result = await prisma.$transaction(async tx => {
+    await lockOrder(tx, order)
+    const where = { orderId: order.id, order: { status: 'completed' }, status: from, held: false, ...(stationId && { stationId: stationId === 'none' ? null : stationId }) }
+    const next = KITCHEN_FLOW[from], now = new Date()
+    // Keep the original measurement when a line is recalled and bumped again.
+    if (next === 'preparing') await tx.customerOrderItem.updateMany({ where: { ...where, preparingAt: null }, data: { preparingAt: now } })
+    if (next === 'ready') await tx.customerOrderItem.updateMany({ where: { ...where, readyAt: null }, data: { readyAt: now } })
+    if (next === 'served') await tx.customerOrderItem.updateMany({ where: { ...where, servedAt: null }, data: { servedAt: now } })
+    return tx.customerOrderItem.updateMany({ where, data: { status: next, ...(next === 'ready' && { servedAt: null }) } })
   })
   if (result.count > 0) publishOrder(order, 'item_status')
   res.json({ updated: result.count })
 })
 
-// POST /kitchen/orders/:id/recall — bring back dishes bumped as served in the
+// POST /kitchen/orders/:id/recall â€” bring back dishes bumped as served in the
 // last 30 minutes (a mistaken "All served")
 router.post('/orders/:id/recall', canBoard, async (req: Request, res: Response) => {
   const { stationId } = z.object({ stationId: z.string().optional() }).parse(req.body ?? {})
@@ -235,14 +245,14 @@ router.post('/orders/:id/recall', canBoard, async (req: Request, res: Response) 
   if (order.status !== 'completed') throw new AppError('Full payment is required before sending an order to the kitchen', 409, 'PAYMENT_REQUIRED')
   const result = await prisma.customerOrderItem.updateMany({
     where: { orderId: order.id, order: { status: 'completed' }, status: 'served', updatedAt: { gte: new Date(Date.now() - 30 * 60_000) }, ...(stationId && { stationId: stationId === 'none' ? null : stationId }) },
-    data: { status: 'ready' },
+    data: { status: 'ready', servedAt: null },
   })
   if (result.count === 0) throw new AppError('Nothing was served in the last 30 minutes', 409, 'NOTHING_TO_RECALL')
   publishOrder(order, 'item_status')
   res.json({ recalled: result.count })
 })
 
-// GET /kitchen/availability?branchId= — every active dish with its stock switch for that branch
+// GET /kitchen/availability?branchId= â€” every active dish with its stock switch for that branch
 router.get('/availability', canKitchen, async (req: Request, res: Response) => {
   const { branchId } = req.query as Record<string, string>
   if (!branchId) throw new AppError('Select a branch', 400, 'VALIDATION_ERROR')
@@ -278,7 +288,7 @@ router.get('/availability', canKitchen, async (req: Request, res: Response) => {
   })
 })
 
-// PUT /kitchen/availability — { branchId, dishId, available }
+// PUT /kitchen/availability â€” { branchId, dishId, available }
 router.put('/availability', canKitchen, async (req: Request, res: Response) => {
   const body = z.object({ branchId: z.string().min(1), dishId: z.string().min(1), available: z.boolean() }).parse(req.body)
   await assertBranchAccess(req, body.branchId)

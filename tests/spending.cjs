@@ -22,7 +22,7 @@ async function main() {
   const owner = await db.user.create({ data: { organizationId: org.id, email: 'spend-owner@example.invalid', passwordHash: 'unused', firstName: 'Spend', lastName: 'Owner' } })
   const role = await db.role.create({ data: { organizationId: org.id, name: 'owner', displayName: 'Owner' } })
   await db.userRole.create({ data: { userId: owner.id, roleId: role.id } })
-  for (const [key, module] of [['can_create_expense', 'expenses'], ['can_approve_expense', 'expenses'], ['can_void_expense', 'expenses'], ['can_create_purchasing_entry', 'purchasing'], ['can_make_payment', 'suppliers'], ['can_approve_bill', 'bills'], ['can_manage_settings', 'settings'], ['can_create_branch', 'branches']]) {
+  for (const [key, module] of [['can_create_expense', 'expenses'], ['can_approve_expense', 'expenses'], ['can_void_expense', 'expenses'], ['can_create_purchasing_entry', 'purchasing'], ['can_make_payment', 'suppliers'], ['can_approve_bill', 'bills'], ['can_view_reports', 'reports'], ['can_manage_settings', 'settings'], ['can_create_branch', 'branches']]) {
     await db.permission.create({ data: { key, module, description: key } })
   }
   const accounts = {}
@@ -158,8 +158,19 @@ async function main() {
   const maintenanceCategory = await db.expenseCategory.findFirst({ where: { organizationId: org.id, name: 'Maintenance' } })
   check('maintenance entry is an operating expense filed under an auto-created Maintenance category', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.source, 'maintenance'); assert.equal(response.data.status, 'submitted'); assert.equal(response.data.totalAmount, 230); assert.equal(response.data.categoryId, maintenanceCategory.id); assert.equal(response.data.supplierId, null); assert.ok(response.data.receiptDocumentId) })
   const maintenanceId = response.data.id
-  response = await api('POST', '/expenses', maintenanceForm({ amount: 50, vatRate: 0 }))
+  response = await api('POST', '/expenses', maintenanceForm({ amount: 50, vatRate: 0, categoryId: category.id }))
   check('second maintenance entry reuses the Maintenance category', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.categoryId, maintenanceCategory.id); assert.equal(response.data.status, 'draft') })
+  const draftMaintenanceId = response.data.id
+  response = await api('PUT', `/expenses/${draftMaintenanceId}`, { categoryId: category.id })
+  check('draft edits cannot move Maintenance into another category', () => assert.equal(response.status, 400))
+  response = await api('PUT', `/expenses/${draftMaintenanceId}`, { supplierId: supplier.id })
+  check('draft Maintenance cannot become an unsettled supplier expense', () => assert.equal(response.status, 400))
+  response = await api('PUT', `/expenses/${draftMaintenanceId}`, { description: 'Routine repairs' })
+  check('draft Maintenance still supports ordinary edits', () => assert.equal(response.status, 200, JSON.stringify(response.data)))
+  const operatingForm = maintenanceForm({ source: 'manual', categoryId: category.id, amount: 30, vatRate: 0 })
+  operatingForm.delete('supplierId')
+  response = await api('POST', '/expenses', operatingForm)
+  check('other operating costs remain available through the same multipart form', () => { assert.equal(response.status, 201, JSON.stringify(response.data)); assert.equal(response.data.source, 'manual'); assert.equal(response.data.categoryId, category.id) })
   response = await api('POST', '/expenses', { branchId: branch.id, expenseDate: '2026-10-30', amount: 10, totalAmount: 10, description: 'No category' })
   check('regular expense still requires a category', () => assert.equal(response.status, 400))
   response = await api('POST', `/expenses/${maintenanceId}/approve`)
@@ -168,11 +179,21 @@ async function main() {
   check('approved maintenance is paid from cash, not left payable', () => { assert.equal(response.status, 200); assert.ok(maintenanceJournal.lines.some(l => l.accountId === accounts.CASH_ON_HAND && Number(l.creditAmount) === 230)); assert.ok(!maintenanceJournal.lines.some(l => l.accountId === accounts.ACCOUNTS_PAYABLE)) })
   response = await api('GET', '/expenses/register?kind=maintenance')
   check('maintenance filter lists only maintenance entries', () => { assert.equal(response.data.total, 2); assert.ok(response.data.data.every(r => r.kind === 'maintenance')) })
-  check('summary reports maintenance separately inside operating expenses', () => { assert.equal(response.data.summary.maintenance, 230); assert.equal(response.data.summary.expenses, 230) })
+  check('summary reports maintenance separately inside operating expenses', () => { assert.equal(response.data.summary.maintenance, 230); assert.equal(response.data.summary.expenses, 340) })
   response = await api('GET', '/expenses/register?kind=expense')
   check('operating expense filter includes maintenance', () => assert.ok(response.data.data.some(r => r.id === maintenanceId && r.kind === 'maintenance')))
   response = await api('GET', '/expenses/register?kind=purchase')
   check('purchase filter excludes maintenance', () => assert.ok(!response.data.data.some(r => r.kind === 'maintenance')))
+  response = await api('GET', '/reports/expenses?fromDate=2026-10-30&toDate=2026-10-30')
+  check('Expense Report has a distinct Maintenance total and classified register rows', () => {
+    assert.equal(response.status, 200, JSON.stringify(response.data))
+    assert.equal(response.data.report.kpis.find(k => k.label === 'Maintenance').value, 280)
+    const rows = response.data.report.sections.find(s => s.id === 'register').rows
+    assert.ok(rows.some(r => r.type === 'Maintenance' && r.description === 'AC repair'))
+    assert.ok(rows.some(r => r.type === 'Operating expense' && r.description === 'Cleaning'))
+  })
+  const unchangedStock = await db.branchStock.findUnique({ where: { branchId_itemId: { branchId: branch.id, itemId: item.id } } })
+  check('Maintenance does not change purchased inventory', () => assert.equal(unchangedStock.quantityOnHand, 4))
   response = await api('DELETE', `/expenses/categories/${category.id}`)
   check('categories used by bills cannot be deleted', () => assert.equal(response.status, 400))
   const parallelId = randomUUID()

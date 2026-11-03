@@ -25,6 +25,7 @@ export async function applyBranchConfiguration(db: PrismaClient, input: unknown)
     }
   }
   if (tables.Organization?.length !== 1 || tables.Organization[0].id !== packageData.organizationId || tables.Branch?.length !== 1 || tables.Branch[0].id !== packageData.branchId || !tables.User?.length || !tables.Role || !tables.Permission || !tables.UserRole || !tables.RolePermission || !tables.UserBranchAccess) throw new AppError('Incomplete branch configuration', 400, 'CONFIGURATION_INVALID')
+  if (!tables.BranchMenuItem || tables.Branch[0].menuInitialized !== true) throw new AppError('Branch menu configuration is incomplete', 400, 'CONFIGURATION_INVALID')
   const ids = new Map(Object.entries(tables).map(([name, rows]) => [name, new Set(rows.map(r => String(r.id ?? r.organizationId)))]))
   for (const [name, rows] of Object.entries(tables)) for (const row of rows) {
     for (const relation of models.get(name)!.fields.filter(f => f.kind === 'object' && f.relationFromFields?.length)) {
@@ -64,6 +65,7 @@ export async function applyBranchConfiguration(db: PrismaClient, input: unknown)
     await tx.dishSize.deleteMany({ where: { dish: { organizationId: runtime.organizationId } } })
     await tx.dishIngredient.deleteMany({ where: { dish: { organizationId: runtime.organizationId } } })
     await tx.dishShift.deleteMany({ where: { dish: { organizationId: runtime.organizationId } } })
+    await tx.branchMenuItem.deleteMany({ where: { organizationId: runtime.organizationId, branchId: runtime.branchId } })
     await tx.user.updateMany({ where: { organizationId: runtime.organizationId, id: { notIn: userIds } }, data: { isActive: false } })
     await tx.account.updateMany({ where: { organizationId: runtime.organizationId, id: { notIn: [...(ids.get('Account') ?? [])] } }, data: { status: 'ARCHIVED' } })
     const present = new Set<string>(), pending = new Set(Object.keys(tables))

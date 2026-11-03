@@ -10,6 +10,29 @@ model AuthAttemptBucket {
 }
 
 // Operational print spool. Never replicated; cloud devices use cloud- printer IDs.
+model NetworkKitchenPrinter {
+  id String @id
+  organizationId String
+  branchId String
+  stationId String
+  name String
+  host String
+  port Int @default(9100)
+  paperWidth Int @default(80)
+  enabled Boolean @default(false)
+  deliveryMode String
+  enabledAt DateTime @default(now())
+  agentTokenHash String?
+  agentInstanceId String?
+  // Device name shown when another cashier device takes over dispatch.
+  dispatcherLabel String?
+  lastSeenAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([organizationId, branchId, stationId])
+  @@unique([organizationId, branchId, host, port])
+}
+
 model KitchenPrintJob {
   id String @id @default(uuid())
   sequence BigInt @unique @default(autoincrement())
@@ -352,6 +375,8 @@ model Branch {
   customerOrders    CustomerOrder[]
   orderReviews      OrderReview[]
   dishesOutOfStock  DishOutOfStock[]
+  menuInitialized   Boolean            @default(false)
+  menuItems         BranchMenuItem[]
   deliveryZones     DeliveryZone[]
   riders            Rider[]
 
@@ -1371,12 +1396,31 @@ model Dish {
   modifierLinks  DishModifierGroup[]
   comboGroups    ComboGroup[]
   comboOptions   ComboOption[]       @relation("ComboComponent")
+  branchMenus    BranchMenuItem[]
 
   @@index([organizationId, categoryId])
 }
 
-// One line of a dish's recipe: how much of an inventory item goes into ONE
-// portion (in the item's own unit, e.g. 0.25 kg), plus the trim/cooking loss.
+// A branch's saved selling price and menu membership for a shared dish.
+model BranchMenuItem {
+  id             String   @id @default(cuid())
+  organizationId String
+  branchId       String
+  dishId         String
+  price          Float
+  isActive       Boolean  @default(true)
+  // Independent prices keyed by stable size, modifier and combo option IDs.
+  optionPrices   Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  branch         Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  dish           Dish     @relation(fields: [dishId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, dishId])
+  @@index([organizationId, branchId, isActive])
+}
+
+// One recipe line: quantity per portion in the inventory item's stock unit.
 model DishIngredient {
   id        String @id @default(cuid())
   dishId    String
@@ -1882,6 +1926,11 @@ model CustomerOrderItem {
   lineTotal    Float
   // recipe cost of one portion when the order was paid
   unitCost     Float           @default(0)
+  // Immutable recipe quantities/costs captured at payment; older lines remain null.
+  recipeUsage  Json?
+  preparingAt  DateTime?
+  readyAt      DateTime?
+  servedAt     DateTime?
   notes        String?
   guestName    String?
   // awaiting (sent from a table QR, waiting for staff to accept) | pending |

@@ -68,7 +68,7 @@ floorRouter.post('/tables/:id/:action', view, async (req: Request, res: Response
     if (action === 'seat' && !body.guestCount) throw new AppError('Enter the guest count', 400, 'VALIDATION_ERROR')
     if (action === 'seat' && open) await tx.customerOrder.update({ where: { id: open.id }, data: { guestCount: body.guestCount } })
     const updated = await tx.diningTable.update({ where: { id: table.id }, data: action === 'clear' ? { seatedAt: null, guestCount: null, needsClearing: false } : { seatedAt: fresh.seatedAt ?? new Date(), guestCount: body.guestCount } })
-    await logAudit(tx, { req, action: `table_${action}`, module: 'orders', resourceType: 'dining_table', resourceId: table.id, branchId: table.branchId, newData: body })
+    await logAudit(tx, { req, action: `table_${action}`, module: 'orders', resourceType: 'dining_table', resourceId: table.id, branchId: table.branchId, newData: { ...body, ...(action === 'clear' && fresh.seatedAt ? { seatedAt: fresh.seatedAt.toISOString(), clearedAt: new Date().toISOString(), guestCount: fresh.guestCount, tableName: fresh.name } : {}) } })
     return updated
   })
   publish({ topic: 'table', action, organizationId: req.user.organizationId, branchId: table.branchId, tableId: table.id })

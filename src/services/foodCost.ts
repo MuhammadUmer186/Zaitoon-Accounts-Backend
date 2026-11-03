@@ -85,7 +85,7 @@ export async function costAndConsumeOrder(tx: Prisma.TransactionClient, orderId:
   for (const [n, line] of order.items.entries()) {
     const unitCost = portionCost(recipes[n], costs)
     foodCost += unitCost * line.quantity
-    await tx.customerOrderItem.update({ where: { id: line.id }, data: { unitCost } })
+    await tx.customerOrderItem.update({ where: { id: line.id }, data: { unitCost, recipeUsage: recipes[n].map(g => ({ itemId: g.itemId, quantity: grossQuantity(g), unitCost: costs.get(g.itemId) ?? 0 })) } })
     for (const g of recipes[n]) usage.set(g.itemId, (usage.get(g.itemId) ?? 0) + grossQuantity(g) * line.quantity)
   }
 

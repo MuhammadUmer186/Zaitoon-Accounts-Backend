@@ -11,6 +11,7 @@ import { enabledOnlineOrderTypes, onlineTrackingCode, parseOnlineTrackingCode } 
 import { dishImageUrl } from './menu'
 import { brandingLogoUrl } from './orgs'
 import { publicOrder } from './public'
+import { branchUnavailable } from '../services/branchMenu'
 import { createIntent, publicIntent } from '../services/payments'
 import { assertReadyForPayment } from '../services/orderPaymentPolicy'
 import { queueOnlineOrder, remoteOnlineTracking } from '../services/branchOnline'
@@ -32,6 +33,7 @@ router.get('/branches/:branchId/menu', rateLimit('online-menu', 120, 60_000), as
   const { org, branch } = await publicBranch(req.params.branchId)
   const shifts = await ensureShifts(prisma, org.id)
   const shift = currentShift(shifts, org.timezone)
+  const { menu, off } = await branchUnavailable(prisma, org.id, branch.id)
   const categories = shift ? await prisma.menuCategory.findMany({
     where: { organizationId: org.id, isActive: true }, orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
     include: { dishes: {
@@ -41,10 +43,11 @@ router.get('/branches/:branchId/menu', rateLimit('online-menu', 120, 60_000), as
   }) : []
   const upcoming = shift ? null : nextShift(shifts, org.timezone)
   const [options, outOfStock] = await Promise.all([
-    loadDishOptions(prisma, categories.flatMap((c) => c.dishes.map((d) => d.id))),
+    loadDishOptions(prisma, categories.flatMap((c) => c.dishes.map((d) => d.id)), branch.id),
     prisma.dishOutOfStock.findMany({ where: { branchId: branch.id }, select: { dishId: true } }),
   ])
-  const off = new Set(outOfStock.map((o) => o.dishId))
+  for (const o of outOfStock) off.add(o.dishId)
+  for (const c of categories) c.dishes = c.dishes.filter(d => !off.has(d.id))
   res.json({
     restaurant: { name: org.tradeName || org.name, ...publicRegion(org), logoUrl: brandingLogoUrl(org), multiBranch: org.multiBranch },
     branch: { id: branch.id, name: org.multiBranch ? branch.name : org.tradeName || org.name, address: branch.address, phone: branch.phone },
@@ -55,7 +58,7 @@ router.get('/branches/:branchId/menu', rateLimit('online-menu', 120, 60_000), as
     nextShift: upcoming && { name: upcoming.name, startTime: upcoming.startTime, endTime: upcoming.endTime },
     categories: categories.filter((c) => c.dishes.length).map((c) => ({
       id: c.id, name: c.name, description: c.description,
-      dishes: c.dishes.map((d) => ({ id: d.id, name: d.name, description: d.description, price: d.price, imageUrl: dishImageUrl(d), ...menuOptionsPayload(options.get(d.id), off) })),
+      dishes: c.dishes.map((d) => ({ id: d.id, name: d.name, description: d.description, price: menu.get(d.id)!.price, imageUrl: dishImageUrl(d), ...menuOptionsPayload(options.get(d.id), off) })),
     })),
   })
 })
