@@ -57,6 +57,15 @@ function longRaster(rows) {
   const same = job(Buffer.from([27, 64, 66, 10]))
   const both = await Promise.all([spool.print(same), spool.print(same)])
   check('the same job sent twice at once prints once', () => { assert.deepEqual(both.map(o => o.state), ['network_sent', 'network_sent']); assert.equal(printer.jobs.length, 3) })
+  // A repeat that arrives while the first attempt is mid-send waits for it.
+  let slowWrites = 0
+  const slowSpool = new Spool(tempFile(), async () => { slowWrites++; await delay(300); return { state: 'network_sent' } })
+  const inFlight = job(Buffer.from('in flight\n'))
+  const firstSend = slowSpool.print(inFlight)
+  await delay(50)
+  const lateRepeat = await slowSpool.print(inFlight)
+  check('a repeat during the first send waits and reports its real result', () => { assert.equal(lateRepeat.state, 'network_sent'); assert.equal(slowWrites, 1) })
+  await firstSend
   const pair = await Promise.all([spool.print(job(Buffer.from('receipt\n'))), spool.print(job(Buffer.from('kitchen\n')))])
   check('two slips for one printer wait in turn instead of colliding', () => { assert.deepEqual(pair.map(o => o.state), ['network_sent', 'network_sent']); assert.equal(printer.jobs.length, 5); assert.equal(printer.overlapped(), false) })
 

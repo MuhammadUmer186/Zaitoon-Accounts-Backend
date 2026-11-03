@@ -108,18 +108,21 @@ class Spool {
     }
     return () => releases.reverse().forEach(r => r())
   }
-  repeat(request, digest) {
+  // early: checked before waiting for the printer. An in-memory "dispatching"
+  // record is then still being sent by this process (a restart turns it into
+  // "uncertain"), so the caller waits for its outcome instead.
+  repeat(request, digest, early = false) {
     const old = this.journal.records[request.jobId]
     // "queued" means no byte reached the printer, so the same job may be
     // retried with fresh bytes (a new timestamp) or a corrected printer IP.
-    if (!old || old.state === 'queued') return null
+    if (!old || old.state === 'queued' || (early && old.state === 'dispatching')) return null
     if (old.digest !== digest || old.printerId !== request.printerId || old.host !== request.host || old.port !== request.port) throw new BridgeError(409, 'CHANGED_ATTEMPT', 'This print attempt was already used for different content or another printer')
     return { state: ['discarded', 'dispatching'].includes(old.state) ? 'uncertain' : old.state, reason: 'duplicate' }
   }
   async print(request) {
     const bytes = validateRequest(request)
     const digest = crypto.createHash('sha256').update(bytes).digest('hex'), endpoint = `${request.host}:${request.port}`
-    const early = this.repeat(request, digest)
+    const early = this.repeat(request, digest, true)
     if (early) return early
     const release = await this.acquire([`printer:${request.printerId}`, `endpoint:${endpoint}`])
     if (!release) return { state: 'queued', reason: 'busy' }
