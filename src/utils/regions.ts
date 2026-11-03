@@ -78,14 +78,17 @@ export function countryDefaults(code: string) {
   return { currency, locale, timezone, taxLabel, fiscalYearStart, dateFormat }
 }
 
-// Minor-unit digits of a currency (JPY 0, KWD 3, PKR 2 …) from the runtime's
-// ISO 4217 data
+// Minor-unit digits of a currency (JPY 0, KWD 3, PKR 2 …) per ISO 4217. Not
+// read from Intl: newer ICU/CLDR data reports PKR with 0 digits, which would
+// make money rounding depend on the Node or browser version. Keep this table
+// identical to frontend/src/lib/regional.ts.
+const MINOR_UNITS: Record<string, number> = {
+  BIF: 0, CLP: 0, DJF: 0, GNF: 0, ISK: 0, JPY: 0, KMF: 0, KRW: 0, PYG: 0, RWF: 0, UGX: 0, UYI: 0, VND: 0, VUV: 0, XAF: 0, XOF: 0, XPF: 0,
+  BHD: 3, IQD: 3, JOD: 3, KWD: 3, LYD: 3, OMR: 3, TND: 3,
+  CLF: 4, UYW: 4,
+}
 export function currencyDecimals(currency: string): number {
-  try {
-    return new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2
-  } catch {
-    return 2
-  }
+  return MINOR_UNITS[currency?.toUpperCase()] ?? 2
 }
 
 export function isValidLocale(locale: string): boolean {

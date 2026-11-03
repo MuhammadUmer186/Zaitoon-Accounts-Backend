@@ -62,6 +62,8 @@ async function run(label, file, args = [], timeout = 240000) {
     if (!process.argv.includes('--branch-only') && !syncOnly) await run('production-hardening', path.join(backend,'tests/production-hardening.cjs'), [], 240000);
     if (!process.argv.includes('--branch-only') && !syncOnly) await run('kitchen-printing', path.join(backend,'tests/kitchen-printing.cjs'), [], 240000);
     if (!process.argv.includes('--branch-only') && !syncOnly) await run('cloud-kitchen-printing', path.join(backend,'tests/cloud-kitchen-printing.cjs'), [], 240000);
+    if (!process.argv.includes('--branch-only') && !syncOnly) await run('network-printing', path.join(backend,'tests/network-printing.cjs'), [], 240000);
+    if (!process.argv.includes('--branch-only') && !syncOnly) await run('local-print-bridge', path.join(backend,'tests/local-print-bridge.cjs'), [], 120000);
     if (!process.argv.includes('--probes-only')) await run('branch-runtime', path.join(backend,'tests/branch-runtime.cjs'), [], 180000);
     // Creates its own cloud and branch scratch databases (two JWT secrets, two processes).
     if (!process.argv.includes('--probes-only')) await run('branch-online', path.join(backend,'tests/branch-online.cjs'), [], 420000);

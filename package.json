@@ -4,6 +4,7 @@
   "scripts": {
     "test:network-printing": "npm run build && node tests/network-printing.cjs",
     "test:print-bridge": "node tests/local-print-bridge.cjs",
+    "audit:production": "node scripts/audit-production.cjs",
     "test:reports": "npm run build && node tests/operational-reports.cjs",
     "test:spending": "npm run build && node tests/spending.cjs",
     "test:free-dish": "npm run build && node tests/free-dish.cjs",
